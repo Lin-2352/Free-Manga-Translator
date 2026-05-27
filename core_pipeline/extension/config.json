@@ -1,0 +1,4 @@
+{
+  "localPipelineUrl": "http://127.0.0.1:8766/v1/translate-image",
+  "localPipelineLanguage": "ja"
+}

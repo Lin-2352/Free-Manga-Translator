@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Manga Translator</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <img src="icons/48x48.png" alt="Manga Translator" class="logo">
+      <div class="title-block">
+        <h1>Manga Translator</h1>
+        <span>Local 8-stage pipeline</span>
+      </div>
+      <span class="badge">LOCAL</span>
+    </header>
+
+    <section class="section">
+      <div class="section-header">
+        <span class="section-icon">Pipeline</span>
+        <span>Local Pipeline</span>
+        <span class="status-dot active" id="apiStatus"></span>
+      </div>
+      <div class="setting-row setting-row-stack">
+        <label for="localPipelineUrl">Local Pipeline URL</label>
+        <div class="setting-inline">
+          <input type="text" id="localPipelineUrl" placeholder="http://127.0.0.1:8766/v1/translate-image">
+          <button id="saveLocalPipelineBtn" class="btn btn-secondary btn-with-feedback">
+            <span>Save</span>
+            <span class="btn-check" id="saveCheck" aria-hidden="true">✓</span>
+          </button>
+        </div>
+      </div>
+      <div class="setting-row">
+        <label for="localPipelineLanguage">Source Language</label>
+        <select id="localPipelineLanguage">
+          <option value="ja">Japanese manga</option>
+          <option value="ko">Korean manhwa</option>
+          <option value="zh">Chinese manhua</option>
+        </select>
+      </div>
+      <p class="help-link">
+        Provider keys stay inside the local Python server. The extension only sends images to the local endpoint.
+      </p>
+    </section>
+
+    <section class="section">
+      <div class="toggle-row">
+        <div>
+          <span class="section-icon">Auto</span>
+          <span>Auto-translate images</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="translationToggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-header">
+        <span class="section-icon">Run</span>
+        <span>Translation Control</span>
+      </div>
+      <div class="actions-grid">
+        <button id="translatePageBtn" class="btn btn-primary btn-action">Translate Page</button>
+        <button id="translationPanelBtn" class="btn btn-secondary btn-action">Selection Panel</button>
+        <button id="pauseBtn" class="btn btn-secondary btn-action">Pause</button>
+        <button id="resumeBtn" class="btn btn-secondary btn-action">Resume</button>
+        <button id="clearBtn" class="btn btn-danger btn-action">Clear All</button>
+        <button id="retranslateBtn" class="btn btn-secondary btn-action">Re-translate</button>
+      </div>
+      <p class="help-link">
+        Translate Page runs once. Auto-translate stays off until you explicitly enable it.
+      </p>
+    </section>
+
+    <section class="section">
+      <div class="section-header">
+        <span class="section-icon">Cache</span>
+        <span>Recent Translations</span>
+      </div>
+      <div class="cache-status">
+        <span id="cacheStatusText">0/12 images cached</span>
+      </div>
+      <div class="setting-row">
+        <label for="translationCachePages">Keep in cache</label>
+        <select id="translationCachePages">
+          <option value="0">Disabled</option>
+          <option value="5">5 images</option>
+          <option value="12">12 images</option>
+          <option value="20">20 images</option>
+          <option value="40">40 images</option>
+        </select>
+      </div>
+      <button id="clearCacheBtn" class="btn btn-secondary btn-action">Clear Cache</button>
+      <p class="help-link">
+        Cache is browser-session only. Clear Cache removes translated image restores immediately.
+      </p>
+    </section>
+
+    <section class="section">
+      <div class="section-header">
+        <span class="section-icon">Text</span>
+        <span>Display</span>
+      </div>
+      <div class="setting-row">
+        <label for="fontSelect">Overlay Font Style</label>
+        <select id="fontSelect">
+          <option value="CC Wild Words">CC Wild Words</option>
+          <option value="Bangers">Bangers</option>
+          <option value="Patrick Hand">Patrick Hand</option>
+          <option value="Comic Sans MS">Comic Sans MS</option>
+          <option value="Arial">Arial (System)</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <label for="fontColorInput">Overlay Font Color</label>
+        <input type="color" id="fontColorInput" value="#000000">
+      </div>
+    </section>
+
+    <footer class="footer">
+      <div id="statusText">Local pipeline ready</div>
+      <div id="statsText" class="stats"></div>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
