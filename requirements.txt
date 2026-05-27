@@ -1,0 +1,14 @@
+﻿fastapi==0.108.0
+uvicorn[standard]>=0.23.0
+pydantic>=2.7.0
+pillow
+numpy
+opencv-python
+onnxruntime-gpu
+torch
+transformers
+manga-ocr
+easyocr
+paddleocr
+ultralytics
+requests

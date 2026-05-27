@@ -1,0 +1,41 @@
+{
+  "name": "Free Manga Translator",
+  "version": "1.0.0",
+  "manifest_version": 3,
+  "description": "Translate Japanese, Chinese, and Korean manga to English through a local 8-step pipeline server",
+  "icons": {
+    "16": "icons/16x16.png",
+    "48": "icons/48x48.png",
+    "128": "icons/128x128.png"
+  },
+  "action": {
+    "default_icon": "icons/128x128-disabled.png",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "contextMenus",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "all_frames": true,
+      "matches": ["<all_urls>"],
+      "js": ["content.js"]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["fonts/*", "icons/*", "config.json"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
