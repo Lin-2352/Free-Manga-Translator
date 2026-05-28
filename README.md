@@ -8,8 +8,6 @@ Free Manga Translator is a local manga, manhwa, and manhua translation system wi
 - Chrome and Brave extension for browser-based page translation.
 - OCR, layout analysis, speech-bubble handling, floating-text handling, inpainting, and typesetting.
 - API-key translation support through `core_pipeline/.env`.
-- Local model assets tracked with Git LFS.
-- Minimal repository layout without QA dumps, runtime caches, validation folders, or checkpoints.
 
 ## Repository Layout
 
@@ -30,6 +28,7 @@ examples/            README input/output examples.
 - Windows 10 or Windows 11.
 - Python 3.11 or newer.
 - CUDA-capable NVIDIA GPU recommended.
+- Pytorch
 - Git LFS.
 - Chrome or Brave.
 
