@@ -12,7 +12,7 @@ and a clean 3-color debug image:
 No orange, no yellow, no collision indicators.
 """
 
-                                   
+
 from pathlib import Path as _BootstrapPath
 import sys as _bootstrap_sys
 _BOOTSTRAP_FILE = _BootstrapPath(__file__).resolve()
@@ -35,7 +35,7 @@ for _rel in (
     if _path not in _bootstrap_sys.path:
         _bootstrap_sys.path.insert(0, _path)
 del _BootstrapPath, _bootstrap_sys, _BOOTSTRAP_FILE, _candidate, _PROJECT_ROOT_FOR_IMPORTS, _rel, _path
-                                       
+
 import json
 import os
 import re
@@ -90,24 +90,27 @@ def _strong_dialogue_candidate(text: str, counts: dict[str, int]) -> bool:
 
 
 _SHORT_DIALOGUE_STEMS = (
-    "\u3042\u3063\u305f",                          
-    "\u3042\u3064",                            
-    "\u3055\u3080",             
-    "\u3044\u305f",              
-    "\u3084\u3060",                   
-    "\u3060\u3081",                
-    "\u3044\u3084",                   
-    "\u3044\u3044",                    
-    "\u306d\u3048",            
-    "\u307b\u3089",             
-    "\u307e\u3063\u3066",         
-    "\u3053\u308c",             
-    "\u305d\u308c",             
-    "\u306a\u3093",                           
-    "\u3059\u3054",                
-    "\u3053\u308f",              
-    "\u304d\u3082",              
-    "\u3046\u305d",                     
+    "\u3042\u3063\u305f",  # atta / attaka variants
+    "\u3042\u3064",       # hot / warm variants
+    "\u3055\u3080",       # cold
+    "\u3044\u305f",       # hurts
+    "\u3084\u3060",       # no / don't
+    "\u3060\u3081",       # no good
+    "\u3044\u3084",       # no / gross
+    "\u3044\u3044",       # okay / good
+    "\u306d\u3048",       # hey
+    "\u307b\u3089",       # look
+    "\u307e\u3063\u3066",   # wait
+    "\u3061\u3087\u3063\u3068", # wait / a little
+    "\u3042\u306e",       # um / hey
+    "\u3059\u304b",       # casual question suffix
+    "\u3053\u308c",       # this
+    "\u305d\u308c",       # that
+    "\u306a\u3093",       # what/why fragments
+    "\u3059\u3054",       # amazing
+    "\u3053\u308f",       # scary
+    "\u304d\u3082",       # gross
+    "\u3046\u305d",       # no way / lie
 )
 
 
@@ -128,7 +131,7 @@ def _obvious_sfx_fragment(text: str) -> bool:
         return True
 
     sound_prefixes = (
-        "\u3061\u3085\u3071",         
+        "\u3061\u3085\u3071",  # chupa
         "\u3061\u3085",
         "\u3074\u3085",
         "\u3073\u3085",
@@ -159,9 +162,44 @@ def _short_spoken_dialogue_fragment(item: dict, image: np.ndarray | None) -> boo
     cjk_total = counts["hangul"] + counts["kana"] + counts["han"]
     if cjk_total < 2 or len(compact) > 8:
         return False
+
+    box = item.get("box", {})
+    coords = (
+        int(box.get("x1", 0)),
+        int(box.get("y1", 0)),
+        int(box.get("x2", 0)),
+        int(box.get("y2", 0)),
+    )
+    x1, y1, x2, y2 = coords
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    if image is not None:
+        img_h, img_w = image.shape[:2]
+        min_readable_width = max(28, int(img_w * 0.025))
+        min_readable_height = max(72, int(img_h * 0.070))
+        if width < min_readable_width and height < min_readable_height and len(compact) <= 5:
+            return False
+
     if counts["han"] >= 1 or counts["hangul"] >= 2:
         return True
     if not any(stem in compact for stem in _SHORT_DIALOGUE_STEMS):
+        return False
+
+    pale_fraction = _pale_region_fraction(image, coords)
+    dark_fraction = _dark_region_fraction(image, coords)
+    return pale_fraction >= 0.32 or dark_fraction >= 0.18
+
+
+def _erase_only_adjacent_fragment(item: dict, image: np.ndarray | None) -> bool:
+    text = str(item.get("text", "")).strip()
+    compact = _normalized_cjk_fragment(text)
+    if not compact or _obvious_sfx_fragment(text):
+        return False
+
+    counts = _script_counts(text)
+    if counts["han"] or counts["hangul"]:
+        return False
+    if counts["kana"] < 2 or len(compact) > 4:
         return False
 
     box = item.get("box", {})
@@ -171,9 +209,14 @@ def _short_spoken_dialogue_fragment(item: dict, image: np.ndarray | None) -> boo
         int(box.get("x2", 0)),
         int(box.get("y2", 0)),
     )
+    width = max(1, coords[2] - coords[0])
+    height = max(1, coords[3] - coords[1])
+    if width > max(42, int(height * 0.74)):
+        return False
+
     pale_fraction = _pale_region_fraction(image, coords)
     dark_fraction = _dark_region_fraction(image, coords)
-    return pale_fraction >= 0.32 or dark_fraction >= 0.18
+    return pale_fraction >= 0.34 or dark_fraction >= 0.16
 
 
 
@@ -342,22 +385,25 @@ def _recoverable_adjacent_fragment(item: dict, constraints: list[dict], image: n
     image_shape = image.shape if image is not None else None
     img_h = image_shape[0] if image_shape is not None else 0
     img_w = image_shape[1] if image_shape is not None else 0
+    if img_h and img_w:
+        min_readable_width = max(28, int(img_w * 0.025))
+        min_readable_height = max(72, int(img_h * 0.070))
+        if width < min_readable_width and height < min_readable_height and compact_len <= 5:
+            return False
     cls = classify_text_by_content(text)
     pale_fraction = _pale_region_fraction(image, (x1, y1, x2, y2))
     dark_fraction = _dark_region_fraction(image, (x1, y1, x2, y2))
     pale_fragment = pale_fraction >= 0.42
     top_pale_fragment = bool(img_h and y1 <= int(img_h * 0.26) and pale_fragment)
     safe_caption_fragment = pale_fraction >= 0.55 and dark_fraction <= 0.24
+    erase_only_fragment = _erase_only_adjacent_fragment(item, image)
 
-                                                                               
-                                                                               
-                                                                                
-                                                                               
-                             
-    if cls in {"sfx", "noise", "english"}:
+    if cls == "english":
+        return False
+    if cls in {"sfx", "noise"} and not erase_only_fragment:
         return False
 
-    if cls != "dialogue" and not (top_pale_fragment or safe_caption_fragment):
+    if cls != "dialogue" and not (top_pale_fragment or safe_caption_fragment or erase_only_fragment):
         return False
 
     if width > max(92, int(height * 0.92)):
@@ -382,6 +428,8 @@ def _recoverable_adjacent_fragment(item: dict, constraints: list[dict], image: n
         close_y = abs(center_y - ((ry1 + ry2) / 2.0)) <= max(92, int(max(height, r_height) * 0.90))
         close_x = h_gap <= max(96, int(min(height, r_height) * 1.15))
         if close_x and (same_vertical_band or (close_y and v_gap <= max(36, int(max(height, r_height) * 0.28)))):
+            if erase_only_fragment:
+                return True
             if has_dialogue_script or safe_caption_fragment:
                 return True
             if top_pale_fragment and img_h and ry1 <= int(img_h * 0.25):
@@ -487,6 +535,8 @@ def _semantic_role_for_item(item: dict, image_shape, sample_name: str = "", imag
         return "title_logo"
     if bubble_idx == -1 and img_h and img_w:
         area_ratio = (width * height) / max(1, img_h * img_w)
+        if width < max(28, int(img_w * 0.025)) and height < max(72, int(img_h * 0.070)) and compact_text_len <= 5:
+            return "floating_too_small"
         if (
             (area_ratio > 0.065 or width > int(img_w * 0.52))
             and counts["han"] == 0
@@ -523,9 +573,9 @@ def run_step6_layout():
         else:
             image_shape = image.shape
 
-                                                                          
-                                                                      
-                                                          
+
+
+
         constraints = []
         rejected = []
         for item in ocr_data:
@@ -535,6 +585,7 @@ def run_step6_layout():
                 "title_logo",
                 "floating_too_large",
                 "floating_too_wide",
+                "floating_too_small",
                 "ocr_language_mismatch",
                 "ocr_low_confidence",
             }:
@@ -548,12 +599,16 @@ def run_step6_layout():
             ):
                 rejected.append(_layout_rejection(item, "floating_sfx_art", semantic_role="sfx", classification=cls))
                 continue
+            keep_short_floating = (
+                item.get("bubble_idx", -1) == -1
+                and _short_spoken_dialogue_fragment(item, image)
+            )
             keep_short_bubble = (
                 cls == "sfx"
                 and item.get("bubble_idx", -1) != -1
                 and _has_usable_translation(item.get("text", ""))
             )
-            if cls != "dialogue" and not keep_short_bubble:
+            if cls != "dialogue" and not keep_short_bubble and not keep_short_floating:
                 rejected.append(_layout_rejection(item, f"classification_{cls}", semantic_role=semantic_role, classification=cls))
                 continue
             if cls == "dialogue" and not _has_usable_translation(item.get("text", "")):
@@ -572,7 +627,7 @@ def run_step6_layout():
                 "bubble_idx":      item.get("bubble_idx", -1),
                 "mask_mode":       item.get("mask_mode", "stroke"),
                 "route":           item.get("route", "floating_dialogue"),
-                "semantic_role":   semantic_role,
+                "semantic_role":   "dialogue" if keep_short_floating else semantic_role,
                 "fallback_source": item.get("fallback_source"),
                 "force_bubble_cleanup": bool(item.get("force_bubble_cleanup", False)),
             })
@@ -593,6 +648,7 @@ def run_step6_layout():
             fy2 = int(box.get("y2", fy1))
             f_height = max(1, fy2 - fy1)
             f_center_y = (fy1 + fy2) / 2.0
+            erase_only_fragment = _erase_only_adjacent_fragment(item, image)
 
             if _short_spoken_dialogue_fragment(item, image):
                 gb = item.get("green_box", box)
@@ -637,6 +693,15 @@ def run_step6_layout():
             if best_constraint is None:
                 continue
 
+            if erase_only_fragment:
+                best_constraint.setdefault("erase_boxes", [])
+                best_constraint["erase_boxes"].append([fx1, fy1, fx2, fy2])
+                if best_constraint.get("fallback_source"):
+                    best_constraint["fallback_source"] = f"{best_constraint['fallback_source']}+erase_fragment_merged"
+                else:
+                    best_constraint["fallback_source"] = "erase_fragment_merged"
+                continue
+
             rb = best_constraint["red_box"]
             gb = best_constraint["green_box"]
             best_constraint["red_box"] = [min(rb[0], fx1), min(rb[1], fy1), max(rb[2], fx2), max(rb[3], fy2)]
@@ -650,7 +715,7 @@ def run_step6_layout():
             else:
                 best_constraint["fallback_source"] = "adjacent_fragment_merged"
 
-                                                                          
+
         out_dir = sample_path / "step_6_layout"
         out_dir.mkdir(parents=True, exist_ok=True)
         with open(out_dir / "layout_constraints.json", "w", encoding="utf-8") as f:
@@ -658,11 +723,11 @@ def run_step6_layout():
         with open(out_dir / "rejected_layout_items.json", "w", encoding="utf-8") as f:
             json.dump(rejected, f, indent=2, ensure_ascii=False)
 
-                                                                           
+
         if image is None:
             continue
 
-                                           
+
         if detect_dir.exists():
             for i in range(100):
                 bm_path = detect_dir / f"bubble_{i}.png"
@@ -675,25 +740,25 @@ def run_step6_layout():
                     )
                     cv2.drawContours(image, contours, -1, (255, 0, 0), 2)
 
-                                           
+
         for c in constraints:
             rb   = c["red_box"]
             gb   = c["green_box"]
             poly = c.get("green_polygon", [])
 
-                                                 
+
             cv2.rectangle(
                 image,
                 (rb[0], rb[1]), (rb[2], rb[3]),
                 (0, 0, 255), 2
             )
 
-                                                                        
+
             if poly and len(poly) >= 3:
                 pts = np.array(poly, np.int32).reshape((-1, 1, 2))
                 cv2.polylines(
                     image, [pts], isClosed=True,
-                    color=(0, 255, 0), thickness=1                             
+                    color=(0, 255, 0), thickness=1   # thin, no collision bleed
                 )
             else:
                 cv2.rectangle(

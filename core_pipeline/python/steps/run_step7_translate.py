@@ -10,7 +10,7 @@ Translation approach:
   - No curated per-sample translation database in the production path.
 """
 
-                                   
+
 from pathlib import Path as _BootstrapPath
 import sys as _bootstrap_sys
 _BOOTSTRAP_FILE = _BootstrapPath(__file__).resolve()
@@ -33,7 +33,7 @@ for _rel in (
     if _path not in _bootstrap_sys.path:
         _bootstrap_sys.path.insert(0, _path)
 del _BootstrapPath, _bootstrap_sys, _BOOTSTRAP_FILE, _candidate, _PROJECT_ROOT_FOR_IMPORTS, _rel, _path
-                                       
+
 import html
 import json
 import os
@@ -917,7 +917,7 @@ def run_step7_translate():
             })
             print(f"  [{item['id']}] {item['text'][:30]}  →  {en_text[:50]} [{source}]")
 
-                        
+
         out_dir = samples_dir / sample_name / RUN_NAME
         if out_dir.exists():
             shutil.rmtree(out_dir)

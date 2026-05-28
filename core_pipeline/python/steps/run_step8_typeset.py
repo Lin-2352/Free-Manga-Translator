@@ -7,7 +7,7 @@ Renders English text onto the clean inpainted canvas.
 3. Anchors each translation near its original source text center.
 """
 
-                                   
+
 from pathlib import Path as _BootstrapPath
 import sys as _bootstrap_sys
 _BOOTSTRAP_FILE = _BootstrapPath(__file__).resolve()
@@ -30,7 +30,7 @@ for _rel in (
     if _path not in _bootstrap_sys.path:
         _bootstrap_sys.path.insert(0, _path)
 del _BootstrapPath, _bootstrap_sys, _BOOTSTRAP_FILE, _candidate, _PROJECT_ROOT_FOR_IMPORTS, _rel, _path
-                                       
+
 import json
 import math
 import os
@@ -47,9 +47,9 @@ from ml_region_lib import SAMPLE_MAP
 from pipeline_paths import DEFAULT_SAMPLES_ROOT, sample_root_from_env
 
 
-                                                                     
-           
-                                                                     
+
+
+
 MAX_FONT_DIALOGUE = 96
 MIN_FONT_SIZE = 8
 MAX_OUTLINE_WIDTH = 3
@@ -68,9 +68,11 @@ MODERN_REFERENCE_FONT_PATH = "C:/Windows/Fonts/comic.ttf"
 if not os.path.exists(MODERN_REFERENCE_FONT_PATH):
     MODERN_REFERENCE_FONT_PATH = FONT_PATH
 
-FLOATING_FONT_PATH = "C:/Windows/Fonts/arialnb.ttf"
+FLOATING_FONT_PATH = "C:/Windows/Fonts/arialbd.ttf"
 if not os.path.exists(FLOATING_FONT_PATH):
-    FLOATING_FONT_PATH = "arialbd.ttf"
+    FLOATING_FONT_PATH = "C:/Windows/Fonts/arialnb.ttf"
+if not os.path.exists(FLOATING_FONT_PATH):
+    FLOATING_FONT_PATH = FONT_PATH
 
 DENSE_FONT_PATH = "C:/Windows/Fonts/arial.ttf"
 if not os.path.exists(DENSE_FONT_PATH):
@@ -267,6 +269,8 @@ def _text_style_for_layout(background: Image.Image, allowed_mask: Image.Image) -
             "name": "dark_on_light",
             "fill_color": (0, 0, 0, 255),
             "stroke_color": (255, 255, 255, 255),
+            "floating_stroke_color": (255, 255, 255, 255),
+            "floating_outline_cap": 4,
             "background_luma_median": None,
             "background_luma_p75": None,
         }
@@ -285,6 +289,8 @@ def _text_style_for_layout(background: Image.Image, allowed_mask: Image.Image) -
             "name": "light_on_dark",
             "fill_color": (255, 255, 255, 255),
             "stroke_color": (0, 0, 0, 255),
+            "floating_stroke_color": (0, 0, 0, 178),
+            "floating_outline_cap": 1,
             "background_luma_median": median_luma,
             "background_luma_p75": p75_luma,
         }
@@ -293,6 +299,8 @@ def _text_style_for_layout(background: Image.Image, allowed_mask: Image.Image) -
         "name": "dark_on_light",
         "fill_color": (0, 0, 0, 255),
         "stroke_color": (255, 255, 255, 255),
+        "floating_stroke_color": (255, 255, 255, 255),
+        "floating_outline_cap": 4,
         "background_luma_median": median_luma,
         "background_luma_p75": p75_luma,
     }
@@ -562,6 +570,15 @@ def _allowed_mask_for_layout(
         if gray.shape == allowed_np.shape:
             dark_ink = (gray < 105) & allowed_np
             erase_np = np.zeros_like(allowed_np, dtype=bool)
+            red_box = layout.get("red_box")
+            if isinstance(red_box, (list, tuple)) and len(red_box) >= 4:
+                rx1, ry1, rx2, ry2 = _coerce_box(red_box[:4], image_size)
+                rx1 = max(0, rx1 - 4)
+                ry1 = max(0, ry1 - 4)
+                rx2 = min(image_size[0], rx2 + 4)
+                ry2 = min(image_size[1], ry2 + 4)
+                if rx2 > rx1 and ry2 > ry1:
+                    erase_np[ry1:ry2, rx1:rx2] = True
             for erase_box in layout.get("erase_boxes", []):
                 if not isinstance(erase_box, (list, tuple)) or len(erase_box) < 4:
                     continue
@@ -572,9 +589,9 @@ def _allowed_mask_for_layout(
                 ey2 = min(image_size[1], ey2 + 4)
                 if ex2 > ex1 and ey2 > ey1:
                     erase_np[ey1:ey2, ex1:ex2] = True
-                                                                           
-                                                                             
-                                                                           
+
+
+
             dark_ink &= ~erase_np
             dark_ink = cv2.dilate(
                 dark_ink.astype(np.uint8),
@@ -662,6 +679,168 @@ def _candidate_positions(
     return positions
 
 
+def _mask_bbox_from_np(mask_np: np.ndarray) -> tuple[int, int, int, int] | None:
+    ys, xs = np.where(mask_np)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _split_two_lobe_masks(allowed_mask: Image.Image) -> list[Image.Image] | None:
+    mask_np = np.array(allowed_mask) > 0
+    bounds = _mask_bbox_from_np(mask_np)
+    if bounds is None:
+        return None
+    x1, y1, x2, y2 = bounds
+    width = x2 - x1
+    height = y2 - y1
+    area = int(np.count_nonzero(mask_np))
+    if width < 120 or height < 80 or area < 1800:
+        return None
+
+    row_centers = []
+    row_counts = []
+    for y in range(y1, y2):
+        xs = np.where(mask_np[y, x1:x2])[0]
+        if len(xs) < max(8, int(width * 0.08)):
+            row_centers.append(np.nan)
+            row_counts.append(0)
+        else:
+            row_centers.append(float(xs.mean() + x1))
+            row_counts.append(int(len(xs)))
+
+    valid_centers = np.array([c for c in row_centers if not np.isnan(c)], dtype=np.float32)
+    if valid_centers.size < 20:
+        return None
+    top_sample = valid_centers[: max(5, valid_centers.size // 3)]
+    bottom_sample = valid_centers[-max(5, valid_centers.size // 3):]
+    center_delta = abs(float(np.median(top_sample)) - float(np.median(bottom_sample)))
+    if center_delta < max(44, width * 0.22):
+        return None
+
+    best = None
+    for split_y in range(y1 + int(height * 0.30), y1 + int(height * 0.72)):
+        top_np = mask_np.copy()
+        bottom_np = mask_np.copy()
+        top_np[split_y:, :] = False
+        bottom_np[:split_y, :] = False
+        top_area = int(np.count_nonzero(top_np))
+        bottom_area = int(np.count_nonzero(bottom_np))
+        if top_area < max(450, int(area * 0.18)) or bottom_area < max(450, int(area * 0.18)):
+            continue
+        top_bounds = _mask_bbox_from_np(top_np)
+        bottom_bounds = _mask_bbox_from_np(bottom_np)
+        if top_bounds is None or bottom_bounds is None:
+            continue
+        tx1, ty1, tx2, ty2 = top_bounds
+        bx1, by1, bx2, by2 = bottom_bounds
+        top_center = (tx1 + tx2) / 2.0
+        bottom_center = (bx1 + bx2) / 2.0
+        split_band_count = row_counts[split_y - y1] if 0 <= split_y - y1 < len(row_counts) else width
+        score = (
+            abs(top_center - bottom_center) * 2.0
+            + min(top_area, bottom_area) / max(1, area) * 180.0
+            - split_band_count * 0.12
+            - abs((top_area / max(1, bottom_area)) - 1.0) * 18.0
+        )
+        if best is None or score > best[0]:
+            best = (score, top_np, bottom_np)
+
+    if best is None:
+        return None
+    masks = []
+    for part_np in (best[1], best[2]):
+        if np.count_nonzero(part_np) < 450:
+            return None
+        masks.append(Image.fromarray((part_np.astype(np.uint8) * 255), mode="L"))
+    return masks
+
+
+def _clipped_pixels_for_fit(fit: dict, allowed_np: np.ndarray) -> int:
+    if "parts" in fit:
+        return sum(
+            _count_clipped_pixels(part["alpha"], allowed_np, part["position"])
+            for part in fit["parts"]
+        )
+    return _count_clipped_pixels(fit["alpha"], allowed_np, fit["position"])
+
+
+def _find_two_region_layout(
+    text: str,
+    layout: dict,
+    allowed_mask: Image.Image,
+    text_style: dict,
+) -> dict | None:
+    if layout.get("bubble_idx", -1) == -1:
+        return None
+    masks = _split_two_lobe_masks(allowed_mask)
+    if not masks:
+        return None
+    words = text.split()
+    if len(words) < 8:
+        return None
+
+    best = None
+    best_score = -1e18
+    low = max(3, int(len(words) * 0.35))
+    high = min(len(words) - 3, int(len(words) * 0.68))
+    if high < low:
+        return None
+
+    for split_index in range(low, high + 1):
+        texts = [" ".join(words[:split_index]), " ".join(words[split_index:])]
+        parts = []
+        failed = False
+        for part_text, part_mask in zip(texts, masks):
+            part_bounds = _bbox_from_mask(part_mask)
+            if part_bounds is None:
+                failed = True
+                break
+            part_layout = dict(layout)
+            part_layout["green_box"] = list(part_bounds)
+            part_layout["red_box"] = list(part_bounds)
+            fit = _find_mask_aware_layout(part_text, part_layout, part_mask, text_style)
+            if fit["status"] == "fallback_clipped":
+                failed = True
+                break
+            fit = dict(fit)
+            fit["text"] = part_text
+            fit["allowed_mask"] = part_mask
+            parts.append(fit)
+        if failed or len(parts) != 2:
+            continue
+        font_floor = min(part["font_size"] for part in parts)
+        clipped = sum(
+            _count_clipped_pixels(part["alpha"], np.array(part["allowed_mask"]) > 0, part["position"])
+            for part in parts
+        )
+        if clipped:
+            continue
+        area_usage = sum(
+            (part["block"].width * part["block"].height)
+            / max(1, np.count_nonzero(np.array(part["allowed_mask"]) > 0))
+            for part in parts
+        )
+        balance_penalty = abs(parts[0]["font_size"] - parts[1]["font_size"]) * 10.0
+        score = font_floor * 100.0 + area_usage * 80.0 - balance_penalty
+        if score > best_score:
+            all_lines = []
+            for part in parts:
+                all_lines.extend(part["lines"])
+            best = {
+                "parts": parts,
+                "font_size": font_floor,
+                "lines": all_lines,
+                "status": "fit_multi_region",
+                "clipped_pixels": 0,
+                "metrics": {
+                    "outline_width": max(part["metrics"]["outline_width"] for part in parts),
+                },
+            }
+            best_score = score
+    return best
+
+
 def _alpha_fits(alpha: np.ndarray, allowed_np: np.ndarray, position: tuple[int, int]) -> bool:
     left, top = position
     height, width = alpha.shape
@@ -740,6 +919,18 @@ def _find_mask_aware_layout(
             outline_width = 0 if modern_reference_bubble else _outline_for_size(size, is_floating=is_floating)
             if text_style.get("source_cover"):
                 outline_width = max(outline_width, min(5, int(round(size * 0.12))))
+            elif is_floating:
+                if text_style.get("name") == "dark_on_light":
+                    outline_width = max(outline_width, 3 if size <= 26 else 2)
+                outline_width = min(
+                    outline_width,
+                    int(text_style.get("floating_outline_cap", outline_width)),
+                )
+            stroke_color = (
+                text_style.get("floating_stroke_color", text_style["stroke_color"])
+                if is_floating and not text_style.get("source_cover")
+                else text_style["stroke_color"]
+            )
 
             for width_ratio in width_ratios:
                 target_width = max(8.0, bounds_width * float(width_ratio))
@@ -759,7 +950,7 @@ def _find_mask_aware_layout(
                     size,
                     outline_width,
                     text_style["fill_color"],
-                    text_style["stroke_color"],
+                    stroke_color,
                 )
                 if block.width > bounds_width or block.height > bounds_height:
                     continue
@@ -837,6 +1028,18 @@ def _find_mask_aware_layout(
     fallback_outline = 0 if modern_reference_bubble else _outline_for_size(fallback_font_size, is_floating=is_floating)
     if text_style.get("source_cover"):
         fallback_outline = max(fallback_outline, min(5, int(round(fallback_font_size * 0.12))))
+    elif is_floating:
+        if text_style.get("name") == "dark_on_light":
+            fallback_outline = max(fallback_outline, 3 if fallback_font_size <= 26 else 2)
+        fallback_outline = min(
+            fallback_outline,
+            int(text_style.get("floating_outline_cap", fallback_outline)),
+        )
+    fallback_stroke_color = (
+        text_style.get("floating_stroke_color", text_style["stroke_color"])
+        if is_floating and not text_style.get("source_cover")
+        else text_style["stroke_color"]
+    )
     fallback_lines = _wrap_standard(
         words,
         fallback_font,
@@ -850,7 +1053,7 @@ def _find_mask_aware_layout(
         fallback_font_size,
         fallback_outline,
         text_style["fill_color"],
-        text_style["stroke_color"],
+        fallback_stroke_color,
     )
     fallback_position = _clamp_top_left(
         green_center,
@@ -969,7 +1172,15 @@ def run_step8_typeset():
                 )
                 red_style = _text_style_for_layout(pil_img, red_style_mask)
                 if red_style["name"] == "light_on_dark":
-                    text_style = red_style
+                    red_median = red_style.get("background_luma_median")
+                    red_p75 = red_style.get("background_luma_p75")
+                    red_is_truly_dark = (
+                        red_median is not None
+                        and red_p75 is not None
+                        and (red_median < 118 or (red_median < 132 and red_p75 < 142))
+                    )
+                    if red_is_truly_dark:
+                        text_style = red_style
             allowed_np = np.array(allowed_mask) > 0
 
             selected_text = None
@@ -984,25 +1195,37 @@ def run_step8_typeset():
                     variant,
                     uppercase=(not preserve_case and not _dense_external_text(variant)),
                 )
-                fitted_candidate = _find_mask_aware_layout(
+                fitted_candidates = []
+                split_candidate = _find_two_region_layout(
                     candidate_text,
                     layout,
                     allowed_mask,
                     text_style,
                 )
-                clipped_candidate = _count_clipped_pixels(
-                    fitted_candidate["alpha"],
-                    allowed_np,
-                    fitted_candidate["position"],
+                if split_candidate is not None:
+                    fitted_candidates.append(split_candidate)
+                fitted_candidates.append(
+                    _find_mask_aware_layout(
+                        candidate_text,
+                        layout,
+                        allowed_mask,
+                        text_style,
+                    )
                 )
-                if selected_fit is None:
-                    selected_text = candidate_text
-                    selected_fit = fitted_candidate
-                    selected_clipped_pixels = clipped_candidate
-                if clipped_candidate == 0 and fitted_candidate["status"] != "fallback_clipped":
-                    selected_text = candidate_text
-                    selected_fit = fitted_candidate
-                    selected_clipped_pixels = 0
+                accepted = False
+                for fitted_candidate in fitted_candidates:
+                    clipped_candidate = _clipped_pixels_for_fit(fitted_candidate, allowed_np)
+                    if selected_fit is None:
+                        selected_text = candidate_text
+                        selected_fit = fitted_candidate
+                        selected_clipped_pixels = clipped_candidate
+                    if clipped_candidate == 0 and fitted_candidate["status"] != "fallback_clipped":
+                        selected_text = candidate_text
+                        selected_fit = fitted_candidate
+                        selected_clipped_pixels = 0
+                        accepted = True
+                        break
+                if accepted:
                     break
 
             if selected_fit is None or selected_text is None:
@@ -1010,20 +1233,37 @@ def run_step8_typeset():
 
             en_text = selected_text
             fitted = selected_fit
-            text_block = fitted["block"]
-            alpha = fitted["alpha"]
-            left, top = fitted["position"]
-
             text_layer = Image.new("RGBA", pil_img.size, (0, 0, 0, 0))
-            text_layer.alpha_composite(text_block, (left, top))
-            if force_overlay_badge:
-                pil_img = _composite_overlay_badge(
-                    pil_img,
-                    (left, top),
-                    (text_block.width, text_block.height),
-                    fitted["font_size"],
-                    text_style,
-                )
+            if "parts" in fitted:
+                part_boxes = []
+                for part in fitted["parts"]:
+                    part_block = part["block"]
+                    part_left, part_top = part["position"]
+                    text_layer.alpha_composite(part_block, (part_left, part_top))
+                    part_boxes.append([
+                        part_left,
+                        part_top,
+                        part_left + part_block.width,
+                        part_top + part_block.height,
+                    ])
+                left = min(box[0] for box in part_boxes)
+                top = min(box[1] for box in part_boxes)
+                right = max(box[2] for box in part_boxes)
+                bottom = max(box[3] for box in part_boxes)
+            else:
+                text_block = fitted["block"]
+                left, top = fitted["position"]
+                text_layer.alpha_composite(text_block, (left, top))
+                right = left + text_block.width
+                bottom = top + text_block.height
+                if force_overlay_badge:
+                    pil_img = _composite_overlay_badge(
+                        pil_img,
+                        (left, top),
+                        (text_block.width, text_block.height),
+                        fitted["font_size"],
+                        text_style,
+                    )
 
             clipped_pixels = int(selected_clipped_pixels or 0)
             if clipped_pixels:
@@ -1037,7 +1277,7 @@ def run_step8_typeset():
                 "text": en_text,
                 "font_size": fitted["font_size"],
                 "lines": fitted["lines"],
-                "position": [left, top, left + text_block.width, top + text_block.height],
+                "position": [left, top, right, bottom],
                 "status": fitted["status"],
                 "reason": cleanup_reason,
                 "overlay_badge": force_overlay_badge,

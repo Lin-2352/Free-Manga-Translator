@@ -7,7 +7,7 @@ Step 5 — OCR & Consolidation (v4: Self-Contained Detection)
 4. Save results for Layout and Translation.
 """
 
-                                   
+
 from pathlib import Path as _BootstrapPath
 import sys as _bootstrap_sys
 _BOOTSTRAP_FILE = _BootstrapPath(__file__).resolve()
@@ -30,7 +30,7 @@ for _rel in (
     if _path not in _bootstrap_sys.path:
         _bootstrap_sys.path.insert(0, _path)
 del _BootstrapPath, _bootstrap_sys, _BOOTSTRAP_FILE, _candidate, _PROJECT_ROOT_FOR_IMPORTS, _rel, _path
-                                       
+
 import json
 import os
 import cv2
@@ -907,7 +907,7 @@ def run_step5_ocr():
             _MANGA_OCR_MODEL = load_ocr_model(force_cpu=False)
         return LocalCjkOcr(_MANGA_OCR_MODEL, None)
     
-                                               
+
     text_handle = _TEXT_HANDLE
     bubble_model = _BUBBLE_MODEL
     bubble_device = _BUBBLE_DEVICE
@@ -928,7 +928,7 @@ def run_step5_ocr():
         image = cv2.imread(str(img_path))
         h, w = image.shape[:2]
         
-                                    
+
         detect_dir = sample_path / "step_1_detect"
         step1_res_path = detect_dir / "detections.json"
         seg_mask_path = detect_dir / "seg_mask.png"
@@ -946,13 +946,13 @@ def run_step5_ocr():
             
             detect_dir.mkdir(parents=True, exist_ok=True)
             
-                            
+
             text_result = detect_text(text_handle, image, cfg)
             cv2.imwrite(str(seg_mask_path), text_result.seg_mask)
             with open(step1_res_path, 'w') as f:
                 json.dump({"boxes": [{k: int(v) for k, v in b.to_dict().items()} for b in text_result.boxes]}, f)
                 
-                                       
+
             bubble_masks = detect_bubbles(bubble_model, bubble_device, image, cfg)
             for i, bm in enumerate(bubble_masks):
                 cv2.imwrite(str(detect_dir / f"bubble_{i}.png"), bm)
@@ -963,7 +963,7 @@ def run_step5_ocr():
                                      "raw_class_name": str(r.raw_class_name), "semantic_class": str(r.semantic_class),
                                      "action": str(r.action), "confidence": float(r.confidence)} for r in semantic_result.regions]}, f)
         else:
-                                          
+
             from ml_region_lib import TextDetectionResult, SemanticDetectionResult, SemanticTextRegion
             seg_mask = cv2.imread(str(seg_mask_path), cv2.IMREAD_GRAYSCALE)
             with open(step1_res_path, 'r') as f:
@@ -985,14 +985,14 @@ def run_step5_ocr():
                 _save_ocr_outputs(sample_path, image, final_results)
                 continue
         
-                    
+
         routed = build_step2_routing_state(text_result, semantic_result, bubble_masks, cfg, w, h, ocr_runtime, image)
         
-                                            
+
         gray_img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         consolidated = consolidate_by_bubble(routed, text_result.seg_mask, bubble_masks, cfg, gray_img)
         
-                                          
+
         final_results = []
         for idx, ct in enumerate(consolidated):
             if ct.route_state == "onomatopoeia": continue
