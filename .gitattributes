@@ -1,4 +1,4 @@
-﻿# Large model/binary assets are required by the local pipeline and must use Git LFS.
+# Large model/binary assets are required by the local pipeline and must use Git LFS.
 *.onnx filter=lfs diff=lfs merge=lfs -text
 *.pt filter=lfs diff=lfs merge=lfs -text
 *.pth filter=lfs diff=lfs merge=lfs -text
