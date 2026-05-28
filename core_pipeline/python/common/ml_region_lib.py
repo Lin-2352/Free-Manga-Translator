@@ -36,13 +36,13 @@ import cv2
 import numpy as np
 import os
 
-                                                                     
-                                            
-                                                                     
-                                                                          
-                                                                              
-                                                                          
-                                               
+
+
+
+
+
+
+
 try:
     import torch
     torch_lib = os.path.join(os.path.dirname(torch.__file__), 'lib')
@@ -52,12 +52,12 @@ try:
             os.add_dll_directory(torch_lib)
 except ImportError:
     pass
-                                                                     
 
 
-                                                                             
-     
-                                                                             
+
+
+
+
 
 @dataclass(frozen=True)
 class Box:
@@ -91,26 +91,26 @@ class Box:
                 "width": self.width, "height": self.height}
 
 
-                                                                             
-        
-                                                                             
+
+
+
 
 @dataclass
 class MLConfig:
-                                   
+
     text_model_path: str = "models/comictextdetector.pt.onnx"
     confidence_threshold: float = 0.05
     nms_iou_threshold: float = 0.45
     input_size: int = 1024
 
-                                                                            
+
     semantic_model_path: str = "ragavsachdeva/magi"
     semantic_confidence: float = 0.20
     semantic_nms_iou: float = 0.45
     semantic_input_size: int = 1600
     semantic_max_det: int = 400
 
-                                                                 
+
     semantic_dialogue_confidence: float = 0.40
     semantic_onomatopoeia_confidence: float = 0.55
     semantic_post_nms_iou: float = 0.35
@@ -121,20 +121,20 @@ class MLConfig:
     semantic_max_ink_ratio: float = 0.70
     semantic_min_edge_ratio: float = 0.004
 
-                                                     
+
     bubble_model_path: str = "models/manga109_bubble/best.pt"
     bubble_confidence: float = 0.50
-    bubble_overlap_threshold: float = 0.50                                              
+    bubble_overlap_threshold: float = 0.50  # min overlap to classify as "inside bubble"
 
-                                    
+
     lama_model_path: str = "models/lama/lama_fp32.onnx"
 
-              
-    seg_threshold: float = 0.50                                   
-    seg_dilate_kernel: int = 3                                                    
+
+    seg_threshold: float = 0.50      # threshold for text seg mask
+    seg_dilate_kernel: int = 3       # dilate seg mask to cover anti-aliased edges
     seg_dilate_iterations: int = 1
 
-                                          
+
     mask_padding: int = 8
     adaptive_block_size: int = 15
     adaptive_c: int = 4
@@ -142,24 +142,24 @@ class MLConfig:
     dilate_iterations: int = 1
     inpaint_radius: int = 3
 
-                  
+
     font_path: Optional[str] = None
     font_size_max: int = 28
     font_size_min: int = 8
     font_color: Tuple[int, int, int] = (0, 0, 0)
     line_spacing: float = 1.3
 
-                         
-    green_color: Tuple[int, int, int] = (0, 255, 0)                  
-    red_color: Tuple[int, int, int] = (0, 0, 255)                      
-    yellow_color: Tuple[int, int, int] = (0, 255, 255)                  
-    bubble_outline_color: Tuple[int, int, int] = (255, 180, 0)                         
+
+    green_color: Tuple[int, int, int] = (0, 255, 0)     # bubble text
+    red_color: Tuple[int, int, int] = (0, 0, 255)       # floating text
+    yellow_color: Tuple[int, int, int] = (0, 255, 255)   # expanded mask
+    bubble_outline_color: Tuple[int, int, int] = (255, 180, 0)  # bubble contour (cyan)
     box_thickness: int = 2
 
 
-                                                                     
-                                        
-                                                                     
+
+
+
 
 def load_text_model(model_path: str, allow_cpu: bool = False):
     """Load ONNX text detector. STRICT CUDA-only."""
@@ -186,7 +186,7 @@ def load_semantic_model(model_path: str, allow_cpu: bool = False):
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
     
-                     
+
     if getattr(transformers.PreTrainedModel, "all_tied_weights_keys", None) is None or isinstance(transformers.PreTrainedModel.all_tied_weights_keys, property):
         def get_tied(self): 
             v = getattr(self, '_tied_weights_keys', {})
@@ -213,7 +213,7 @@ def load_semantic_model(model_path: str, allow_cpu: bool = False):
     for k, v in state_dict.items():
         new_k = k
         if "conv_encoder.model" in new_k: new_k = new_k.replace("conv_encoder.model", "model")
-                                                                                             
+
         if new_k.startswith("detection_transformer."):
             new_k = new_k.replace(".fc1.", ".mlp.fc1.").replace(".fc2.", ".mlp.fc2.")
             for sa in ["v", "qpos", "kpos", "qcontent", "kcontent"]:
@@ -222,7 +222,7 @@ def load_semantic_model(model_path: str, allow_cpu: bool = False):
             for ca in ["v", "qpos", "kpos", "qcontent", "kcontent", "qpos_sine"]:
                 new_k = new_k.replace(f".ca_{ca}_proj.", f".encoder_attn.{ca}_proj.")
             new_k = new_k.replace(".encoder_attn.out_proj.", ".encoder_attn.o_proj.")
-                                                                                              
+
             for prefix in ["self_attn.", "encoder_attn."]:
                 for old, new in [("kcontent_proj", "k_content_proj"), ("kpos_proj", "k_pos_proj"),
                                  ("qcontent_proj", "q_content_proj"), ("qpos_proj", "q_pos_proj"),
@@ -256,23 +256,23 @@ def classify_text_by_content(text: str) -> str:
 
     text_clean = text.strip()
 
-                                                                             
+
     letters = [c for c in text_clean if c.isalpha()]
     if letters:
         ascii_letters = [c for c in letters if c.isascii()]
         if len(ascii_letters) / len(letters) > 0.20:
             return 'english'
 
-                                                       
+
     script_text = "".join(c for c in text_clean if c.isalnum())
     if not script_text:
         return 'noise'
 
-                                                                                               
+
     if script_text.isdigit():
         return 'noise'
 
-                               
+
     katakana = sum(1 for c in script_text if '\u30A0' <= c <= '\u30FF' or c == 'ー')
     hiragana = sum(1 for c in script_text if '\u3040' <= c <= '\u309F')
     kanji    = sum(1 for c in script_text if '\u4E00' <= c <= '\u9FFF')
@@ -285,14 +285,14 @@ def classify_text_by_content(text: str) -> str:
     cjk_total = katakana + hiragana + kanji + hangul
 
     if cjk_total == 0:
-                                    
+
         return 'noise'
 
     katakana_ratio = katakana / cjk_total
 
-                                           
-                                                                               
-                                                                             
+
+
+
     if hangul >= 3:
         return 'dialogue'
     if hangul >= 2 and len(script_text) >= 3:
@@ -300,25 +300,25 @@ def classify_text_by_content(text: str) -> str:
     if hangul > 0 and len(script_text) <= 2:
         return 'sfx'
 
-                                                                            
-                                                                             
+
+
     if kanji >= 2 and hiragana == 0 and katakana == 0:
         return 'dialogue'
     if kanji == 1 and hiragana == 0 and katakana == 0:
         return 'sfx'
 
-                                                 
-                                                    
+
+
     if katakana_ratio >= 0.65 and len(script_text) <= 10:
         return 'sfx'
-                                                                          
+
     if len(script_text) <= 4 and kanji == 0:
         return 'sfx'
-                                                                             
+
     if hiragana == cjk_total and len(script_text) <= 5:
         return 'sfx'
 
-                                                                                         
+
     if kanji >= 1:
         return 'dialogue'
     if hiragana >= 3:
@@ -326,7 +326,7 @@ def classify_text_by_content(text: str) -> str:
     if hiragana >= 2 and katakana >= 1:
         return 'dialogue'
 
-                                                                            
+
     return 'noise'
 
 
@@ -398,14 +398,14 @@ def _nms(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> List[int]:
 @dataclass
 class TextDetectionResult:
     boxes: List[Box]
-    seg_mask: np.ndarray                                                     
+    seg_mask: np.ndarray   # [H_orig, W_orig] binary uint8 (255 = text pixel)
 
 
 @dataclass
 class SemanticModelHandle:
     model: object
     device: str
-    backend: str                            
+    backend: str  # "yolo_pt" or "yolo_onnx"
     input_name: Optional[str] = None
     size_input_name: Optional[str] = None
     label_map: Dict[int, str] = field(default_factory=dict)
@@ -416,8 +416,8 @@ class SemanticTextRegion:
     box: Box
     class_id: int
     raw_class_name: str
-    semantic_class: str                                
-    action: str                                     
+    semantic_class: str   # "dialogue" | "onomatopoeia"
+    action: str           # "erase" | "skip_protect"
     confidence: float
 
 
@@ -435,12 +435,12 @@ def detect_text(session, image: np.ndarray, cfg: MLConfig) -> TextDetectionResul
     sx, sy = w_orig / cfg.input_size, h_orig / cfg.input_size
     blob = _preprocess(image, cfg.input_size)
 
-                                                                       
-    outputs = session.run(None, {"images": blob})
-    blk = outputs[0][0]                        
-    seg_raw = outputs[1][0][0]                               
 
-                                    
+    outputs = session.run(None, {"images": blob})
+    blk = outputs[0][0]            # [64512, 7]
+    seg_raw = outputs[1][0][0]     # [1024, 1024] float [0,1]
+
+
     obj = blk[:, 4]
     mask = obj > cfg.confidence_threshold
     preds, obj_filtered = blk[mask], obj[mask]
@@ -456,16 +456,16 @@ def detect_text(session, image: np.ndarray, cfg: MLConfig) -> TextDetectionResul
             if bx2 > bx1 and by2 > by1:
                 boxes.append(Box(x1=bx1, y1=by1, x2=bx2, y2=by2))
 
-                                                              
+
     seg_binary = (seg_raw > cfg.seg_threshold).astype(np.uint8)
     seg_resized = cv2.resize(seg_binary, (w_orig, h_orig),
                              interpolation=cv2.INTER_NEAREST)
-                                                      
+
     if cfg.seg_dilate_kernel > 0:
         kernel = np.ones((cfg.seg_dilate_kernel, cfg.seg_dilate_kernel), np.uint8)
         seg_resized = cv2.dilate(seg_resized, kernel,
                                  iterations=cfg.seg_dilate_iterations)
-    seg_resized = seg_resized * 255            
+    seg_resized = seg_resized * 255  # 0 or 255
 
     return TextDetectionResult(boxes=boxes, seg_mask=seg_resized)
 
@@ -502,7 +502,7 @@ def detect_semantic_text_regions(
             x2=int(max(0, min(w, tx[2]))),
             y2=int(max(0, min(h, tx[3])))
         )
-                                                              
+
         dialog_conf = float(magi_dialog_conf[idx]) if idx < len(magi_dialog_conf) else 0.5
         
         regions.append(
@@ -519,9 +519,9 @@ def detect_semantic_text_regions(
     return SemanticDetectionResult(regions=regions)
 
 
-                                                                     
-                                                                 
-                                                                     
+
+
+
 
 def load_bubble_model(model_path: str, allow_cpu: bool = False):
     """Load YOLOv11n bubble segmentor. STRICT CUDA-only."""
@@ -573,22 +573,22 @@ def detect_bubbles(
 
             interior_pixels = gray[binary > 127]
             if len(interior_pixels) < 200:
-                continue                                 
+                continue  # Too small — not a real bubble
 
-                                                                     
-                                                        
+
+
             white_ratio = np.mean(interior_pixels > 200)
             if white_ratio < 0.70:
-                continue                                                           
+                continue  # Not white enough — likely face, body, or background art
 
-                                                                                  
+
             ys_b, xs_b = np.nonzero(binary)
             if len(ys_b) == 0:
                 continue
             bw = int(xs_b.max()) - int(xs_b.min()) + 1
             bh = int(ys_b.max()) - int(ys_b.min()) + 1
-                                                                                               
-                                                                                    
+
+
             if bh > bw * 2.5 and len(interior_pixels) < 5000:
                 continue
 
@@ -596,9 +596,9 @@ def detect_bubbles(
     return masks
 
 
-                                                                     
-                                         
-                                                                     
+
+
+
 
 def load_lama_model(model_path: str, allow_cpu: bool = False):
     """Load LaMa inpainting ONNX model. STRICT CUDA-only."""
@@ -632,8 +632,8 @@ def lama_inpaint(
     """
     h_orig, w_orig = image.shape[:2]
 
-                                                                                    
-                                                                                           
+
+
     pad_h = (32 - (h_orig % 32)) % 32
     pad_w = (32 - (w_orig % 32)) % 32
 
@@ -644,23 +644,23 @@ def lama_inpaint(
         img_padded = image
         mask_padded = mask
 
-                                                 
+
     img_rgb = cv2.cvtColor(img_padded, cv2.COLOR_BGR2RGB)
     img_tensor = img_rgb.astype(np.float32) / 255.0
     img_tensor = np.transpose(img_tensor, (2, 0, 1))[np.newaxis]
 
-                                               
+
     mask_tensor = (mask_padded > 127).astype(np.float32)
     mask_tensor = mask_tensor[np.newaxis, np.newaxis]
 
     try:
-                                       
+
         output = lama_session.run(None, {
             "image": img_tensor,
             "mask": mask_tensor,
         })[0]
     except Exception as e:
-                                                                 
+
         print(f"LaMa native resolution failed ({e}), falling back to 512x512 resize...")
         img_resized = cv2.resize(image, (512, 512))
         mask_resized = cv2.resize(mask, (512, 512), interpolation=cv2.INTER_NEAREST)
@@ -678,36 +678,36 @@ def lama_inpaint(
         result = cv2.resize(result, (w_orig, h_orig))
         return result
 
-                                                      
+
     result = output[0]
     result = np.transpose(result, (1, 2, 0))
     result = np.clip(result * 255, 0, 255).astype(np.uint8)
     result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
     
-                           
+
     result = result[:h_orig, :w_orig]
 
     return result
 
 
-                                                                     
-                                                          
-                                                                     
+
+
+
 
 @dataclass
 class ClassifiedText:
     box: Box
     expanded_box: Box
-    text_type: str                                                                  
-    bubble_idx: int                                      
-    overlap: float                                       
-    semantic_type: str = "unknown"                                            
-    route_state: str = "unknown"                                                               
-    action: str = "unknown"                                                      
-    mask_mode: str = "stroke"                                      
+    text_type: str       # legacy: "bubble_text"/"floating_text" or Step2 route name
+    bubble_idx: int      # index of matched bubble, or -1
+    overlap: float       # overlap ratio with best bubble
+    semantic_type: str = "unknown"   # "dialogue" | "onomatopoeia" | "unknown"
+    route_state: str = "unknown"     # "bubble_dialogue" | "floating_dialogue" | "onomatopoeia"
+    action: str = "unknown"          # "erase" | "careful_erase" | "skip_protect"
+    mask_mode: str = "stroke"        # "stroke" | "bubble_interior"
     raw_class_name: str = ""
     confidence: float = 0.0
-    overlap_collision: bool = False                                   
+    overlap_collision: bool = False  # Flag for Green Box intersection
     green_polygon: list = field(default_factory=list)
 
 
@@ -747,10 +747,10 @@ def _get_bubble_mir_internal(bubble_mask: np.ndarray, cx: int, cy: int):
     cx = max(0, min(w - 1, cx))
     cy = max(0, min(h - 1, cy))
     
-                               
+
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((bubble_mask > 127).astype(np.uint8), connectivity=8)
     
-                                                                       
+
     label_id = labels[cy, cx]
     if label_id == 0:
         best_d = 10000
@@ -789,27 +789,27 @@ def _clamp_to_mask_pixel_perfect(x1, y1, x2, y2, mask, safety=4):
     
     if x2 <= x1 or y2 <= y1: return x1, y1, x2, y2
 
-                                                               
+
     roi = mask[y1:y2, x1:x2]
     if roi.size > 0 and np.all(roi > 127):
         return int(x1 + safety), int(y1 + safety), int(x2 - safety), int(y2 - safety)
 
-                                                         
+
     for _ in range(300):
         roi = mask[y1:y2, x1:x2]
         if roi.size == 0: break
         if np.all(roi > 127):
             break
             
-                                                                                        
-                                                 
+
+
         bad_top = np.count_nonzero(mask[y1, x1:x2] <= 127)
         bad_bot = np.count_nonzero(mask[y2-1, x1:x2] <= 127)
         bad_lft = np.count_nonzero(mask[y1:y2, x1] <= 127)
         bad_rgt = np.count_nonzero(mask[y1:y2, x2-1] <= 127)
         
         mx = max(bad_top, bad_bot, bad_lft, bad_rgt)
-        if mx == 0:                
+        if mx == 0: # Interior hole
             x1 += 1
             x2 -= 1
             y1 += 1
@@ -821,10 +821,10 @@ def _clamp_to_mask_pixel_perfect(x1, y1, x2, y2, mask, safety=4):
             
         if x2 <= x1 or y2 <= y1: break
         
-                         
+
     x1, y1, x2, y2 = x1 + safety, y1 + safety, x2 - safety, y2 - safety
     
-                                                                                      
+
     if x2 <= x1 or y2 <= y1:
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
         return int(cx), int(cy), int(cx + 1), int(cy + 1)
@@ -840,16 +840,16 @@ def _clamp_to_mask_centered(cx, cy, x1, y1, x2, y2, mask, safety=4):
     h, w = mask.shape
     cx, cy = float(cx), float(cy)
     
-                                   
+
     dx = max(0.0, abs(x1 - cx), abs(x2 - cx))
     dy = max(0.0, abs(y1 - cy), abs(y2 - cy))
     
     for _ in range(300):
-                                     
+
         nx1, ny1 = int(cx - dx), int(cy - dy)
         nx2, ny2 = int(cx + dx), int(cy + dy)
         
-                                  
+
         cx1, cy1 = max(0, nx1), max(0, ny1)
         cx2, cy2 = min(w, nx2), min(h, ny2)
         
@@ -857,11 +857,11 @@ def _clamp_to_mask_centered(cx, cy, x1, y1, x2, y2, mask, safety=4):
         
         roi = mask[cy1:cy2, cx1:cx2]
         if roi.size > 0 and np.all(roi > 127):
-                                               
+
             return int(cx1 + safety), int(cy1 + safety), int(cx2 - safety), int(cy2 - safety)
             
-                                                                      
-                                            
+
+
         bad_h = np.count_nonzero(mask[cy1, cx1:cx2] <= 127) + np.count_nonzero(mask[cy2-1, cx1:cx2] <= 127)
         bad_v = np.count_nonzero(mask[cy1:cy2, cx1] <= 127) + np.count_nonzero(mask[cy1:cy2, cx2-1] <= 127)
         
@@ -869,7 +869,7 @@ def _clamp_to_mask_centered(cx, cy, x1, y1, x2, y2, mask, safety=4):
             dy -= 1.0
         elif bad_v > 0:
             dx -= 1.0
-        else:                                  
+        else: # Interior hole or both sides bad
             dx -= 1.0
             dy -= 1.0
             
@@ -885,7 +885,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
     if not routed: return []
     h, w = seg_mask.shape
 
-                                             
+
     valid_bubbles = []
     for bmask in bubble_masks:
         if gray_image is not None:
@@ -905,18 +905,18 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
     consolidated = []
     handled_mask = np.zeros((h, w), dtype=np.uint8)
 
-                                                        
+
     for b_idx, bmask in enumerate(bubble_masks):
         M_bubble_text = cv2.bitwise_and(seg_mask, bmask)
         ys, xs = np.nonzero(M_bubble_text > 127)
         if len(ys) == 0:
             continue
 
-                                                               
+
         canvas = np.zeros((h, w), dtype=np.uint8)
         canvas[ys, xs] = 255
 
-                                                                         
+
         run_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 30))
         closed_runs = cv2.morphologyEx(canvas, cv2.MORPH_CLOSE, run_kernel)
 
@@ -927,14 +927,14 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
             c_x, c_y, c_w, c_h = cv2.boundingRect(c)
             if c_w * c_h < 30:
                 continue
-                                                                         
+
             c_mask = np.zeros((h, w), dtype=np.uint8)
             cv2.drawContours(c_mask, [c], -1, 255, -1)
             raw_in_run = cv2.bitwise_and(canvas, c_mask)
             ys_r, xs_r = np.nonzero(raw_in_run)
             if len(ys_r) == 0:
                 continue
-                                                      
+
             rx1 = int(xs_r.min())
             ry1 = int(ys_r.min())
             rx2 = int(xs_r.max()) + 1
@@ -944,8 +944,8 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
                     'coords': (rx1, ry1, rx2, ry2)
                 })
 
-                                                         
-                                                                                                           
+
+
         merged = True
         while merged:
             merged = False
@@ -976,7 +976,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
         if not bubble_red_boxes:
             continue
             
-                        
+
         ys_b, xs_b = np.nonzero(bmask)
         bx1, by1 = int(xs_b.min()), int(ys_b.min())
         bx2, by2 = int(xs_b.max()), int(ys_b.max())
@@ -994,18 +994,18 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
         
         if len(ys_safe) > 0:
             dist_maps = []
-                                                               
+
             for box in bubble_red_boxes:
                 rx1, ry1, rx2, ry2 = box['coords']
-                                                                 
+
                 mask = np.ones_like(bmask, dtype=np.uint8) * 255
                 cv2.rectangle(mask, (int(rx1), int(ry1)), (int(rx2), int(ry2)), 0, -1)
                 
-                                                                  
+
                 dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
                 dist_maps.append(dist)
 
-                                                                     
+
             if dist_maps:
                 dist_stack = np.stack(dist_maps)
                 territory_ids_arr = np.argmin(dist_stack, axis=0)
@@ -1032,7 +1032,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
             gx1, gy1 = min(gx_arr), min(gy_arr)
             gx2, gy2 = max(gx_arr), max(gy_arr)
 
-                                                                  
+
             for ind_box in individual_boxes:
                 rx1, ry1, rx2, ry2 = ind_box['coords']
 
@@ -1067,7 +1067,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
             
         handled_mask = np.maximum(handled_mask, bmask)
 
-                                     
+
     floating_seg = cv2.bitwise_and(seg_mask, cv2.bitwise_not(handled_mask))
     floating_canvas = floating_seg.copy()
 
@@ -1078,9 +1078,9 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
 
     for c in final_floating_contours:
         rx, ry, rw, rh = cv2.boundingRect(c)
-                                                 
+
         if rw * rh < 300: continue
-                                                                          
+
         if rw < 10 or rh < 10: continue
 
         rx1, ry1 = rx, ry
@@ -1129,15 +1129,15 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
             green_polygon=poly_points
         ))
 
-                                               
-                                                                     
-                                                                              
+
+
+
     for ct in consolidated:
         rb = ct.box
         gb = ct.expanded_box
         poly = ct.green_polygon
 
-                                           
+
         min_gx1 = int(rb.x1 - max(1, rb.width * 0.005))
         min_gy1 = int(rb.y1 - max(1, rb.height * 0.005))
         min_gx2 = int(rb.x2 + max(1, rb.width * 0.005))
@@ -1148,7 +1148,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
         new_gx2 = max(gb.x2, min_gx2)
         new_gy2 = max(gb.y2, min_gy2)
 
-                                                         
+
         if ct.bubble_idx != -1 and ct.bubble_idx < len(bubble_masks):
             bm = bubble_masks[ct.bubble_idx]
             ys_b, xs_b = np.nonzero(bm)
@@ -1166,7 +1166,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
 
         ct.expanded_box = Box(new_gx1, new_gy1, new_gx2, new_gy2)
         if poly and len(poly) >= 3:
-                                                
+
             ct.green_polygon = [
                 [max(new_gx1, min(new_gx2, p[0])), max(new_gy1, min(new_gy2, p[1]))]
                 for p in poly
@@ -1226,7 +1226,7 @@ def build_step2_routing_state(
     for original_box in text_result.boxes:
         roi_text = text_result.seg_mask[original_box.y1:original_box.y2, original_box.x1:original_box.x2].copy()
         
-                                                             
+
         for i, bmask in enumerate(bubble_masks):
             roi_bmask = bmask[original_box.y1:original_box.y2, original_box.x1:original_box.x2]
             text_in_this_bubble = cv2.bitwise_and(roi_text, roi_bmask)
@@ -1236,14 +1236,14 @@ def build_step2_routing_state(
                 dilated = cv2.dilate(text_in_this_bubble, kernel, iterations=1)
                 contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 
-                                                                         
+
                 ys_b, xs_b = np.nonzero(bmask)
                 if len(ys_b) == 0: continue
                 b_x1, b_y1, b_x2, b_y2 = xs_b.min(), ys_b.min(), xs_b.max() + 1, ys_b.max() + 1
                 
                 for c in contours:
                     cx, cy, cw, ch = cv2.boundingRect(c)
-                    if cw * ch > 100:                                 
+                    if cw * ch > 100:  # Increased threshold for noise
                         c_roi = text_in_this_bubble[cy:cy+ch, cx:cx+cw]
                         ys, xs = np.nonzero(c_roi)
                         if len(xs) > 0 and len(ys) > 0:
@@ -1254,16 +1254,16 @@ def build_step2_routing_state(
                                 int(original_box.y1 + cy + ys.max() + 1)
                             )
 
-                            if strict_box.area < 120:                          
+                            if strict_box.area < 120: # Area-based noise filter
                                 continue
 
-                                                                                           
+
                             ocr_text = ''
                             ocr_class = 'dialogue'
                             if ocr_model is not None and image is not None:
                                 ocr_text, ocr_class = ocr_classify_region(ocr_model, image, strict_box)
                             
-                                                                         
+
                             if ocr_class in ['english', 'sfx', 'noise']:
                                 continue
                                 
@@ -1287,10 +1287,10 @@ def build_step2_routing_state(
                                 confidence=1.0,
                             ))
                 
-                                                                               
+
                 roi_text = cv2.bitwise_and(roi_text, cv2.bitwise_not(roi_bmask))
 
-                                                                                      
+
         if np.count_nonzero(roi_text) > 30:
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
             dilated = cv2.dilate(roi_text, kernel, iterations=1)
@@ -1298,7 +1298,7 @@ def build_step2_routing_state(
             
             for c in contours:
                 cx, cy, cw, ch = cv2.boundingRect(c)
-                if cw * ch > 100:                      
+                if cw * ch > 100: # Increased threshold
                     c_roi = roi_text[cy:cy+ch, cx:cx+cw]
                     ys, xs = np.nonzero(c_roi)
                     if len(xs) > 0 and len(ys) > 0:
@@ -1312,14 +1312,14 @@ def build_step2_routing_state(
                         if strict_box.area < 120:
                             continue
                         
-                                                            
+
                         ocr_text = ''
-                        ocr_class = 'dialogue'                
+                        ocr_class = 'dialogue'  # safe default
                         
                         if ocr_model is not None and image is not None:
                             ocr_text, ocr_class = ocr_classify_region(ocr_model, image, strict_box)
                         
-                                                                      
+
                         if ocr_class in ['english', 'sfx', 'noise']:
                             continue
 
@@ -1341,7 +1341,7 @@ def build_step2_routing_state(
                             confidence=1.0,
                         ))
 
-                                                                                               
+
     routed_boxes = [r.box for r in routed]
     for magi_reg in semantic_result.regions:
         m_box = magi_reg.box
@@ -1357,8 +1357,8 @@ def build_step2_routing_state(
         if already_covered:
             continue
             
-                                                            
-                                       
+
+
         inside_bubble = False
         best_bubble_idx = -1
         for i, bmask in enumerate(bubble_masks):
@@ -1387,13 +1387,13 @@ def build_step2_routing_state(
                 confidence=magi_reg.confidence,
             ))
         else:
-                                           
+
             ocr_text = ''
             ocr_class = 'dialogue'
             if ocr_model is not None and image is not None:
                 ocr_text, ocr_class = ocr_classify_region(ocr_model, image, m_box)
             
-                                          
+
             if ocr_class in ['english', 'sfx', 'noise']:
                 continue
             
@@ -1411,8 +1411,8 @@ def build_step2_routing_state(
                 confidence=magi_reg.confidence,
             ))
 
-                            
-                                                                                                                    
+
+
     routed_bubble_indices = set(r.bubble_idx for r in routed if r.bubble_idx != -1)
     
     for i, bmask in enumerate(bubble_masks):
@@ -1471,7 +1471,7 @@ def draw_step2_routing_debug(
         if ct.route_state == "bubble_dialogue":
             color = (0, 255, 0)
         elif ct.route_state == "floating_dialogue":
-            color = (255, 255, 0)                                                                                                                                                   
+            color = (255, 255, 0)  # Cyan in RGB is (0,255,255). OpenCV uses BGR natively. (255, 255, 0) is Cyan. Let's trace: BGR -> Blue=255, Green=255, Red=0 -> Cyan/Light Blue!
         elif ct.route_state == "onomatopoeia":
             color = (0, 0, 255)
         else:
@@ -1487,9 +1487,9 @@ def draw_step2_routing_debug(
     return debug
 
 
-                                                                     
-                                                                
-                                                                     
+
+
+
 
 def _extract_text_strokes(image: np.ndarray, coords: Tuple[int, int, int, int], is_bubble: bool) -> np.ndarray:
     x1, y1, x2, y2 = coords
@@ -1498,60 +1498,60 @@ def _extract_text_strokes(image: np.ndarray, coords: Tuple[int, int, int, int], 
     if bh <= 0 or bw <= 0:
         return np.zeros((max(1, bh), max(1, bw)), dtype=np.uint8)
     
-                    
+
     img_roi = image[y1:y2, x1:x2]
     
-                  
+
     gray = cv2.cvtColor(img_roi, cv2.COLOR_BGR2GRAY)
     
     if is_bubble:
-                                                          
-                                                                     
+
+
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
         
-                                                                          
+
         _, strokes = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
         
-                                           
+
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(strokes, connectivity=8)
         for i in range(1, num_labels):
             if stats[i, cv2.CC_STAT_AREA] < 3:
                 strokes[labels == i] = 0
                 
-                                           
+
         strokes = cv2.morphologyEx(strokes, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
         
     else:
-                                                                    
-                                                                            
+
+
         median_val = np.median(gray)
-                                                                                            
-                                                                
+
+
         thresh_type = cv2.THRESH_BINARY if median_val < 160 else cv2.THRESH_BINARY_INV
         
-                                                                          
+
         gray = cv2.medianBlur(gray, 3)
         
-                           
+
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
         
-                                                                   
+
         strokes = cv2.adaptiveThreshold(
             gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             thresh_type,
-            17,                          
-            12,                             
+            17,  # slightly tighter block
+            12,  # slightly more forgiving C
         )
         
-                                                            
+
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(strokes, connectivity=8)
         for i in range(1, num_labels):
-            if stats[i, cv2.CC_STAT_AREA] < 10:                                                 
+            if stats[i, cv2.CC_STAT_AREA] < 10:  # Much more aggressive area filter for floating
                 strokes[labels == i] = 0
                 
-                                        
+
         strokes = cv2.morphologyEx(strokes, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
         
     return strokes
@@ -1585,7 +1585,7 @@ def build_step3_dynamic_mask(
     bubble_mask_out = np.zeros((h, w), dtype=np.uint8)
     floating_mask_out = np.zeros((h, w), dtype=np.uint8)
     
-                                                                           
+
     bubble_union = None
     if bubble_masks:
         bubble_union = np.zeros((h, w), dtype=np.uint8)
@@ -1595,22 +1595,22 @@ def build_step3_dynamic_mask(
     for ct in routed:
         box = ct.box
         
-                                                                            
+
         pad = 4
         y1, y2 = max(0, box.y1 - pad), min(h, box.y2 + pad)
         x1, x2 = max(0, box.x1 - pad), min(w, box.x2 + pad)
         
-                                                                                        
-                                                                                            
-                                                                                  
-                                                        
+
+
+
+
         if ct.route_state == "floating_dialogue":
             y1 = max(0, y1 - 50)
             
         padded_coords = (x1, y1, x2, y2)
         
         if ct.route_state == "bubble_dialogue":
-                                       
+
             box_area = (x2 - x1) * (y2 - y1)
             roi_seg_check = seg_mask[y1:y2, x1:x2]
             seg_density = np.count_nonzero(roi_seg_check) / max(1, box_area)
@@ -1627,11 +1627,11 @@ def build_step3_dynamic_mask(
             else:
                 strokes = roi_seg_bin
                 
-                                                  
+
             kernel = np.ones((3, 3), np.uint8)
             strokes = cv2.dilate(strokes, kernel, iterations=2)
             
-                                                                        
+
             if bubble_union is not None:
                 bubble_roi = bubble_union[y1:y2, x1:x2]
                 strokes = cv2.bitwise_and(strokes, bubble_roi)
@@ -1639,27 +1639,27 @@ def build_step3_dynamic_mask(
             bubble_mask_out[y1:y2, x1:x2] = np.maximum(bubble_mask_out[y1:y2, x1:x2], strokes)
         
         elif ct.route_state == "floating_dialogue":
-                                                                              
-                                                                           
-                                                                                  
-                                                                 
+
+
+
+
             box_area = (x2 - x1) * (y2 - y1)
             roi_seg_check = seg_mask[y1:y2, x1:x2]
             seg_density = np.count_nonzero(roi_seg_check) / max(1, box_area)
             if box_area > 5000 and seg_density < 0.05:
-                continue                                                               
+                continue  # Skip: giant box with almost no text pixels = false positive
             
-                                                                                      
+
             roi_seg = seg_mask[y1:y2, x1:x2].copy()
             _, roi_seg_bin = cv2.threshold(roi_seg, 127, 255, cv2.THRESH_BINARY)
             
-                                                                                                                                                   
+
             if np.count_nonzero(roi_seg_bin) >= 10:
                 roi_mask = roi_seg_bin
             else:
                 roi_mask = _extract_text_strokes(image, (x1, y1, x2, y2), is_bubble=False)
                 
-                                                                     
+
             dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             dilated_strokes = cv2.dilate(roi_mask, dilate_kernel, iterations=1)
             
@@ -1667,16 +1667,16 @@ def build_step3_dynamic_mask(
                 floating_mask_out[y1:y2, x1:x2], dilated_strokes
             )
 
-                                     
+
     
-                                          
+
     final_full_mask = np.maximum(bubble_mask_out, floating_mask_out)
     return final_full_mask
 
 
-                                                                     
-                                         
-                                                                     
+
+
+
 
 def expand_boxes(boxes: List[Box], pad: int, img_w: int, img_h: int) -> List[Box]:
     return [b.expanded(pad, img_w, img_h) for b in boxes]
@@ -1697,31 +1697,31 @@ def erase_regions_selective(
     """
     h, w = image.shape[:2]
 
-                                      
-                                                                            
+
+
     final_mask = np.zeros((h, w), dtype=np.uint8)
 
     for ct in classified:
         if ct.text_type != "bubble_text":
-            continue                      
+            continue  # SKIP floating text
 
-                                     
+
         b = ct.expanded_box
-                                                   
+
         roi_seg = seg_mask[b.y1:b.y2, b.x1:b.x2]
-                               
+
         final_mask[b.y1:b.y2, b.x1:b.x2] = np.maximum(
             final_mask[b.y1:b.y2, b.x1:b.x2], roi_seg
         )
 
-                                            
+
     if np.count_nonzero(final_mask) == 0:
         return image.copy()
 
-                                                       
+
     inpainted = lama_inpaint(lama_session, image, final_mask)
 
-                                                                            
+
     result = image.copy()
     mask_bool = final_mask > 127
     result[mask_bool] = inpainted[mask_bool]
@@ -1729,9 +1729,9 @@ def erase_regions_selective(
     return result
 
 
-                                                                     
-                                 
-                                                                     
+
+
+
 
 def insert_text(image, expanded_boxes, translations, cfg):
     result = image.copy()
@@ -1817,9 +1817,9 @@ def _wrap_text_pillow(draw, text, font, max_w):
     return lines or [text]
 
 
-                                                                     
-                     
-                                                                     
+
+
+
 
 def draw_debug_boxes(
     image: np.ndarray,
@@ -1837,18 +1837,18 @@ def draw_debug_boxes(
     """
     debug = image.copy()
 
-                                                                        
+
     for bmask in bubble_masks:
         contours, _ = cv2.findContours(bmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(debug, contours, -1, (255, 0, 0), 2)             
+        cv2.drawContours(debug, contours, -1, (255, 0, 0), 2)  # Blue, 2px
 
-                                                                        
+
     for ct in classified:
         rb = ct.box
-                                 
+
         cv2.rectangle(debug, (rb.x1, rb.y1), (rb.x2, rb.y2), (0, 0, 255), 2)
 
-                                                                    
+
         poly = getattr(ct, 'green_polygon', [])
         if poly and len(poly) >= 3:
             pts = np.array(poly, np.int32).reshape((-1, 1, 2))
@@ -1880,9 +1880,9 @@ def draw_semantic_class_debug(
     return debug
 
 
-                                                                     
-               
-                                                                     
+
+
+
 
 def run_pipeline(
     image_path: str | Path,
@@ -1899,22 +1899,22 @@ def run_pipeline(
         raise FileNotFoundError(f"Cannot load image: {image_path}")
     h, w = image.shape[:2]
 
-                                                    
+
     text_result = detect_text(text_session, image, cfg)
     seg_mask = text_result.seg_mask
     print(f"  [Step 1] Model A: {len(text_result.boxes)} text regions")
 
-                                           
+
     if semantic_handle is None:
         semantic_handle = load_semantic_model(cfg.semantic_model_path)
     semantic_result = detect_semantic_text_regions(semantic_handle, image, cfg)
     print(f"  [Step 1b] Magi: {len(semantic_result.regions)} semantic regions")
 
-                                       
+
     bubble_masks = detect_bubbles(bubble_model, bubble_device, image, cfg)
     print(f"  [Step 2] Model B: {len(bubble_masks)} speech bubbles")
 
-                                     
+
     if ocr_model is None:
         ocr_model = load_ocr_model()
     
@@ -1929,13 +1929,13 @@ def run_pipeline(
     n_float = sum(1 for c in consolidated if c.route_state == "floating_dialogue")
     print(f"  [Step 3] Consolidation: {n_bubble} bubble dialogue, {n_float} floating dialogue")
 
-                                                              
+
     erased_image = erase_regions_selective(
         image, consolidated, seg_mask, bubble_masks, lama_session, cfg,
     )
     print(f"  [Step 4] LaMa inpainted {n_bubble} bubble regions")
 
-                 
+
     debug_image = draw_debug_boxes(image, consolidated, bubble_masks, seg_mask, cfg)
 
     return {
@@ -1949,9 +1949,9 @@ def run_pipeline(
     }
 
 
-                                                                     
-              
-                                                                     
+
+
+
 
 SAMPLE_MAP = {
     "sample1": "sample.jpg",
@@ -1973,7 +1973,7 @@ def run_all_samples(
     bubble_device: str,
     lama_session,
 ):
-                                                        
+
     print("Pre-loading models for batch run...")
     semantic_handle = load_semantic_model(cfg.semantic_model_path)
     ocr_model = load_ocr_model()
@@ -1985,7 +1985,7 @@ def run_all_samples(
             continue
 
         sample_dir = samples_dir / sample_name
-                                 
+
         out_dir = sample_dir / "step_final_output"
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2003,7 +2003,7 @@ def run_all_samples(
             ocr_model=ocr_model,
         )
 
-                                                          
+
         cv2.imwrite(str(out_dir / "seg_mask.png"), result["seg_mask"])
         cv2.imwrite(str(out_dir / "erased_inpainted.png"), result["erased_image"])
         cv2.imwrite(str(out_dir / "debug_layout_boxes.jpg"), result["debug_image"])
@@ -2143,9 +2143,9 @@ def run_step2_routing_test(
     print(f"[Step2 Test] saved: {out_img}")
 
 
-                                                                     
-     
-                                                                     
+
+
+
 
 def main():
     import argparse
@@ -2186,11 +2186,11 @@ def main():
         mask_padding=args.padding,
     )
 
-                                                                     
+
     if args.semantic_test:
         test_image_path = args.semantic_test_image
 
-                                                                   
+
         if not test_image_path.exists() and str(args.semantic_test_image).replace("\\", "/") == "samples/sample4/sample4.jpg":
             candidates = [
                 Path("samples/sample4/sample4.jpg"),
@@ -2223,13 +2223,13 @@ def main():
         print(f"[Semantic Test] saved: {out_path}")
         return
 
-                                                                    
+
     if args.semantic_test_all:
         semantic_handle = load_semantic_model(cfg.semantic_model_path, allow_cpu=args.allow_cpu)
         run_semantic_test_all_samples(cfg, args.samples_dir, semantic_handle)
         return
 
-                                                                 
+
     if args.step2_routing_test:
         test_image_path = args.semantic_test_image
         if not test_image_path.exists() and str(args.semantic_test_image).replace("\\", "/") == "samples/sample4/sample4.jpg":

@@ -10,7 +10,7 @@ Anime/Manga LaMa checkpoint is reserved for masks that are safe to synthesize.
 """
 
 
-                                   
+
 from pathlib import Path as _BootstrapPath
 import sys as _bootstrap_sys
 _BOOTSTRAP_FILE = _BootstrapPath(__file__).resolve()
@@ -33,12 +33,14 @@ for _rel in (
     if _path not in _bootstrap_sys.path:
         _bootstrap_sys.path.insert(0, _path)
 del _BootstrapPath, _bootstrap_sys, _BOOTSTRAP_FILE, _candidate, _PROJECT_ROOT_FOR_IMPORTS, _rel, _path
-                                       
+
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+from typing import Sequence
 
 import cv2
 import numpy as np
@@ -47,7 +49,7 @@ from pipeline_paths import DEFAULT_SAMPLES_ROOT, sample_root_from_env
 
 try:
     import torch
-except ImportError:                                                              
+except ImportError:  # pragma: no cover - fallback for environments without torch
     torch = None
 
 from ml_region_lib import (
@@ -272,7 +274,19 @@ def _context_crop_bounds(img_h: int, img_w: int, x1: int, y1: int, x2: int, y2: 
     return crop_x1, crop_y1, crop_x2, crop_y2
 
 
-def _anime_lama_local_crop(anime_model, anime_device, image, mask, img_h, img_w, x1, y1, x2, y2):
+def _anime_lama_local_crop(
+    anime_model,
+    anime_device,
+    image,
+    mask,
+    img_h,
+    img_w,
+    x1,
+    y1,
+    x2,
+    y2,
+    blend_mask=None,
+):
     crop_x1, crop_y1, crop_x2, crop_y2 = _context_crop_bounds(img_h, img_w, x1, y1, x2, y2)
     crop_img = image[crop_y1:crop_y2, crop_x1:crop_x2].copy()
     crop_mask = mask[crop_y1:crop_y2, crop_x1:crop_x2].copy()
@@ -280,8 +294,15 @@ def _anime_lama_local_crop(anime_model, anime_device, image, mask, img_h, img_w,
     if not np.any(crop_mask > 0):
         return
 
+    if blend_mask is None:
+        crop_blend_mask = crop_mask
+    else:
+        crop_blend_mask = blend_mask[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+        if not np.any(crop_blend_mask > 0):
+            crop_blend_mask = crop_mask
+
     inpainted_crop = _anime_lama_inpaint(anime_model, anime_device, crop_img, crop_mask)
-    alpha = cv2.GaussianBlur((crop_mask > 0).astype(np.float32), (0, 0), 1.8)
+    alpha = cv2.GaussianBlur((crop_blend_mask > 0).astype(np.float32), (0, 0), 1.8)
     alpha = np.clip(alpha[..., None], 0.0, 1.0)
 
     view = image[crop_y1:crop_y2, crop_x1:crop_x2]
@@ -289,7 +310,7 @@ def _anime_lama_local_crop(anime_model, anime_device, image, mask, img_h, img_w,
         inpainted_crop.astype(np.float32) * alpha
         + view.astype(np.float32) * (1.0 - alpha)
     ).astype(np.uint8)
-    view[crop_mask > 0] = blended[crop_mask > 0]
+    view[crop_blend_mask > 0] = blended[crop_blend_mask > 0]
 
 
 def _manga_cleaner_local_crop(image, mask, img_h, img_w, x1, y1, x2, y2) -> bool:
@@ -466,34 +487,49 @@ def _final_flat_paper_cleanup(reference: np.ndarray, image: np.ndarray, mask: np
         if x2 <= x or y2 <= y:
             continue
 
+        bbox_area = max(1, w * h)
+        bbox_density = float(area) / float(bbox_area)
+        if bbox_density >= 0.40 or bbox_area >= 12000:
+            continue
+
         roi = reference[y:y2, x:x2]
         roi_mask = mask[y:y2, x:x2]
-        if h >= 72 and h > w * 1.25:
-            pad = 22
-            rx1 = max(0, x - pad)
-            ry1 = max(0, y - pad)
-            rx2 = min(reference.shape[1], x2 + pad)
-            ry2 = min(reference.shape[0], y2 + pad)
-            patch = reference[ry1:ry2, rx1:rx2]
-            if patch.size:
-                ring = np.ones(patch.shape[:2], dtype=bool)
-                ix1 = max(0, x - rx1)
-                iy1 = max(0, y - ry1)
-                ix2 = min(patch.shape[1], x2 - rx1)
-                iy2 = min(patch.shape[0], y2 - ry1)
-                ring[iy1:iy2, ix1:ix2] = False
-                if np.count_nonzero(ring) >= 80:
-                    ring_gray_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-                    ring_hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-                    ring_gray = ring_gray_patch[ring]
-                    ring_sat = ring_hsv_patch[:, :, 1][ring]
-                    gray_tone_fraction = float(
-                        np.mean((ring_gray >= 95) & (ring_gray <= 218) & (ring_sat < 145))
-                    )
-                    ring_median = float(np.median(ring_gray))
-                    ring_edges = float(np.mean(cv2.Canny(ring_gray_patch, 45, 135)[ring] > 0))
-                    if gray_tone_fraction >= 0.45 and 95.0 <= ring_median <= 205.0 and ring_edges <= 0.11:
-                        continue
+        pad = 22
+        rx1 = max(0, x - pad)
+        ry1 = max(0, y - pad)
+        rx2 = min(reference.shape[1], x2 + pad)
+        ry2 = min(reference.shape[0], y2 + pad)
+        patch = reference[ry1:ry2, rx1:rx2]
+        if patch.size:
+            ring = np.ones(patch.shape[:2], dtype=bool)
+            ix1 = max(0, x - rx1)
+            iy1 = max(0, y - ry1)
+            ix2 = min(patch.shape[1], x2 - rx1)
+            iy2 = min(patch.shape[0], y2 - ry1)
+            ring[iy1:iy2, ix1:ix2] = False
+            if np.count_nonzero(ring) >= 80:
+                ring_gray_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+                ring_hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+                ring_gray = ring_gray_patch[ring]
+                ring_sat = ring_hsv_patch[:, :, 1][ring]
+                gray_tone_fraction = float(
+                    np.mean((ring_gray >= 95) & (ring_gray <= 218) & (ring_sat < 145))
+                )
+                ring_median = float(np.median(ring_gray))
+                ring_edges = float(np.mean(cv2.Canny(ring_gray_patch, 45, 135)[ring] > 0))
+                bright_halftone_fraction = float(
+                    np.mean((ring_gray > 230) & (ring_sat < 155))
+                )
+                if (
+                    gray_tone_fraction >= 0.45
+                    and 95.0 <= ring_median <= 205.0
+                    and ring_edges <= 0.11
+                ) or (
+                    ring_median >= 228.0
+                    and bright_halftone_fraction >= 0.52
+                    and ring_edges <= 0.13
+                ):
+                    continue
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         paper_pixels = (gray > 168) & (hsv[:, :, 1] < 145)
@@ -1702,6 +1738,8 @@ def _stroke_only_inpaint_repair(
     coords: tuple[int, int, int, int],
     mask_roi: np.ndarray,
     radius: float = 2.0,
+    max_seed_density: float = 0.46,
+    max_repair_density: float = 0.42,
 ) -> np.ndarray | None:
     """Remove only detected source glyph strokes, never the whole text box.
 
@@ -1722,7 +1760,7 @@ def _stroke_only_inpaint_repair(
     if seed_count < 6:
         return None
     seed_density = seed_count / float(area)
-    if seed_density > 0.46:
+    if seed_density > max_seed_density:
         return None
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -1792,7 +1830,7 @@ def _stroke_only_inpaint_repair(
     if repair_count < 6:
         return None
     repair_density = repair_count / float(area)
-    if repair_density > 0.42:
+    if repair_density > max_repair_density:
         return None
 
     pad = max(12, min(34, int(max(width, height) * 0.10)))
@@ -1815,6 +1853,698 @@ def _stroke_only_inpaint_repair(
     target_view[crop_mask > 0] = repaired[crop_mask > 0]
     _local_repair_tone_match(source, target, coords, repair)
     return repair
+
+
+def _pure_paper_source_inpaint(
+    source: np.ndarray,
+    target: np.ndarray,
+    coords: tuple[int, int, int, int],
+    mask_roi: np.ndarray,
+) -> np.ndarray | None:
+    x1, y1, x2, y2 = coords
+    roi = source[y1:y2, x1:x2]
+    if roi.size == 0 or mask_roi.size == 0:
+        return None
+
+    repair = (mask_roi > 0).astype(np.uint8) * 255
+    if np.count_nonzero(repair > 0) < 8:
+        return None
+
+    height, width = repair.shape[:2]
+    area = max(1, height * width)
+    density = float(np.count_nonzero(repair > 0)) / float(area)
+    if density < 0.015 or density > 0.62:
+        return None
+
+    repair_background = cv2.dilate(
+        repair,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    ) <= 0
+    if np.count_nonzero(repair_background) < max(32, int(area * 0.08)):
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    background_gray = gray[repair_background].astype(np.float32)
+    bright_fraction = float(np.mean(background_gray > 232))
+    mid_fraction = float(np.mean((background_gray >= 82) & (background_gray <= 220)))
+    dark_fraction = float(np.mean(background_gray < 82))
+    saturation_p80 = float(np.percentile(hsv[:, :, 1][repair_background], 80))
+    edge_density = float(np.mean((cv2.Canny(gray, 45, 135) > 0)[repair_background]))
+    luma_std = float(np.std(background_gray))
+
+    pure_paper = (
+        bright_fraction >= 0.88
+        and mid_fraction <= 0.13
+        and dark_fraction <= 0.10
+        and saturation_p80 <= 72.0
+        and edge_density <= 0.105
+        and luma_std <= 46.0
+    )
+    if not pure_paper:
+        return None
+
+    try:
+        telea = cv2.inpaint(target[y1:y2, x1:x2], repair, 1.25, cv2.INPAINT_TELEA)
+        navier = cv2.inpaint(target[y1:y2, x1:x2], repair, 1.0, cv2.INPAINT_NS)
+    except cv2.error:
+        return None
+
+    repaired = cv2.addWeighted(telea, 0.82, navier, 0.18, 0)
+    target_roi = target[y1:y2, x1:x2]
+    target_roi[repair > 0] = repaired[repair > 0]
+    return repair
+
+
+def _smooth_gradient_source_text_fill(
+    source: np.ndarray,
+    target: np.ndarray,
+    coords: tuple[int, int, int, int],
+    mask_roi: np.ndarray,
+) -> np.ndarray | None:
+    x1, y1, x2, y2 = coords
+    roi = source[y1:y2, x1:x2]
+    if roi.size == 0 or mask_roi.size == 0:
+        return None
+
+    height, width = roi.shape[:2]
+    area = max(1, height * width)
+    if height < 54 or width < 24:
+        return None
+    narrow_vertical = width <= 92 and height >= width * 1.55
+
+    outlined = _outlined_floating_source_mask(source, coords, mask_roi)
+    repair = outlined if outlined is not None else mask_roi
+    if outlined is not None:
+        combined_repair = cv2.bitwise_or(outlined, (mask_roi > 0).astype(np.uint8) * 255)
+        combined_density = float(np.count_nonzero(combined_repair > 0)) / float(area)
+        if combined_density <= 0.62:
+            repair = combined_repair
+    repair = (repair > 0).astype(np.uint8) * 255
+    repair = cv2.morphologyEx(
+        repair,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+
+    repair_count = int(np.count_nonzero(repair > 0))
+    if repair_count < 10:
+        return None
+    repair_density = repair_count / float(area)
+    if repair_density < 0.025 or repair_density > 0.44:
+        return None
+
+    fit_mask = cv2.dilate(
+        repair,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    background = fit_mask <= 0
+    if np.count_nonzero(background) < max(40, int(area * 0.08)):
+        fit_mask = repair
+        background = repair <= 0
+    if np.count_nonzero(background) < max(40, int(area * 0.08)):
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    roi_dark_fraction = float(np.mean(gray < 118))
+    roi_bright_fraction = float(np.mean(gray > 218))
+    roi_luma_std = float(np.std(gray.astype(np.float32)))
+    if roi_dark_fraction >= 0.18 and roi_bright_fraction >= 0.16 and roi_luma_std >= 70.0:
+        return None
+
+    bg_gray = gray[background].astype(np.float32)
+    bg_bright = float(np.mean(bg_gray > 232))
+    bg_mid = float(np.mean((bg_gray >= 70) & (bg_gray <= 225)))
+    bg_dark = float(np.mean(bg_gray < 62))
+    bg_std = float(np.std(bg_gray))
+    bg_edges = float(np.mean((cv2.Canny(gray, 45, 135) > 0)[background]))
+    low_saturation = float(np.mean(hsv[:, :, 1][background] < 150))
+
+    fitted = None
+    stats = None
+    if narrow_vertical and repair_density >= 0.62:
+        context_padding = max(42, min(118, int(max(width, height) * 0.45)))
+        fitted, stats = _tone_fit_context_background(
+            target,
+            coords,
+            fit_mask,
+            padding=context_padding,
+            rowwise=True,
+        )
+        if not (
+            fitted is not None
+            and 78.0 <= stats.get("median", 0.0) <= 236.0
+            and stats.get("std", 99.0) <= 60.0
+            and stats.get("edge_density", 1.0) <= 0.13
+            and stats.get("dark_fraction", 1.0) <= 0.18
+            and stats.get("bright_fraction", 1.0) <= 0.42
+        ):
+            fitted = None
+            stats = None
+
+    local_background = background & (gray >= 70) & (gray <= 232) & (hsv[:, :, 1] < 150)
+    if fitted is None and bg_mid >= 0.28 and np.count_nonzero(local_background) >= max(36, int(area * 0.035)):
+        background_pixels = roi[local_background].astype(np.float32)
+        background_gray = gray[local_background].astype(np.float32)
+        global_color = np.median(background_pixels, axis=0)
+        fitted = np.empty_like(roi)
+        row_colors = np.empty((height, 3), dtype=np.float32)
+        band_radius = max(4, min(18, height // 18))
+        for row_index in range(height):
+            row_y1 = max(0, row_index - band_radius)
+            row_y2 = min(height, row_index + band_radius + 1)
+            row_background = local_background[row_y1:row_y2]
+            if np.count_nonzero(row_background) >= 8:
+                row_pixels = roi[row_y1:row_y2][row_background].astype(np.float32)
+                row_color = np.median(row_pixels, axis=0)
+            else:
+                row_color = global_color
+            row_colors[row_index, :] = row_color
+        if height >= 7:
+            sigma_y = max(1.8, min(9.0, height / 36.0))
+            row_colors = cv2.GaussianBlur(
+                row_colors.reshape(height, 1, 3),
+                (1, 0),
+                sigmaX=0,
+                sigmaY=sigma_y,
+            ).reshape(height, 3)
+        fitted[:, :, :] = np.clip(row_colors[:, None, :], 0, 255).astype(np.uint8)
+        stats = {
+            "median": float(np.median(background_gray)),
+            "std": float(np.std(background_gray)),
+            "edge_density": float(np.mean((cv2.Canny(gray, 45, 135) > 0)[local_background])),
+            "dark_fraction": float(np.mean(background_gray < 82)),
+            "bright_fraction": float(np.mean(background_gray > 232)),
+        }
+    else:
+        fitted, stats = _tone_fit_context_background(
+            source,
+            coords,
+            fit_mask,
+            padding=max(30, min(92, int(max(width, height) * 0.30))),
+            rowwise=True,
+        )
+        if fitted is None:
+            return None
+
+    local_smooth = (
+        low_saturation >= 0.82
+        and bg_mid >= 0.14
+        and bg_dark <= 0.22
+        and bg_std <= 58.0
+        and bg_edges <= 0.14
+        and not (bg_bright > 0.90 and bg_mid < 0.12)
+    )
+    context_smooth = (
+        82.0 <= stats.get("median", 0.0) <= 225.0
+        and stats.get("std", 99.0) <= 44.0
+        and stats.get("edge_density", 1.0) <= 0.12
+        and stats.get("dark_fraction", 1.0) <= 0.18
+        and stats.get("bright_fraction", 1.0) <= 0.38
+    )
+    if not (local_smooth or context_smooth):
+        return None
+
+    apply_mask = repair
+    if (
+        context_smooth
+        and stats.get("std", 99.0) <= 36.0
+        and stats.get("edge_density", 1.0) <= 0.04
+        and stats.get("dark_fraction", 1.0) <= 0.04
+        and (height >= width * 1.15 or repair_density >= 0.30)
+    ):
+        apply_mask = cv2.dilate(
+            repair,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
+        )
+
+    target_roi = target[y1:y2, x1:x2]
+    target_roi[apply_mask > 0] = fitted[apply_mask > 0]
+    target_gray = cv2.cvtColor(target_roi, cv2.COLOR_BGR2GRAY)
+    residual_near_text = cv2.dilate(
+        apply_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
+        iterations=1,
+    ) > 0
+    residual_halo = (
+        residual_near_text
+        & (gray >= 218)
+        & (target_gray >= 234)
+        & (hsv[:, :, 1] < 145)
+    )
+    residual_halo = cv2.morphologyEx(
+        residual_halo.astype(np.uint8) * 255,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    residual_density = float(np.count_nonzero(residual_halo > 0)) / float(area)
+    if 0.002 <= residual_density <= 0.22:
+        residual_halo = cv2.dilate(
+            residual_halo,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+        target_roi[residual_halo > 0] = fitted[residual_halo > 0]
+        apply_mask = cv2.bitwise_or(apply_mask, residual_halo)
+    return apply_mask
+
+
+def _dense_smooth_tone_source_text_fill(
+    source: np.ndarray,
+    target: np.ndarray,
+    coords: tuple[int, int, int, int],
+    mask_roi: np.ndarray,
+) -> np.ndarray | None:
+    x1, y1, x2, y2 = coords
+    roi = source[y1:y2, x1:x2]
+    if roi.size == 0 or mask_roi.size == 0:
+        return None
+
+    height, width = roi.shape[:2]
+    area = max(1, height * width)
+    if height < 54 or width < 24:
+        return None
+
+    narrow_vertical = width <= 92 and height >= width * 1.55
+    max_repair_density = 1.001 if narrow_vertical else 0.96
+    outlined = _outlined_floating_source_mask(source, coords, mask_roi)
+    if outlined is not None:
+        combined_repair = cv2.bitwise_or(outlined, (mask_roi > 0).astype(np.uint8) * 255)
+        combined_density = float(np.count_nonzero(combined_repair > 0)) / float(area)
+        repair = combined_repair if combined_density <= max_repair_density else mask_roi
+    else:
+        repair = mask_roi
+    repair = (repair > 0).astype(np.uint8) * 255
+    repair = cv2.morphologyEx(
+        repair,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+
+    repair_count = int(np.count_nonzero(repair > 0))
+    if repair_count < 10:
+        return None
+    repair_density = repair_count / float(area)
+    if repair_density < 0.18 or repair_density > max_repair_density:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    fit_mask = cv2.dilate(
+        repair,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        iterations=1,
+    )
+    background = fit_mask <= 0
+    if np.count_nonzero(background) < max(28, int(area * 0.035)):
+        fit_mask = repair
+        background = repair <= 0
+    if np.count_nonzero(background) < max(28, int(area * 0.035)):
+        if not narrow_vertical:
+            return None
+        fitted, stats = _tone_fit_context_background(
+            target,
+            coords,
+            repair,
+            padding=max(30, min(92, int(max(width, height) * 0.30))),
+            rowwise=True,
+        )
+        if fitted is None:
+            fitted, stats = _tone_fit_context_background(
+                source,
+                coords,
+                repair,
+                padding=max(30, min(92, int(max(width, height) * 0.30))),
+                rowwise=True,
+            )
+        if fitted is None:
+            return None
+        if not (
+            74.0 <= stats.get("median", 0.0) <= 232.0
+            and stats.get("std", 99.0) <= 56.0
+            and stats.get("edge_density", 1.0) <= 0.16
+            and stats.get("dark_fraction", 1.0) <= 0.18
+            and stats.get("bright_fraction", 1.0) <= 0.46
+        ):
+            return None
+        target_roi = target[y1:y2, x1:x2]
+        target_roi[repair > 0] = fitted[repair > 0]
+        return repair
+
+    bg_gray = gray[background].astype(np.float32)
+    bg_mid = float(np.mean((bg_gray >= 70) & (bg_gray <= 230)))
+    bg_dark = float(np.mean(bg_gray < 62))
+    bg_bright = float(np.mean(bg_gray > 238))
+    bg_std = float(np.std(bg_gray))
+    bg_edges = float(np.mean((cv2.Canny(gray, 45, 135) > 0)[background]))
+    low_saturation = float(np.mean(hsv[:, :, 1][background] < 150))
+
+    if low_saturation < 0.86 or bg_dark > 0.12 or bg_edges > 0.11:
+        return None
+    if bg_std > 42.0 and bg_mid < 0.58:
+        return None
+    if bg_bright > 0.92 and bg_mid < 0.08:
+        return None
+
+    local_background = background & (gray >= 70) & (gray <= 232) & (hsv[:, :, 1] < 150)
+    fitted = None
+    stats = None
+    if bg_mid >= 0.28 and np.count_nonzero(local_background) >= max(36, int(area * 0.035)):
+        background_pixels = roi[local_background].astype(np.float32)
+        background_gray = gray[local_background].astype(np.float32)
+        global_color = np.median(background_pixels, axis=0)
+        fitted = np.empty_like(roi)
+        row_colors = np.empty((height, 3), dtype=np.float32)
+        band_radius = max(4, min(18, height // 18))
+        for row_index in range(height):
+            row_y1 = max(0, row_index - band_radius)
+            row_y2 = min(height, row_index + band_radius + 1)
+            row_background = local_background[row_y1:row_y2]
+            if np.count_nonzero(row_background) >= 8:
+                row_pixels = roi[row_y1:row_y2][row_background].astype(np.float32)
+                row_color = np.median(row_pixels, axis=0)
+            else:
+                row_color = global_color
+            row_colors[row_index, :] = row_color
+        if height >= 7:
+            sigma_y = max(1.8, min(9.0, height / 36.0))
+            row_colors = cv2.GaussianBlur(
+                row_colors.reshape(height, 1, 3),
+                (1, 0),
+                sigmaX=0,
+                sigmaY=sigma_y,
+            ).reshape(height, 3)
+        fitted[:, :, :] = np.clip(row_colors[:, None, :], 0, 255).astype(np.uint8)
+        stats = {
+            "median": float(np.median(background_gray)),
+            "std": float(np.std(background_gray)),
+            "edge_density": float(np.mean((cv2.Canny(gray, 45, 135) > 0)[local_background])),
+            "dark_fraction": float(np.mean(background_gray < 82)),
+            "bright_fraction": float(np.mean(background_gray > 232)),
+        }
+    elif fitted is None:
+        fitted, stats = _tone_fit_context_background(
+            target,
+            coords,
+            fit_mask,
+            padding=max(30, min(92, int(max(width, height) * 0.30))),
+            rowwise=True,
+        )
+        if fitted is None:
+            fitted, stats = _tone_fit_context_background(
+                source,
+                coords,
+                fit_mask,
+                padding=max(30, min(92, int(max(width, height) * 0.30))),
+                rowwise=True,
+            )
+        if fitted is None:
+            return None
+    if not (82.0 <= stats.get("median", 0.0) <= 236.0):
+        return None
+    max_background_std = 56.0 if narrow_vertical else 36.0
+    max_background_edge_density = 0.095 if narrow_vertical else 0.065
+    if (
+        stats.get("std", 99.0) > max_background_std
+        or stats.get("edge_density", 1.0) > max_background_edge_density
+    ):
+        return None
+    if stats.get("dark_fraction", 1.0) > 0.10:
+        return None
+
+    apply_mask = repair
+    if repair_density >= 0.22:
+        kernel_size = 5 if repair_density >= 0.28 else 3
+        iterations = 2 if repair_density >= 0.55 else 1
+        expanded = cv2.dilate(
+            repair,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)),
+            iterations=iterations,
+        )
+        if float(np.count_nonzero(expanded > 0)) / float(area) <= 0.992:
+            apply_mask = expanded
+
+    target_roi = target[y1:y2, x1:x2]
+    target_roi[apply_mask > 0] = fitted[apply_mask > 0]
+    target_gray = cv2.cvtColor(target_roi, cv2.COLOR_BGR2GRAY)
+    residual_near_text = cv2.dilate(
+        apply_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
+        iterations=1,
+    ) > 0
+    residual_halo = (
+        residual_near_text
+        & (gray >= 218)
+        & (target_gray >= 234)
+        & (hsv[:, :, 1] < 145)
+    )
+    residual_halo = cv2.morphologyEx(
+        residual_halo.astype(np.uint8) * 255,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    residual_density = float(np.count_nonzero(residual_halo > 0)) / float(area)
+    if 0.002 <= residual_density <= 0.22:
+        residual_halo = cv2.dilate(
+            residual_halo,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+        target_roi[residual_halo > 0] = fitted[residual_halo > 0]
+        apply_mask = cv2.bitwise_or(apply_mask, residual_halo)
+    return apply_mask
+
+
+def _mixed_dark_surface_source_inpaint(
+    source: np.ndarray,
+    target: np.ndarray,
+    coords: tuple[int, int, int, int],
+    mask_roi: np.ndarray,
+) -> np.ndarray | None:
+    x1, y1, x2, y2 = coords
+    roi = source[y1:y2, x1:x2]
+    if roi.size == 0 or mask_roi.size == 0:
+        return None
+
+    outlined = _outlined_floating_source_mask(source, coords, mask_roi)
+    if outlined is None or np.count_nonzero(outlined > 0) < 10:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    dark_fraction = float(np.mean(gray < 118))
+    bright_fraction = float(np.mean(gray > 218))
+    luma_std = float(np.std(gray.astype(np.float32)))
+    if dark_fraction < 0.18 or bright_fraction < 0.16 or luma_std < 76.0:
+        return None
+
+    repair = (outlined > 0).astype(np.uint8) * 255
+    repair = cv2.morphologyEx(
+        repair,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    repair_count = int(np.count_nonzero(repair > 0))
+    area = max(1, repair.shape[0] * repair.shape[1])
+    density = repair_count / float(area)
+    if repair_count < 10 or density > 0.62:
+        return None
+
+    try:
+        telea = cv2.inpaint(target[y1:y2, x1:x2], repair, 1.6, cv2.INPAINT_TELEA)
+        navier = cv2.inpaint(target[y1:y2, x1:x2], repair, 1.35, cv2.INPAINT_NS)
+    except cv2.error:
+        return None
+
+    repaired = cv2.addWeighted(telea, 0.72, navier, 0.28, 0)
+    target_roi = target[y1:y2, x1:x2]
+    target_roi[repair > 0] = repaired[repair > 0]
+    return repair
+
+
+def _bright_textured_source_repair(
+    source: np.ndarray,
+    target: np.ndarray,
+    coords: tuple[int, int, int, int],
+    mask_roi: np.ndarray,
+) -> np.ndarray | None:
+    x1, y1, x2, y2 = coords
+    roi = source[y1:y2, x1:x2]
+    if roi.size == 0 or mask_roi.size == 0:
+        return None
+
+    repair = (mask_roi > 0).astype(np.uint8) * 255
+    repair_count = int(np.count_nonzero(repair > 0))
+    if repair_count < 8:
+        return None
+
+    area = max(1, repair.size)
+    repair_density = repair_count / float(area)
+    if repair_density > 0.58:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    unmasked = repair <= 0
+    if np.count_nonzero(unmasked) < max(20, int(area * 0.04)):
+        return None
+
+    background_gray = gray[unmasked]
+    background_sat = hsv[:, :, 1][unmasked]
+    background_edges = cv2.Canny(gray, 45, 135)[unmasked] > 0
+    bg_median = float(np.median(background_gray))
+    bg_std = float(np.std(background_gray.astype(np.float32)))
+    bg_edge = float(np.mean(background_edges))
+    bright_fraction = float(np.mean(background_gray > 228))
+    paper_fraction = float(np.mean((background_gray > 170) & (background_sat < 145)))
+    flat_white = bg_std < 6.0 and bg_edge < 0.015 and bright_fraction > 0.90
+    textured_bright = (
+        bg_median >= 208.0
+        and paper_fraction >= 0.58
+        and bright_fraction >= 0.40
+        and not flat_white
+        and (bg_std >= 7.0 or bg_edge >= 0.018)
+    )
+    if not textured_bright:
+        return None
+
+    high_texture = bg_std >= 18.0 or bg_edge >= 0.065
+    if high_texture:
+        core_repair = cv2.dilate(
+            repair,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+    else:
+        core_repair = repair.copy()
+    expansion_kernel = (7, 7) if high_texture else (5, 5)
+    model_repair = cv2.dilate(
+        repair,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, expansion_kernel),
+        iterations=1,
+    )
+    full_mask = np.zeros(source.shape[:2], dtype=np.uint8)
+    full_mask[y1:y2, x1:x2] = model_repair
+    before = target[y1:y2, x1:x2].copy()
+
+    use_manga_cleaner = high_texture and os.getenv(
+        "MANGA_BRIGHT_TEXTURE_CLEANER", "off"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    repaired = False
+    if use_manga_cleaner:
+        previous_backend = os.environ.get("MANGA_CLEANER_BACKEND")
+        try:
+            if not previous_backend or previous_backend.strip().lower() in {"0", "false", "no", "off"}:
+                os.environ["MANGA_CLEANER_BACKEND"] = "auto"
+            repaired = _manga_cleaner_local_crop(
+                target,
+                full_mask,
+                source.shape[0],
+                source.shape[1],
+                x1,
+                y1,
+                x2,
+                y2,
+            )
+        finally:
+            if previous_backend is None:
+                os.environ.pop("MANGA_CLEANER_BACKEND", None)
+            else:
+                os.environ["MANGA_CLEANER_BACKEND"] = previous_backend
+
+    if not repaired:
+        pad = max(12, min(26, int(max(x2 - x1, y2 - y1) * 0.10)))
+        crop_x1 = max(0, x1 - pad)
+        crop_y1 = max(0, y1 - pad)
+        crop_x2 = min(source.shape[1], x2 + pad)
+        crop_y2 = min(source.shape[0], y2 + pad)
+        crop_img = target[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+        crop_mask = full_mask[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+        if np.count_nonzero(crop_mask > 0) < 8:
+            return None
+        try:
+            telea = cv2.inpaint(crop_img, crop_mask, 1.8, cv2.INPAINT_TELEA)
+            navier = cv2.inpaint(crop_img, crop_mask, 1.4, cv2.INPAINT_NS)
+        except cv2.error:
+            return None
+        repaired_crop = cv2.addWeighted(telea, 0.72, navier, 0.28, 0)
+        target_view = target[crop_y1:crop_y2, crop_x1:crop_x2]
+        target_view[crop_mask > 0] = repaired_crop[crop_mask > 0]
+    elif high_texture:
+        changed = np.any(before != target[y1:y2, x1:x2], axis=2)
+        changed_count = int(np.count_nonzero(changed & (core_repair > 0)))
+        if changed_count < 8:
+            return None
+        return core_repair
+
+    ring_mask = (model_repair > 0) & ~(cv2.dilate(
+        core_repair,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    ) > 0)
+    if np.count_nonzero(ring_mask) >= 10:
+        repaired_roi = target[y1:y2, x1:x2].copy()
+        ring_alpha = cv2.GaussianBlur(ring_mask.astype(np.float32), (0, 0), 1.1)
+        ring_strength = 0.74 if (bg_std < 14.0 and bg_edge < 0.055) else 0.62
+        ring_alpha = np.clip(ring_alpha * ring_strength, 0.0, 1.0)[..., None]
+        restored = (
+            before.astype(np.float32) * ring_alpha
+            + repaired_roi.astype(np.float32) * (1.0 - ring_alpha)
+        ).astype(np.uint8)
+        repaired_roi[ring_mask] = restored[ring_mask]
+        target[y1:y2, x1:x2] = repaired_roi
+
+    _local_repair_tone_match(source, target, coords, core_repair)
+    source_gray_roi = gray
+    repaired_gray = cv2.cvtColor(target[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    residual_similarity = (
+        (core_repair > 0)
+        & (np.abs(repaired_gray.astype(np.int16) - source_gray_roi.astype(np.int16)) < 20)
+    )
+    residual_dark = (
+        (core_repair > 0)
+        & (repaired_gray < max(0.0, bg_median - 20.0))
+    )
+    if (
+        int(np.count_nonzero(residual_similarity)) >= max(18, int(repair_count * 0.16))
+        or int(np.count_nonzero(residual_dark)) >= max(14, int(repair_count * 0.10))
+    ):
+        fallback_mask = cv2.dilate(
+            core_repair,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+        pad = max(12, min(26, int(max(x2 - x1, y2 - y1) * 0.10)))
+        crop_x1 = max(0, x1 - pad)
+        crop_y1 = max(0, y1 - pad)
+        crop_x2 = min(source.shape[1], x2 + pad)
+        crop_y2 = min(source.shape[0], y2 + pad)
+        crop_img = target[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+        crop_mask = np.zeros(crop_img.shape[:2], dtype=np.uint8)
+        crop_mask[y1 - crop_y1:y2 - crop_y1, x1 - crop_x1:x2 - crop_x1] = fallback_mask
+        try:
+            telea = cv2.inpaint(crop_img, crop_mask, 1.8, cv2.INPAINT_TELEA)
+            navier = cv2.inpaint(crop_img, crop_mask, 1.4, cv2.INPAINT_NS)
+            repaired_crop = cv2.addWeighted(telea, 0.72, navier, 0.28, 0)
+            target_view = target[crop_y1:crop_y2, crop_x1:crop_x2]
+            target_view[crop_mask > 0] = repaired_crop[crop_mask > 0]
+            _local_repair_tone_match(source, target, coords, fallback_mask)
+            core_repair = fallback_mask
+        except cv2.error:
+            pass
+    changed = np.any(before != target[y1:y2, x1:x2], axis=2)
+    changed_count = int(np.count_nonzero(changed & (core_repair > 0)))
+    if changed_count < 8:
+        return None
+    return core_repair
 
 
 def _outlined_floating_source_mask(
@@ -1843,6 +2573,65 @@ def _outlined_floating_source_mask(
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     saturation = hsv[:, :, 1]
+    seed = seed_roi > 0
+    if int(np.count_nonzero(seed)) >= 6:
+        seed_context = cv2.dilate(
+            seed.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1,
+        ) > 0
+        background_probe = ~seed_context
+        if int(np.count_nonzero(background_probe)) >= max(20, int(area * 0.04)):
+            background_luma = float(np.median(gray[background_probe]))
+        else:
+            background_luma = float(np.percentile(gray, 50))
+        img_h, img_w = source.shape[:2]
+        pad = max(12, min(56, int(max(width, height) * 0.18)))
+        rx1, ry1 = max(0, x1 - pad), max(0, y1 - pad)
+        rx2, ry2 = min(img_w, x2 + pad), min(img_h, y2 + pad)
+        if rx2 > rx1 and ry2 > ry1:
+            context = source[ry1:ry2, rx1:rx2]
+            context_gray = cv2.cvtColor(context, cv2.COLOR_BGR2GRAY)
+            context_hsv = cv2.cvtColor(context, cv2.COLOR_BGR2HSV)
+            ring = np.ones(context_gray.shape, dtype=bool)
+            ring[y1 - ry1:y2 - ry1, x1 - rx1:x2 - rx1] = False
+            ring_candidates = ring & (context_gray >= 48) & (context_gray <= 232) & (context_hsv[:, :, 1] < 170)
+            if int(np.count_nonzero(ring_candidates)) >= max(24, int(area * 0.018)):
+                background_luma = min(background_luma, float(np.median(context_gray[ring_candidates])))
+        if background_luma < 224.0:
+            halo_context = cv2.dilate(
+                seed.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
+                iterations=1,
+            ) > 0
+            halo_cutoff = max(218.0, min(248.0, background_luma + 28.0))
+            halo = halo_context & (gray >= halo_cutoff) & (saturation < 155)
+            halo = cv2.morphologyEx(
+                halo.astype(np.uint8) * 255,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1,
+            )
+            halo_count = int(np.count_nonzero(halo > 0))
+            seed_count = int(np.count_nonzero(seed))
+            if halo_count >= max(8, int(seed_count * 0.16)):
+                repair = cv2.bitwise_or(halo, seed.astype(np.uint8) * 255)
+                repair = cv2.morphologyEx(
+                    repair,
+                    cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                    iterations=1,
+                )
+                repair = cv2.dilate(
+                    repair,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                    iterations=1,
+                )
+                density = float(np.count_nonzero(repair > 0)) / float(area)
+                narrow_vertical = width <= 92 and height >= width * 1.55
+                max_density = 1.001 if narrow_vertical else 0.94
+                if 0.025 <= density <= max_density:
+                    return repair
     paper_fraction = float(np.mean((gray > 172) & (saturation < 115)))
     mean_luma = float(np.mean(gray))
     if paper_fraction >= 0.76 and mean_luma >= 176.0:
@@ -1866,7 +2655,6 @@ def _outlined_floating_source_mask(
 
     component_count, labels, stats, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
     kept = np.zeros_like(bright)
-    seed = seed_roi > 0
     for label in range(1, component_count):
         component = labels == label
         component_area = int(stats[label, cv2.CC_STAT_AREA])
@@ -1951,9 +2739,9 @@ def _outlined_floating_text_repair(
         repaired = _stroke_only_inpaint_repair(source, target, coords, repair, radius=2.0)
         return repaired if repaired is not None else None
 
-                                                                              
-                                                                                 
-                                                 
+
+
+
     pad = max(18, min(48, int(max(x2 - x1, y2 - y1) * 0.14)))
     crop_x1 = max(0, x1 - pad)
     crop_y1 = max(0, y1 - pad)
@@ -1988,6 +2776,8 @@ def _refined_floating_source_mask(
     height, width = roi.shape[:2]
     area = max(1, height * width)
     candidates: list[np.ndarray] = []
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
     high_contrast_mask = _high_contrast_light_text_block_mask(roi)
     if high_contrast_mask is not None:
@@ -2000,17 +2790,27 @@ def _refined_floating_source_mask(
 
     seg_roi = seg_mask[y1:y2, x1:x2]
     _, seg_roi = cv2.threshold(seg_roi, 127, 255, cv2.THRESH_BINARY)
+    floating_roi = _floating_text_erase_roi(source, coords)
+    dark_roi = _extract_dark_text_strokes(source, coords)
+
     seg_density = np.count_nonzero(seg_roi > 0) / float(area)
+    floating_density = np.count_nonzero(floating_roi > 0) / float(area)
+    dark_density = np.count_nonzero(dark_roi > 0) / float(area)
+
+    bright_background_fraction = float(np.mean((gray > 188) & (hsv[:, :, 1] < 155)))
+    edge_density = float(np.mean(cv2.Canny(gray, 45, 135) > 0))
+    bright_halftone_background = (
+        bright_background_fraction >= 0.42
+        and float(np.std(gray.astype(np.float32))) >= 24.0
+        and edge_density >= 0.028
+    )
+
     if np.count_nonzero(seg_roi > 0) >= 6 and seg_density <= 0.44:
         candidates.append(seg_roi)
 
-    floating_roi = _floating_text_erase_roi(source, coords)
-    floating_density = np.count_nonzero(floating_roi > 0) / float(area)
     if np.count_nonzero(floating_roi > 0) >= 6 and floating_density <= 0.44:
         candidates.append(floating_roi)
 
-    dark_roi = _extract_dark_text_strokes(source, coords)
-    dark_density = np.count_nonzero(dark_roi > 0) / float(area)
     if np.count_nonzero(dark_roi > 0) >= 6 and dark_density <= 0.44:
         candidates.append(dark_roi)
 
@@ -2018,8 +2818,6 @@ def _refined_floating_source_mask(
         return np.zeros((height, width), dtype=np.uint8)
 
     mask = max(candidates, key=lambda item: np.count_nonzero(item > 0)).copy()
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     bright_fraction = float(np.mean((gray > 178) & (hsv[:, :, 1] < 135)))
     dark_fraction = float(np.mean(gray < 112))
     if (
@@ -2037,13 +2835,26 @@ def _refined_floating_source_mask(
     component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
         (mask > 0).astype(np.uint8), connectivity=8
     )
-    filtered = np.zeros_like(mask)
+    large_component_centers: list[tuple[float, float]] = []
+    component_meta = []
+    tiny_round_component_count = 0
     for label in range(1, component_count):
         component_area = int(stats[label, cv2.CC_STAT_AREA])
         cx = int(stats[label, cv2.CC_STAT_LEFT])
         cy = int(stats[label, cv2.CC_STAT_TOP])
         cw = int(stats[label, cv2.CC_STAT_WIDTH])
         ch = int(stats[label, cv2.CC_STAT_HEIGHT])
+        fill_ratio = component_area / float(max(1, cw * ch))
+        aspect = cw / float(max(1, ch))
+        center = (cx + cw / 2.0, cy + ch / 2.0)
+        component_meta.append((label, component_area, cx, cy, cw, ch, fill_ratio, aspect, center))
+        if component_area >= 28 or cw >= 10 or ch >= 10 or fill_ratio < 0.30:
+            large_component_centers.append(center)
+        elif component_area <= 28 and cw <= 10 and ch <= 10 and 0.45 <= aspect <= 2.2 and fill_ratio >= 0.34:
+            tiny_round_component_count += 1
+
+    filtered = np.zeros_like(mask)
+    for label, component_area, cx, cy, cw, ch, fill_ratio, aspect, center in component_meta:
         if component_area < 3:
             continue
         if component_area > max(2600, int(area * 0.18)):
@@ -2054,12 +2865,28 @@ def _refined_floating_source_mask(
             continue
         if screen_like and cy < int(height * 0.20) and ch < int(height * 0.20):
             continue
+        if (
+            bright_halftone_background
+            and tiny_round_component_count >= 8
+            and component_area <= 28
+            and cw <= 10
+            and ch <= 10
+            and 0.45 <= aspect <= 2.2
+            and fill_ratio >= 0.34
+            and large_component_centers
+        ):
+            nearest_large = min(
+                math.hypot(center[0] - other[0], center[1] - other[1])
+                for other in large_component_centers
+            )
+            if nearest_large > max(13.0, float(min(width, height)) * 0.18):
+                continue
         filtered[labels == label] = 255
 
     if np.count_nonzero(filtered > 0) < 6:
         return np.zeros((height, width), dtype=np.uint8)
 
-    kernel_size = 5 if screen_like else 3
+    kernel_size = 3 if bright_halftone_background else (5 if screen_like else 3)
     return cv2.dilate(
         filtered,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)),
@@ -2108,9 +2935,26 @@ def _fill_dark_surface_source_strokes(
         local_cleanup = cleanup[by1:by2, bx1:bx2] > 0
         local_gray = gray[by1:by2, bx1:bx2]
 
-        background = (~local_cleanup) & (local_gray < 150)
+        component_u8 = local_component.astype(np.uint8)
+        ring = cv2.dilate(
+            component_u8,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (
+                    max(5, min(17, (pad // 2) * 2 + 1)),
+                    max(5, min(17, (pad // 2) * 2 + 1)),
+                ),
+            ),
+            iterations=1,
+        ) > 0
+        inner = cv2.dilate(
+            component_u8,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        ) > 0
+        background = ring & ~inner & (~local_cleanup) & (local_gray < 246)
         if np.count_nonzero(background) < 10:
-            background = (~local_cleanup) & (local_gray < 190)
+            background = (~local_cleanup) & (local_gray < 210)
         if np.count_nonzero(background) < 8:
             continue
 
@@ -2132,6 +2976,23 @@ def _fill_dark_surface_source_strokes(
     if np.count_nonzero(changed_mask > 0) >= 6 and coverage >= 0.55:
         target_roi[:, :] = target_patch
         return changed_mask
+
+    cleanup_bool = cleanup > 0
+    repair_density = float(np.count_nonzero(cleanup_bool)) / float(max(1, cleanup_bool.size))
+    if repair_density >= 0.18:
+        background = (~cleanup_bool) & (gray < 155)
+        if np.count_nonzero(background) >= max(60, int(cleanup_bool.size * 0.08)):
+            deep_background = background & (gray < 105)
+            if np.count_nonzero(deep_background) >= max(36, int(np.count_nonzero(background) * 0.18)):
+                background = deep_background
+            pixels = roi[background].astype(np.float32)
+            median_color = np.median(pixels, axis=0)
+            distances = np.linalg.norm(pixels - median_color, axis=1)
+            inliers = pixels[distances < 62.0]
+            if len(inliers) >= 40 and float(np.mean(np.std(inliers, axis=0))) <= 34.0:
+                fill = np.median(inliers, axis=0).astype(np.uint8)
+                target_roi[cleanup_bool] = fill
+                return cleanup
     return None
 
 
@@ -2184,9 +3045,13 @@ def _fill_local_tone_source_strokes(
             background = ~local_cleanup
         if np.count_nonzero(background) < 12:
             continue
-        non_text_background = background & (local_gray < 245)
-        if np.count_nonzero(non_text_background) >= 10:
-            background = non_text_background
+        mid_tone_background = background & (local_gray >= 72) & (local_gray <= 220)
+        if np.count_nonzero(mid_tone_background) >= max(10, int(np.count_nonzero(background) * 0.18)):
+            background = mid_tone_background
+        else:
+            non_text_background = background & (local_gray < 245)
+            if np.count_nonzero(non_text_background) >= 10:
+                background = non_text_background
 
         bg_edge_density = float(np.mean(local_edges[background]))
         if bg_edge_density > 0.22:
@@ -2362,6 +3227,376 @@ def _fill_smooth_tone_caption_strokes(
     target_roi = target[y1:y2, x1:x2]
     target_roi[repair_bool] = fitted[repair_bool]
     return filtered
+
+
+def _tone_fit_background(
+    roi: np.ndarray,
+    repair_mask: np.ndarray,
+    *,
+    prefer_low_edges: bool = True,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    height, width = roi.shape[:2]
+    if height == 0 or width == 0:
+        return None, None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    edges = cv2.Canny(gray, 45, 135) > 0
+    background = (repair_mask <= 0) & (gray > 22) & (gray < 244) & (hsv[:, :, 1] < 185)
+    if prefer_low_edges:
+        edge_shell = cv2.dilate(
+            edges.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        ) > 0
+        low_edge_background = background & ~edge_shell
+        if np.count_nonzero(low_edge_background) >= max(40, int(height * width * 0.04)):
+            background = low_edge_background
+
+    values = gray[background]
+    if values.size < max(24, int(height * width * 0.018)):
+        return None, None
+
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values.astype(np.float32) - median))) + 1.0
+    trimmed = background & (np.abs(gray.astype(np.float32) - median) < max(34.0, mad * 3.0))
+    if np.count_nonzero(trimmed) >= max(24, int(height * width * 0.018)):
+        background = trimmed
+
+    bg_values = gray[background].astype(np.float32)
+    if bg_values.size < max(24, int(height * width * 0.018)):
+        return None, None
+    if float(np.mean(edges[background])) > 0.22:
+        return None, None
+    if float(np.std(bg_values)) > 72.0:
+        return None, None
+
+    bg_y, bg_x = np.where(background)
+    if bg_x.size < max(24, int(height * width * 0.018)):
+        return None, None
+
+    design = np.column_stack(
+        [
+            bg_x.astype(np.float32) / float(max(1, width - 1)),
+            bg_y.astype(np.float32) / float(max(1, height - 1)),
+            np.ones_like(bg_x, dtype=np.float32),
+        ]
+    )
+    grid_y, grid_x = np.indices((height, width))
+    grid_design = np.column_stack(
+        [
+            grid_x.reshape(-1).astype(np.float32) / float(max(1, width - 1)),
+            grid_y.reshape(-1).astype(np.float32) / float(max(1, height - 1)),
+            np.ones(height * width, dtype=np.float32),
+        ]
+    )
+
+    fitted = np.empty_like(roi, dtype=np.float32)
+    for channel in range(3):
+        samples = roi[:, :, channel][background].astype(np.float32)
+        coeffs, *_ = np.linalg.lstsq(design, samples, rcond=None)
+        fitted[:, :, channel] = (grid_design @ coeffs).reshape(height, width)
+    return np.clip(fitted, 0, 255).astype(np.uint8), background
+
+
+def _tone_fit_context_background(
+    source: np.ndarray,
+    coords: tuple[int, int, int, int],
+    repair_mask: np.ndarray,
+    *,
+    padding: int,
+    rowwise: bool = False,
+) -> tuple[np.ndarray | None, dict[str, float]]:
+    x1, y1, x2, y2 = coords
+    height, width = repair_mask.shape[:2]
+    if height <= 0 or width <= 0:
+        return None, {}
+
+    crop_x1 = max(0, x1 - padding)
+    crop_y1 = max(0, y1 - padding)
+    crop_x2 = min(source.shape[1], x2 + padding)
+    crop_y2 = min(source.shape[0], y2 + padding)
+    crop = source[crop_y1:crop_y2, crop_x1:crop_x2]
+    if crop.size == 0:
+        return None, {}
+
+    crop_mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+    inner_x1 = x1 - crop_x1
+    inner_y1 = y1 - crop_y1
+    crop_mask[inner_y1:inner_y1 + height, inner_x1:inner_x1 + width] = repair_mask
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    edges = cv2.Canny(gray, 45, 135) > 0
+    background = (crop_mask <= 0) & (gray > 24) & (gray < 242) & (hsv[:, :, 1] < 185)
+    low_edge = background & ~cv2.dilate(
+        edges.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    ).astype(bool)
+    if np.count_nonzero(low_edge) >= max(60, int(crop.shape[0] * crop.shape[1] * 0.035)):
+        background = low_edge
+
+    values = gray[background].astype(np.float32)
+    if values.size < max(48, int(crop.shape[0] * crop.shape[1] * 0.018)):
+        return None, {}
+
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median))) + 1.0
+    trimmed = background & (np.abs(gray.astype(np.float32) - median) < max(38.0, mad * 3.2))
+    if np.count_nonzero(trimmed) >= max(48, int(crop.shape[0] * crop.shape[1] * 0.018)):
+        background = trimmed
+        values = gray[background].astype(np.float32)
+
+    edge_density = float(np.mean(edges[background]))
+    bg_std = float(np.std(values))
+    dark_fraction = float(np.mean(values < 62.0))
+    bright_fraction = float(np.mean(values > 232.0))
+    stats = {
+        "median": float(np.median(values)),
+        "std": bg_std,
+        "edge_density": edge_density,
+        "dark_fraction": dark_fraction,
+        "bright_fraction": bright_fraction,
+    }
+    if edge_density > 0.24 or bg_std > 78.0:
+        return None, stats
+
+    bg_y, bg_x = np.where(background)
+    if rowwise:
+        fitted = np.empty((height, width, 3), dtype=np.float32)
+        fallback = np.median(crop[background], axis=0).astype(np.float32)
+        row_colors = np.empty((height, 3), dtype=np.float32)
+        row_band = max(4, min(16, height // 18))
+        for row_index in range(height):
+            crop_row = inner_y1 + row_index
+            near_row = np.abs(bg_y - crop_row) <= row_band
+            if np.count_nonzero(near_row) >= 12:
+                color = np.median(crop[bg_y[near_row], bg_x[near_row]], axis=0).astype(np.float32)
+            else:
+                color = fallback
+            row_colors[row_index, :] = color
+        if height >= 7:
+            sigma_y = max(1.8, min(9.0, height / 36.0))
+            row_colors = cv2.GaussianBlur(
+                row_colors.reshape(height, 1, 3),
+                (1, 0),
+                sigmaX=0,
+                sigmaY=sigma_y,
+            ).reshape(height, 3)
+        fitted[:, :, :] = row_colors[:, None, :]
+        return np.clip(fitted, 0, 255).astype(np.uint8), stats
+
+    design = np.column_stack(
+        [
+            bg_x.astype(np.float32) / float(max(1, crop.shape[1] - 1)),
+            bg_y.astype(np.float32) / float(max(1, crop.shape[0] - 1)),
+            np.ones_like(bg_x, dtype=np.float32),
+        ]
+    )
+    grid_y, grid_x = np.indices((height, width))
+    crop_grid_x = grid_x.reshape(-1) + inner_x1
+    crop_grid_y = grid_y.reshape(-1) + inner_y1
+    target_design = np.column_stack(
+        [
+            crop_grid_x.astype(np.float32) / float(max(1, crop.shape[1] - 1)),
+            crop_grid_y.astype(np.float32) / float(max(1, crop.shape[0] - 1)),
+            np.ones(height * width, dtype=np.float32),
+        ]
+    )
+
+    fitted = np.empty((height, width, 3), dtype=np.float32)
+    for channel in range(3):
+        samples = crop[:, :, channel][background].astype(np.float32)
+        coeffs, *_ = np.linalg.lstsq(design, samples, rcond=None)
+        fitted[:, :, channel] = (target_design @ coeffs).reshape(height, width)
+    return np.clip(fitted, 0, 255).astype(np.uint8), stats
+
+
+def _fill_smooth_tone_caption_block(
+    source: np.ndarray,
+    target: np.ndarray,
+    coords: tuple[int, int, int, int],
+    mask_roi: np.ndarray,
+) -> np.ndarray | None:
+    x1, y1, x2, y2 = coords
+    roi = source[y1:y2, x1:x2]
+    if roi.size == 0 or mask_roi.size == 0 or np.count_nonzero(mask_roi > 0) < 8:
+        return None
+
+    height, width = roi.shape[:2]
+    if height < 86 or height < width * 1.25 or width > max(230, int(source.shape[1] * 0.22)):
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    seed = mask_roi > 0
+    text_mask = _high_contrast_light_text_block_mask(roi)
+    repair = seed.copy()
+    if text_mask is not None:
+        near_seed = cv2.dilate(
+            seed.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+            iterations=1,
+        ) > 0
+        repair |= (text_mask > 0) & near_seed
+    outlined = _outlined_floating_source_mask(source, coords, mask_roi)
+    if outlined is not None:
+        repair |= outlined > 0
+
+    if np.count_nonzero(repair) < 8:
+        return None
+
+    repair = cv2.morphologyEx(
+        repair.astype(np.uint8) * 255,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    repair = cv2.dilate(
+        repair,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+
+    rows, cols = np.where(repair > 0)
+    if rows.size < 8:
+        return None
+    block = repair.copy()
+    block_density = float(np.count_nonzero(block > 0)) / float(max(1, block.size))
+    if block_density < 0.04 or block_density > 0.40:
+        return None
+
+    padding = max(26, min(84, int(max(width, height) * 0.28)))
+    fitted, context_stats = _tone_fit_context_background(source, coords, block, padding=padding, rowwise=True)
+    if fitted is None:
+        return None
+    context_x1 = max(0, x1 - padding)
+    context_y1 = max(0, y1 - padding)
+    context_x2 = min(source.shape[1], x2 + padding)
+    context_y2 = min(source.shape[0], y2 + padding)
+    context_gray = cv2.cvtColor(source[context_y1:context_y2, context_x1:context_x2], cv2.COLOR_BGR2GRAY)
+    if float(np.mean(context_gray < 48)) > 0.18:
+        return None
+    if context_stats.get("dark_fraction", 1.0) > 0.12:
+        return None
+    if context_stats.get("std", 99.0) > 38.0 or context_stats.get("edge_density", 1.0) > 0.095:
+        return None
+    if not (82.0 <= context_stats.get("median", 0.0) <= 236.0):
+        return None
+
+    target_roi = target[y1:y2, x1:x2]
+    alpha = cv2.GaussianBlur((block > 0).astype(np.float32), (0, 0), 4.0)
+    core = cv2.erode(
+        block,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        iterations=1,
+    ) > 0
+    alpha[core] = 1.0
+    alpha = np.clip(alpha, 0.0, 1.0)[..., None]
+    blended = (fitted.astype(np.float32) * alpha + target_roi.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+    blend_mask = alpha[:, :, 0] > 0.02
+    target_roi[blend_mask] = blended[blend_mask]
+    return block
+
+
+def _fill_bounded_tone_source_strokes(
+    source: np.ndarray,
+    target: np.ndarray,
+    coords: tuple[int, int, int, int],
+    mask_roi: np.ndarray,
+) -> np.ndarray | None:
+    x1, y1, x2, y2 = coords
+    roi = source[y1:y2, x1:x2]
+    if roi.size == 0 or mask_roi.size == 0 or np.count_nonzero(mask_roi > 0) < 8:
+        return None
+
+    height, width = roi.shape[:2]
+    area = max(1, height * width)
+    if height < 48 or width < 22:
+        return None
+
+    seed = mask_roi > 0
+    repair = seed.astype(np.uint8) * 255
+    outlined = _outlined_floating_source_mask(source, coords, mask_roi)
+    if outlined is not None:
+        repair = outlined.copy()
+
+    repair = cv2.morphologyEx(
+        repair,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    repair = cv2.dilate(
+        repair,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+
+    repair_count = int(np.count_nonzero(repair > 0))
+    if repair_count < 10:
+        return None
+    repair_density = repair_count / float(area)
+    if repair_density < 0.025 or repair_density > 0.78:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    background = repair <= 0
+    if np.count_nonzero(background) < max(28, int(area * 0.04)):
+        return None
+    bg_gray = gray[background].astype(np.float32)
+    bg_median = float(np.median(bg_gray))
+    bg_std = float(np.std(bg_gray))
+    bg_bright = float(np.mean(bg_gray > 232))
+    bg_mid = float(np.mean((bg_gray >= 50) & (bg_gray <= 210)))
+    bg_dark = float(np.mean(bg_gray < 86))
+    low_saturation = float(np.mean(hsv[:, :, 1][background] < 185))
+    if low_saturation < 0.82:
+        return None
+    if bg_bright > 0.82 and bg_mid < 0.10:
+        return None
+    if bg_std > 78.0:
+        return None
+
+    edges = cv2.Canny(gray, 45, 135) > 0
+    bg_edge_density = float(np.mean(edges[background]))
+    if bg_edge_density > 0.24:
+        return None
+    if bg_median < 42.0 and bg_mid < 0.18:
+        return None
+    if repair_density > 0.36 and (bg_std > 42.0 or bg_edge_density > 0.105 or bg_dark > 0.22):
+        return None
+
+    fitted, fit_background = _tone_fit_background(roi, repair, prefer_low_edges=True)
+    if fitted is None:
+        fitted, context_stats = _tone_fit_context_background(
+            source,
+            coords,
+            repair,
+            padding=max(18, min(76, int(max(width, height) * 0.22))),
+        )
+        if (
+            fitted is not None
+            and (
+                context_stats.get("edge_density", 1.0) > 0.24
+                or context_stats.get("std", 99.0) > 82.0
+                or context_stats.get("bright_fraction", 1.0) > 0.92
+            )
+        ):
+            fitted = None
+    if fitted is None or fit_background is None:
+        if fitted is None:
+            return None
+
+    target_roi = target[y1:y2, x1:x2]
+    before = target_roi.copy()
+    target_roi[repair > 0] = fitted[repair > 0]
+    changed = np.any(before != target_roi, axis=2)
+    if int(np.count_nonzero(changed & (repair > 0))) < 8:
+        return None
+    return repair
 
 
 def _mixed_tone_outline_mask(
@@ -2920,6 +4155,232 @@ def _mixed_tone_model_repair(
     return repair_mask
 
 
+def _dilated_anime_caption_repair(
+    source: np.ndarray,
+    target: np.ndarray,
+    coords: tuple[int, int, int, int],
+    mask_roi: np.ndarray,
+    anime_model,
+    anime_device,
+) -> np.ndarray | None:
+    if anime_model is None:
+        return None
+
+    x1, y1, x2, y2 = coords
+    roi = source[y1:y2, x1:x2]
+    if roi.size == 0 or mask_roi.size == 0:
+        return None
+
+    source_only_mask = _refined_floating_source_mask(
+        source,
+        np.zeros(source.shape[:2], dtype=np.uint8),
+        coords,
+    )
+    if np.count_nonzero(source_only_mask > 0) >= 6:
+        repair = source_only_mask > 0
+    else:
+        repair = mask_roi > 0
+    repair_count = int(np.count_nonzero(repair))
+    if repair_count < 6:
+        return None
+
+    area = max(1, repair.size)
+    density = float(repair_count) / float(area)
+    if density < 0.18 or density > 0.92:
+        return None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 45, 135) > 0
+    unmasked = ~repair
+    unmasked_count = int(np.count_nonzero(unmasked))
+    if unmasked_count < max(16, int(area * 0.015)):
+        return None
+
+    bg_std = float(np.std(gray[unmasked]))
+    bg_edge = float(np.mean(edges[unmasked]))
+    bg_median = float(np.median(gray[unmasked]))
+    bg_bright_fraction = float(np.mean(gray[unmasked] > 230))
+
+    simple_gray = bg_std <= 18.0 and bg_edge <= 0.12
+    bright_halftone = bg_median >= 228.0 and bg_bright_fraction >= 0.52 and bg_edge <= 0.13
+    if not (simple_gray or bright_halftone):
+        return None
+
+    dilated = cv2.dilate(
+        (repair.astype(np.uint8)) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=2,
+    )
+    if _floating_region_is_art_sensitive(source, coords, dilated):
+        return None
+
+    region_mask = np.zeros(source.shape[:2], dtype=np.uint8)
+    region_mask[y1:y2, x1:x2] = dilated
+    before = target[y1:y2, x1:x2].copy()
+    _anime_lama_local_crop(
+        anime_model,
+        anime_device,
+        target,
+        region_mask,
+        source.shape[0],
+        source.shape[1],
+        x1,
+        y1,
+        x2,
+        y2,
+    )
+    core_seed = cv2.dilate(
+        (repair.astype(np.uint8)) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    ring_mask = (dilated > 0) & ~(core_seed > 0)
+    if np.count_nonzero(ring_mask) >= 10:
+        repaired_roi = target[y1:y2, x1:x2].copy()
+        ring_alpha = cv2.GaussianBlur(ring_mask.astype(np.float32), (0, 0), 1.2)
+        ring_alpha = np.clip(
+            ring_alpha * (0.72 if bright_halftone else 0.58),
+            0.0,
+            1.0,
+        )[..., None]
+        restored = (
+            before.astype(np.float32) * ring_alpha
+            + repaired_roi.astype(np.float32) * (1.0 - ring_alpha)
+        ).astype(np.uint8)
+        repaired_roi[ring_mask] = restored[ring_mask]
+        target[y1:y2, x1:x2] = repaired_roi
+    changed = np.any(before != target[y1:y2, x1:x2], axis=2)
+    changed_count = int(np.count_nonzero(changed & (dilated > 0)))
+    if changed_count < 8:
+        return None
+    return dilated
+
+
+def _legacy_bright_caption_candidate(
+    source: np.ndarray,
+    coords: tuple[int, int, int, int],
+    mask_roi: np.ndarray,
+) -> bool:
+    x1, y1, x2, y2 = coords
+    roi = source[y1:y2, x1:x2]
+    if roi.size == 0 or mask_roi.size == 0:
+        return False
+
+    height, width = roi.shape[:2]
+    area = max(1, height * width)
+    text_count = int(np.count_nonzero(mask_roi > 0))
+    if text_count < 20:
+        return False
+
+    density = text_count / float(area)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    background = mask_roi <= 0
+    if np.count_nonzero(background) < max(16, int(area * 0.025)):
+        background = np.ones_like(mask_roi, dtype=bool)
+
+    bg_gray = gray[background]
+    bg_sat = hsv[:, :, 1][background]
+    bg_bright = float(np.mean(bg_gray > 224))
+    bg_dark = float(np.mean(bg_gray < 72))
+    low_saturation = float(np.mean(bg_sat < 120))
+    edge_density = float(np.mean(cv2.Canny(gray, 45, 135) > 0))
+
+    if bg_bright < 0.68 or bg_dark > 0.15 or low_saturation < 0.76:
+        return False
+
+    tall_caption = height >= max(84, int(width * 1.16))
+    wide_caption = width >= max(150, int(height * 1.70))
+    dense_caption = density >= 0.62 and edge_density <= 0.24
+    horizontal_bright_caption = wide_caption and density >= 0.20 and edge_density <= 0.20
+    compact_bright_caption = (
+        width >= 58
+        and height >= 38
+        and width <= 180
+        and height <= 120
+        and density >= 0.72
+        and edge_density <= 0.30
+    )
+
+    return (
+        dense_caption
+        or compact_bright_caption
+        or horizontal_bright_caption
+        or (tall_caption and density >= 0.48)
+    )
+
+
+def _legacy_full_box_anime_repair(
+    source: np.ndarray,
+    target: np.ndarray,
+    coords: tuple[int, int, int, int],
+    anime_model,
+    anime_device,
+    pad: int = 2,
+) -> np.ndarray | None:
+    if anime_model is None:
+        return None
+
+    img_h, img_w = source.shape[:2]
+    x1, y1, x2, y2 = coords
+    fx1 = max(0, x1 - pad)
+    fy1 = max(0, y1 - pad)
+    fx2 = min(img_w, x2 + pad)
+    fy2 = min(img_h, y2 + pad)
+    if fx2 <= fx1 or fy2 <= fy1:
+        return None
+
+    region_mask = np.zeros(source.shape[:2], dtype=np.uint8)
+    region_mask[fy1:fy2, fx1:fx2] = 255
+    before = target[fy1:fy2, fx1:fx2].copy()
+    _anime_lama_local_crop(
+        anime_model,
+        anime_device,
+        target,
+        region_mask,
+        img_h,
+        img_w,
+        fx1,
+        fy1,
+        fx2,
+        fy2,
+    )
+    changed = np.any(before != target[fy1:fy2, fx1:fx2], axis=2)
+    if int(np.count_nonzero(changed)) < 8:
+        return None
+    return region_mask
+
+
+def _union_repair_box(
+    base: tuple[int, int, int, int],
+    extra: Sequence[int] | None,
+    image_shape: tuple[int, ...],
+) -> tuple[int, int, int, int]:
+    img_h, img_w = image_shape[:2]
+    x1, y1, x2, y2 = base
+    if extra and len(extra) >= 4:
+        ex1, ey1, ex2, ey2 = [int(round(float(v))) for v in extra[:4]]
+        x1 = min(x1, ex1)
+        y1 = min(y1, ey1)
+        x2 = max(x2, ex2)
+        y2 = max(y2, ey2)
+    return (
+        max(0, min(img_w, x1)),
+        max(0, min(img_h, y1)),
+        max(0, min(img_w, x2)),
+        max(0, min(img_h, y2)),
+    )
+
+
+def _compact_caption_repair_pad(coords: tuple[int, int, int, int]) -> int:
+    x1, y1, x2, y2 = coords
+    width = max(0, x2 - x1)
+    height = max(0, y2 - y1)
+    if width <= 180 and height <= 120:
+        return 6
+    return 2
+
+
 def _tight_floating_stroke_repair(
     source: np.ndarray,
     target: np.ndarray,
@@ -2932,9 +4393,90 @@ def _tight_floating_stroke_repair(
     mask_roi = _refined_floating_source_mask(source, seg_mask, coords)
     if np.count_nonzero(mask_roi > 0) < 6:
         return None
+    mask_density = float(np.count_nonzero(mask_roi > 0)) / float(max(1, mask_roi.size))
+    x1, y1, x2, y2 = coords
+    roi = source[y1:y2, x1:x2]
+    precise_only = False
+    if roi.size:
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        precise_only = (
+            mask_density >= 0.24
+            and float(np.std(gray.astype(np.float32))) >= 58.0
+            and float(np.mean(cv2.Canny(gray, 45, 135) > 0)) >= 0.055
+            and (float(np.mean(gray < 118)) >= 0.055 or float(np.mean(gray > 220)) >= 0.36)
+        )
+
+    dense_smooth_mask = _dense_smooth_tone_source_text_fill(source, target, coords, mask_roi)
+    if dense_smooth_mask is not None:
+        return dense_smooth_mask
+
+    pure_paper_mask = _pure_paper_source_inpaint(source, target, coords, mask_roi)
+    if pure_paper_mask is not None:
+        return pure_paper_mask
+
+    smooth_gradient_mask = _smooth_gradient_source_text_fill(source, target, coords, mask_roi)
+    if smooth_gradient_mask is not None:
+        return smooth_gradient_mask
+
+    mixed_dark_mask = _mixed_dark_surface_source_inpaint(source, target, coords, mask_roi)
+    if mixed_dark_mask is not None:
+        return mixed_dark_mask
+
+    smooth_caption_block = _fill_smooth_tone_caption_block(source, target, coords, mask_roi)
+    if smooth_caption_block is not None:
+        return smooth_caption_block
+
+    bounded_tone_mask = _fill_bounded_tone_source_strokes(source, target, coords, mask_roi)
+    if bounded_tone_mask is not None:
+        return bounded_tone_mask
+
+    dark_surface_seed = mask_roi
+    if roi.size:
+        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        if float(np.mean(roi_gray < 140)) >= 0.30:
+            outlined_for_dark = _outlined_floating_source_mask(source, coords, mask_roi)
+            if outlined_for_dark is not None:
+                dark_surface_seed = outlined_for_dark
+    dark_surface_mask = _fill_dark_surface_source_strokes(source, target, coords, dark_surface_seed)
+    if dark_surface_mask is not None:
+        return dark_surface_mask
+
+    wide_caption = (x2 - x1) >= max(120, int((y2 - y1) * 1.45))
+    if not wide_caption:
+        early_local_tone_mask = _fill_local_tone_source_strokes(source, target, coords, mask_roi)
+        if early_local_tone_mask is not None:
+            return early_local_tone_mask
+
+    bright_textured_mask = _bright_textured_source_repair(source, target, coords, mask_roi)
+    if bright_textured_mask is not None:
+        return bright_textured_mask
 
     if _fill_high_contrast_light_text_mask(source, target, coords, mask_roi):
         return mask_roi
+
+    if precise_only:
+        stroke_only_mask = _stroke_only_inpaint_repair(
+            source,
+            target,
+            coords,
+            mask_roi,
+            radius=1.15,
+            max_seed_density=0.64,
+            max_repair_density=0.60,
+        )
+        if stroke_only_mask is not None:
+            return stroke_only_mask
+
+    dilated_anime_mask = _dilated_anime_caption_repair(
+        source,
+        target,
+        coords,
+        mask_roi,
+        anime_model,
+        anime_device,
+    )
+    if dilated_anime_mask is not None:
+        return dilated_anime_mask
 
     outlined_mask = _outlined_floating_text_repair(source, target, coords, mask_roi)
     if outlined_mask is not None:
@@ -2943,6 +4485,9 @@ def _tight_floating_stroke_repair(
     stroke_only_mask = _stroke_only_inpaint_repair(source, target, coords, mask_roi)
     if stroke_only_mask is not None:
         return stroke_only_mask
+
+    if mask_density >= 0.72 and _fill_flat_background_text_mask(source, target, coords, mask_roi):
+        return mask_roi
 
     mixed_tone_mask = _mixed_tone_model_repair(
         source,
@@ -2954,10 +4499,6 @@ def _tight_floating_stroke_repair(
     )
     if mixed_tone_mask is not None:
         return mixed_tone_mask
-
-    dark_surface_mask = _fill_dark_surface_source_strokes(source, target, coords, mask_roi)
-    if dark_surface_mask is not None:
-        return dark_surface_mask
 
     smooth_caption_mask = _fill_smooth_tone_caption_strokes(source, target, coords, mask_roi)
     if smooth_caption_mask is not None:
@@ -3374,8 +4915,6 @@ def run_step4_inpaint():
             is_bubble = constraint.get("bubble_idx", -1) != -1 or force_bubble_cleanup
             precise_layout_mask = constraint.get("mask_mode") == "svg_text"
             cleanup_box = red_box
-            if not is_bubble and not constraint.get("erase_boxes"):
-                cleanup_box = [int(value) for value in constraint.get("green_box", red_box)]
             x1, y1, x2, y2 = cleanup_box
 
             roi_seg = seg_mask[y1:y2, x1:x2]
@@ -3549,12 +5088,20 @@ def run_step4_inpaint():
                         primary_box,
                         primary_roi,
                     )
+                    secondary_boxes_nested = all(
+                        other[0] >= primary_box[0] - 4
+                        and other[1] >= primary_box[1] - 4
+                        and other[2] <= primary_box[2] + 4
+                        and other[3] <= primary_box[3] + 4
+                        for other in erase_boxes[1:]
+                    )
                     if (
                         np.count_nonzero(primary_roi > 0) >= 20
                         and (
                             primary_component_mask is not None
                             or not _floating_cleanup_should_fail_closed(image, primary_box, primary_roi)
                         )
+                        and secondary_boxes_nested
                     ):
                         erase_boxes = [primary_box]
 
@@ -3783,25 +5330,69 @@ def run_step4_inpaint():
                         "reason": "source_cover_required",
                     }
                     continue
+                floating_area = max(1, (x2 - x1) * (y2 - y1))
+                floating_density = float(np.count_nonzero(floating_roi > 0)) / float(floating_area)
+                floating_tall = (y2 - y1) >= max(92, int((x2 - x1) * 1.20))
+                floating_wide = (x2 - x1) >= max(180, int((y2 - y1) * 1.75))
                 prefer_box_cleanup = (
                     not constraint.get("erase_boxes")
                     and not use_layout_stroke_mask
                     and (
-                        (x2 - x1) * (y2 - y1) >= 18000
-                        or (y2 - y1) >= max(92, int((x2 - x1) * 1.20))
+                        (floating_tall and floating_density >= 0.26)
+                        or (
+                            floating_area >= 18000
+                            and floating_density >= 0.68
+                            and not floating_wide
+                        )
                     )
                     and _floating_full_box_cleanup_allowed(image, (x1, y1, x2, y2))
                 )
-                if not prefer_box_cleanup:
-                    tight_repair_mask = _tight_floating_stroke_repair(
+                legacy_caption_repair = None
+                if (
+                    not constraint.get("erase_boxes")
+                    and not use_layout_stroke_mask
+                    and _legacy_bright_caption_candidate(image, (x1, y1, x2, y2), floating_roi)
+                ):
+                    legacy_repair_box = _union_repair_box(
+                        (x1, y1, x2, y2),
+                        constraint.get("green_box"),
+                        image.shape,
+                    )
+                    legacy_caption_repair = _legacy_full_box_anime_repair(
                         image,
                         result,
-                        seg_mask,
-                        (x1, y1, x2, y2),
+                        legacy_repair_box,
                         anime_model,
                         anime_device,
+                        pad=_compact_caption_repair_pad(legacy_repair_box),
                     )
-                    if tight_repair_mask is not None:
+                if legacy_caption_repair is not None:
+                    floating_mask = cv2.bitwise_or(floating_mask, legacy_caption_repair)
+                    final_mask = cv2.bitwise_or(final_mask, legacy_caption_repair)
+                    cleanup_status[constraint_id] = {
+                        "cleaned": True,
+                        "mode": "floating",
+                        "reason": "legacy_bright_caption_anime",
+                    }
+                    continue
+                prefer_box_cleanup = False
+                tight_repair_mask = _tight_floating_stroke_repair(
+                    image,
+                    result,
+                    seg_mask,
+                    (x1, y1, x2, y2),
+                    anime_model,
+                    anime_device,
+                )
+                if tight_repair_mask is not None:
+                    tight_repair_density = float(np.count_nonzero(tight_repair_mask > 0)) / float(
+                        max(1, (x2 - x1) * (y2 - y1))
+                    )
+                    if (
+                        not prefer_box_cleanup
+                        or constraint.get("erase_boxes")
+                        or tight_repair_density <= 0.78
+                    ):
                         region_mask[y1:y2, x1:x2] = tight_repair_mask
                         floating_mask = cv2.bitwise_or(floating_mask, region_mask)
                         final_mask = cv2.bitwise_or(final_mask, region_mask)
@@ -3886,8 +5477,12 @@ def run_step4_inpaint():
                     )
                 ):
                     pass
-                elif not use_layout_stroke_mask and _maybe_fill_screentone_background(
-                    image, result, tone_x1, tone_y1, tone_x2, tone_y2
+                elif (
+                    not use_layout_stroke_mask
+                    and current_mask_density >= 0.72
+                    and _maybe_fill_screentone_background(
+                        image, result, tone_x1, tone_y1, tone_x2, tone_y2
+                    )
                 ):
                     region_mask = np.zeros((img_h, img_w), dtype=np.uint8)
                     region_mask[tone_y1:tone_y2, tone_x1:tone_x2] = 255

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-                                   
+
 from pathlib import Path as _BootstrapPath
 import sys as _bootstrap_sys
 _BOOTSTRAP_FILE = _BootstrapPath(__file__).resolve()
@@ -23,7 +23,7 @@ for _rel in (
     if _path not in _bootstrap_sys.path:
         _bootstrap_sys.path.insert(0, _path)
 del _BootstrapPath, _bootstrap_sys, _BOOTSTRAP_FILE, _candidate, _PROJECT_ROOT_FOR_IMPORTS, _rel, _path
-                                       
+
 
 from pathlib import Path
 import time
