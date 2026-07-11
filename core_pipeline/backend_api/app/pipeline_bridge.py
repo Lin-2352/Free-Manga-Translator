@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-
+# --- Clean-copy path bootstrap ---
 from pathlib import Path as _BootstrapPath
 import sys as _bootstrap_sys
 _BOOTSTRAP_FILE = _BootstrapPath(__file__).resolve()
@@ -23,13 +23,21 @@ for _rel in (
     if _path not in _bootstrap_sys.path:
         _bootstrap_sys.path.insert(0, _path)
 del _BootstrapPath, _bootstrap_sys, _BOOTSTRAP_FILE, _candidate, _PROJECT_ROOT_FOR_IMPORTS, _rel, _path
-
+# --- End clean-copy path bootstrap ---
 
 from pathlib import Path
+import hashlib
+import threading
 import time
 from typing import Any
 
 import run_extension_pipeline_server as legacy_bridge
+
+from .gpu_scheduler import PIPELINE_SCHEDULER
+
+
+_SAMPLE_LOCKS: dict[str, threading.Lock] = {}
+_SAMPLE_LOCKS_GUARD = threading.Lock()
 
 
 class PipelineRunError(RuntimeError):
@@ -57,6 +65,36 @@ def _artifact_paths(sample_name: str) -> dict[str, str]:
     }
 
 
+def _failure_diagnostics(sample_name: str, language: str) -> dict[str, Any]:
+    artifacts = _artifact_paths(sample_name)
+    try:
+        report = legacy_bridge._collect_runtime_report(sample_name, language)
+        legacy_bridge._annotate_runtime_report_safety(report)
+    except Exception as error:
+        report = {"diagnosticError": str(error)}
+    return {
+        "sampleName": sample_name,
+        "language": language,
+        "artifacts": artifacts,
+        "report": report,
+    }
+
+
+def _runtime_sample_name(image_bytes: bytes, language: str) -> str:
+    digest = hashlib.sha1(image_bytes).hexdigest()[:14]
+    normalized = legacy_bridge._normalize_language_hint(language)
+    return f"runtime_{normalized}_{digest}"
+
+
+def _sample_lock(sample_name: str) -> threading.Lock:
+    with _SAMPLE_LOCKS_GUARD:
+        lock = _SAMPLE_LOCKS.get(sample_name)
+        if lock is None:
+            lock = threading.Lock()
+            _SAMPLE_LOCKS[sample_name] = lock
+        return lock
+
+
 def run_pipeline_payload(payload: dict[str, Any]) -> dict[str, Any]:
     started = time.perf_counter()
     image_bytes = legacy_bridge._decode_image_data(payload)
@@ -76,31 +114,57 @@ def run_pipeline_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if quality_profile != "strict":
         raise PipelineRunError("Only strict mode is enabled for consumer-safe output.")
 
-    with legacy_bridge.PIPELINE_LOCK:
-        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-        cache_id = metadata.get("cacheId") or metadata.get("cacheKey") or "no-cache-id"
-        print(
-            f"[api] pipeline request start language={language} bytes={len(image_bytes)} cache={str(cache_id)[:80]}",
-            flush=True,
-        )
-        sample_name, _ = legacy_bridge._write_runtime_sample(image_bytes, language)
-        if legacy_bridge._has_reusable_runtime_output(sample_name, language):
-            report = legacy_bridge._collect_runtime_report(
-                sample_name,
-                language,
-                stage_timings=[{"stage": "runtime_output_cache", "seconds": 0}],
-                total_seconds=0,
-                reused_output=True,
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    cache_id = metadata.get("cacheId") or metadata.get("cacheKey") or "no-cache-id"
+    trace_id = metadata.get("traceId") or payload.get("clientRequestId") or "no-trace"
+    source = metadata.get("source") or "unknown"
+    sample_name = _runtime_sample_name(image_bytes, language)
+    with _sample_lock(sample_name):
+        with PIPELINE_SCHEDULER.acquire(str(cache_id)[:80]) as scheduler_slot:
+            print(
+                (
+                    f"[api] pipeline request start trace={trace_id} sample={sample_name} "
+                    f"language={language} source={source} bytes={len(image_bytes)} cache={str(cache_id)[:80]}"
+                ),
+                flush=True,
             )
-            legacy_bridge._assert_runtime_report_safe(report)
-            print(f"[api] runtime output cache hit sample={sample_name}", flush=True)
-        else:
-            report = legacy_bridge._run_runtime_pipeline(sample_name, language)
-        translated_image = legacy_bridge._read_output_data_url(sample_name)
-        print(
-            f"[api] pipeline request done sample={sample_name} total={time.perf_counter() - started:.2f}s",
-            flush=True,
-        )
+            sample_name, _ = legacy_bridge._write_runtime_sample(image_bytes, language)
+            try:
+                if legacy_bridge._has_reusable_runtime_output(sample_name, language):
+                    report = legacy_bridge._collect_runtime_report(
+                        sample_name,
+                        language,
+                        stage_timings=[{"stage": "runtime_output_cache", "seconds": 0}],
+                        total_seconds=0,
+                        reused_output=True,
+                    )
+                    legacy_bridge._assert_runtime_report_safe(report)
+                    print(f"[api] runtime output cache hit sample={sample_name}", flush=True)
+                else:
+                    report = legacy_bridge._run_runtime_pipeline(sample_name, language)
+            except Exception as error:
+                diagnostics = _failure_diagnostics(sample_name, language)
+                print(
+                    (
+                        f"[api] pipeline request failed trace={trace_id} sample={sample_name} "
+                        f"language={language} error={error} diagnostics={diagnostics}"
+                    ),
+                    flush=True,
+                )
+                raise PipelineRunError(
+                    f"Pipeline failed for {sample_name}: {error}; diagnostics={diagnostics}"
+                ) from error
+            report["scheduler"] = scheduler_slot.as_report()
+            translated_image = legacy_bridge._read_output_data_url(sample_name)
+            step8 = report.get("step8") if isinstance(report.get("step8"), dict) else {}
+            print(
+                (
+                    f"[api] pipeline request done trace={trace_id} sample={sample_name} "
+                    f"outputSafety={report.get('outputSafety')} rendered={step8.get('regions')} "
+                    f"total={time.perf_counter() - started:.2f}s"
+                ),
+                flush=True,
+            )
 
     return {
         "sampleName": sample_name,

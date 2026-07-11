@@ -1,16 +1,16 @@
-
-
+// Free Manga Translator - Translation Panel (Click-and-Drag Selection)
+// Uses Ichigo's techniques: backward drag, zoom-aware positioning, percentage-based text boxes
 
 (function () {
   'use strict';
 
-  
+  // Toggle: if panel already exists, remove it
   if (document.getElementById('fmt-panel-overlay')) {
     document.getElementById('fmt-panel-overlay').remove();
     return;
   }
 
-  
+  // ===== Inject panel styles =====
   const styleId = 'fmt-panel-styles';
   if (!document.getElementById(styleId)) {
     const style = document.createElement('style');
@@ -140,7 +140,7 @@
     document.head.appendChild(style);
   }
 
-  
+  // ===== Create overlay =====
   const overlay = document.createElement('div');
   overlay.id = 'fmt-panel-overlay';
 
@@ -159,11 +159,11 @@
   overlay.appendChild(instructions);
   document.body.appendChild(overlay);
 
-  
+  // ===== Drag State =====
   let isDragging = false;
   let startX = 0, startY = 0;
 
-  
+  // ===== Mouse Handlers (Ichigo pattern: supports backward dragging) =====
   fader.addEventListener('mousedown', (e) => {
     e.preventDefault();
     isDragging = true;
@@ -184,7 +184,7 @@
     const w = currentX - startX;
     const h = currentY - startY;
 
-    
+    // Support backward dragging (Ichigo pattern)
     selection.style.left = (w < 0 ? currentX : startX) + 'px';
     selection.style.top = (h < 0 ? currentY : startY) + 'px';
     selection.style.width = Math.abs(w) + 'px';
@@ -202,20 +202,20 @@
     const left = Math.min(startX, currentX);
     const top = Math.min(startY, currentY);
 
-    
+    // Minimum selection size
     if (w < 50 || h < 50) {
       cleanup();
       return;
     }
 
-    
+    // Hide overlay before capture (so it doesn't appear in screenshot)
     fader.style.display = 'none';
     selection.style.display = 'none';
 
-    
+    // Brief delay for DOM to update
     await new Promise(r => setTimeout(r, 150));
 
-    
+    // Show loading indicator
     const loading = document.createElement('div');
     loading.className = 'fmt-loading';
     loading.style.cssText = `left:${left}px;top:${top}px;width:${w}px;height:${h}px;`;
@@ -251,13 +251,13 @@
     }
   });
 
-  
+  // ===== Precision rounding (Ichigo's pattern) =====
   function precisionRound(num) {
     const m = Number((Math.abs(num) * 100).toPrecision(15));
     return (Math.round(m) / 100) * Math.sign(num);
   }
 
-  
+  // ===== Word wrap for strict DOM text fitting =====
   function wrapTextForWidth(ctx, text, maxWidth) {
     const content = String(text || '');
     if (maxWidth <= 0) return [content];
@@ -311,7 +311,7 @@
     return allLines.length > 0 ? allLines : [''];
   }
 
-  
+  // ===== Strict while-loop text fitting (mathematical fit) =====
   function fitTextStrict(text, boxWidth, boxHeight, fontFamily) {
     const MIN_FONT_SIZE = 7;
     const PADDING = 8;
@@ -365,10 +365,10 @@
     };
   }
 
-  
+  // ===== Show Translation Panel (percentage-based text positioning, DPR-aware) =====
   function showTranslationPanel(translations, panelX, panelY, panelW, panelH, zoomFactor, dpr) {
-    
-    
+    // The captured image dimensions are (panelW * zoomFactor * dpr) x (panelH * zoomFactor * dpr).
+    // API coordinates are in that pixel space. To map back to panel percentages:
     const scale = zoomFactor * dpr;
     const imgW = panelW * scale;
     const imgH = panelH * scale;
@@ -380,7 +380,7 @@
     panel.style.width = panelW + 'px';
     panel.style.height = panelH + 'px';
 
-    
+    // Close button
     const closeBtn = document.createElement('button');
     closeBtn.className = 'fmt-close-btn';
     closeBtn.textContent = '✕';
@@ -390,7 +390,7 @@
     });
     panel.appendChild(closeBtn);
 
-    
+    // Load font preference
     chrome.storage.local.get(['mangaFontStyle', 'mangaFontColor'], (result) => {
       const font = result.mangaFontStyle || 'CC Wild Words';
       const color = result.mangaFontColor || '#000000';
@@ -398,7 +398,7 @@
       const MASK_PADDING_PX = 2;
 
       for (const t of translations) {
-        
+        // Expand mask bounds (6-8px required) to fully erase original text beneath
         const minX = Math.max(0, Math.floor(t.minX - MASK_PADDING_PX));
         const minY = Math.max(0, Math.floor(t.minY - MASK_PADDING_PX));
         const maxX = Math.min(imgW, Math.ceil(t.maxX + MASK_PADDING_PX));
@@ -408,7 +408,7 @@
         const boxHImgPx = maxY - minY;
         if (boxWImgPx < 8 || boxHImgPx < 8) continue;
 
-        
+        // Convert image pixel coords to panel pixel coords
         const boxLeftPx = minX / scale;
         const boxTopPx = minY / scale;
         const boxWPx = boxWImgPx / scale;
@@ -438,7 +438,7 @@
 
         panel.appendChild(textBox);
 
-        
+        // Final strict guard: no overflow may escape mask box.
         requestAnimationFrame(() => {
           let strictSize = fit.fontSize;
           while (
@@ -457,7 +457,7 @@
     overlay.remove();
   }
 
-  
+  // ===== Show final Step 8 translated image for local pipeline mode =====
   function showTranslatedImagePanel(dataUrl, panelX, panelY, panelW, panelH) {
     const panel = document.createElement('div');
     panel.className = 'fmt-panel';
@@ -494,7 +494,7 @@
     overlay.remove();
   }
 
-  
+  // ===== Show Error =====
   function showError(message, x, y, w, h) {
     const errorPanel = document.createElement('div');
     errorPanel.style.cssText = `
@@ -508,7 +508,7 @@
     const errorText = document.createElement('div');
     errorText.style.cssText = 'color:#f44336;font-size:13px;text-align:center;max-width:90%;';
 
-    
+    // User-friendly error messages
     const friendlyMessages = {
       'NO_API_KEY': 'Please set your API key in the extension popup first',
       'INVALID_API_KEY': 'API key is invalid or expired. Please check your keys in the extension popup.',
@@ -517,7 +517,7 @@
       'FullQueue': 'Translation queue is full. Please wait and try again.',
       'CAPTURE_FAILED': 'Failed to capture the page. Please try again.',
     };
-    
+    // Match known error prefixes or show truncated message
     let displayMsg = friendlyMessages[message];
     if (!displayMsg) {
       for (const [key, msg] of Object.entries(friendlyMessages)) {
@@ -540,13 +540,13 @@
     overlay.remove();
   }
 
-  
+  // ===== Cleanup =====
   function cleanup() {
     const el = document.getElementById('fmt-panel-overlay');
     if (el) el.remove();
   }
 
-  
+  // ===== ESC to cancel =====
   function escHandler(e) {
     if (e.key === 'Escape') {
       cleanup();

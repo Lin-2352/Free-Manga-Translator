@@ -49,3 +49,5 @@ class HealthResponse(BaseModel):
     service: str
     mode: str
     version: str
+    warmup: dict[str, Any] = Field(default_factory=dict)
+    scheduler: dict[str, Any] = Field(default_factory=dict)

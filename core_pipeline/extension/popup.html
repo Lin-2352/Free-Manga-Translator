@@ -12,7 +12,7 @@
       <img src="icons/48x48.png" alt="Manga Translator" class="logo">
       <div class="title-block">
         <h1>Manga Translator</h1>
-        <span>Local 8-stage pipeline</span>
+          <span>Local 8-stage pipeline <b id="versionBadge" class="version-badge">v1.1.13</b></span>
       </div>
       <span class="badge">LOCAL</span>
     </header>
@@ -29,7 +29,7 @@
           <input type="text" id="localPipelineUrl" placeholder="http://127.0.0.1:8766/v1/translate-image">
           <button id="saveLocalPipelineBtn" class="btn btn-secondary btn-with-feedback">
             <span>Save</span>
-            <span class="btn-check" id="saveCheck" aria-hidden="true">✓</span>
+            <span class="btn-check" id="saveCheck" aria-hidden="true">&#10003;</span>
           </button>
         </div>
       </div>
@@ -41,21 +41,9 @@
           <option value="zh">Chinese manhua</option>
         </select>
       </div>
-      <p class="help-link">
-        Provider keys stay inside the local Python server. The extension only sends images to the local endpoint.
-      </p>
-    </section>
-
-    <section class="section">
-      <div class="toggle-row">
-        <div>
-          <span class="section-icon">Auto</span>
-          <span>Auto-translate images</span>
-        </div>
-        <label class="toggle">
-          <input type="checkbox" id="translationToggle">
-          <span class="toggle-slider"></span>
-        </label>
+      <div class="engine-strip">
+        <span>Engine</span>
+        <strong id="engineStatusText">Not checked</strong>
       </div>
     </section>
 
@@ -65,16 +53,114 @@
         <span>Translation Control</span>
       </div>
       <div class="actions-grid">
-        <button id="translatePageBtn" class="btn btn-primary btn-action">Translate Page</button>
-        <button id="translationPanelBtn" class="btn btn-secondary btn-action">Selection Panel</button>
-        <button id="pauseBtn" class="btn btn-secondary btn-action">Pause</button>
-        <button id="resumeBtn" class="btn btn-secondary btn-action">Resume</button>
-        <button id="clearBtn" class="btn btn-danger btn-action">Clear All</button>
-        <button id="retranslateBtn" class="btn btn-secondary btn-action">Re-translate</button>
+        <button id="startEngineBtn" class="btn btn-primary btn-action actions-grid-wide" data-help-panel="hoverHelp" data-help-title="Start Engine" data-help="Checks whether the local backend is reachable.|If reachable, requests model warmup through /v1/warmup.|If unreachable, shows the local launcher command because Chrome cannot spawn Python directly without a native host.">Start Engine</button>
+        <button id="translatePageBtn" class="btn btn-primary btn-action" data-help-panel="hoverHelp" data-help-title="Translate Page" data-help="Scans the current reader page for manga images.|Uses cached translations first.|Sends untranslated images to the local 8-stage pipeline.">Translate Page</button>
+        <button id="translationPanelBtn" class="btn btn-secondary btn-action" data-help-panel="hoverHelp" data-help-title="Selection Panel" data-help="Opens manual area translation mode.|Use it for a single panel or cropped region.|Keeps the normal page queue untouched.">Selection Panel</button>
+        <button id="pauseBtn" class="btn btn-warning btn-action" data-help-panel="hoverHelp" data-help-title="Pause" data-help="Immediately pauses page translation.|Cancels queued browser work and stops image spinners.|Keeps already translated images and backend models untouched.">Pause</button>
+        <button id="resumeBtn" class="btn btn-secondary btn-action" data-help-panel="hoverHelp" data-help-title="Resume" data-help="Clears the paused state.|Restarts queued work if auto-translate is enabled.|Does not reload GPU models if they are already warm.">Resume</button>
+        <button id="softStopBtn" class="btn btn-warning btn-action" data-help-panel="hoverHelp" data-help-title="Soft Stop" data-help="Stops active and queued translation work.|Keeps the backend process alive.|Keeps models available so the next run starts faster.">Soft Stop</button>
+        <button id="hardStopBtn" class="btn btn-danger btn-action" data-help-panel="hoverHelp" data-help-title="Hard Stop" data-help="Stops active and queued translation work.|Requests backend model unload and GPU release.|Does not kill the local server process, so the popup can still control it.">Hard Stop</button>
+        <button id="retranslateBtn" class="btn btn-secondary btn-action" data-help-panel="hoverHelp" data-help-title="Re-translate" data-help="Clears browser cache and backend runtime output cache.|Forces a fresh translation pass.|Use after pipeline fixes or rendering changes.">Re-translate</button>
+        <button id="clearBtn" class="btn btn-secondary btn-action actions-grid-wide" data-help-panel="hoverHelp" data-help-title="Clear Page" data-help="Removes translated overlays from the current tab.|Clears browser cache and backend runtime output cache.|Use this before testing a fixed page again.">Clear Page</button>
       </div>
+    </section>
+
+    <section class="section">
+      <div class="toggle-row">
+        <div>
+          <span class="section-icon">Auto</span>
+          <span>Auto-translate images</span>
+          <span class="info-icon" tabindex="0" aria-label="Auto-translate details" data-help-panel="hoverHelp" data-help-title="Auto-translate" data-help="Scans the active reader page for untranslated manga images.|Queues only the configured number of nearby pages/images.|Keep this low on 8 GB GPUs to avoid long GPU occupancy.">i</span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="translationToggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="setting-row queue-control-row">
+        <label for="translationQueuePages">
+          Queue ahead
+          <span class="info-icon" tabindex="0" aria-label="Queue ahead details" data-help-panel="hoverHelp" data-help-title="Queue ahead" data-help="Current only is the lightest mode.|20 pages/images is the default after thumbnail filtering.|Use 35–50 only for long webtoon pages when you can wait.">i</span>
+        </label>
+        <select id="translationQueuePages">
+          <option value="0">Current only</option>
+          <option value="3">3 pages/images</option>
+          <option value="5">5 pages/images</option>
+          <option value="10">10 pages/images</option>
+          <option value="20">20 pages/images</option>
+          <option value="35">35 pages/images</option>
+          <option value="50">50 pages/images</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <label for="translationParallelPages">
+          Parallel jobs
+          <span class="info-icon" tabindex="0" aria-label="Parallel job details" data-help-panel="hoverHelp" data-help-title="Parallel jobs" data-help="Sequential is safest and lowest VRAM.|2 jobs is balanced when VRAM headroom is available.|3 jobs is heavy and should only be used on stronger GPUs.">i</span>
+        </label>
+        <select id="translationParallelPages">
+          <option value="1">Sequential safe</option>
+          <option value="2">Adaptive 2 jobs</option>
+          <option value="3">Adaptive 3 jobs</option>
+        </select>
+      </div>
+      <div class="queue-status-card" aria-live="polite">
+        <div>
+          <span>Active</span>
+          <strong id="activeJobsText">0</strong>
+        </div>
+        <div>
+          <span>Queued</span>
+          <strong id="queuedJobsText">0/5</strong>
+        </div>
+        <div>
+          <span>Parallel</span>
+          <strong id="parallelJobsText">2</strong>
+        </div>
+      </div>
+      <div class="queue-meter" aria-label="Translation queue pressure">
+        <span id="queueMeterFill"></span>
+      </div>
+      <button id="clearQueueBtn" class="mini-btn queue-clear-btn" type="button">Clear Queue</button>
       <p class="help-link">
-        Translate Page runs once. Auto-translate stays off until you explicitly enable it.
+        Cache restores do not count as queued jobs. Results enter cache only after the backend returns a completed translated image.
       </p>
+    </section>
+
+    <section class="section telemetry-section">
+      <div class="section-header">
+        <span class="section-icon">System</span>
+        <span>Telemetry</span>
+      </div>
+      <details class="telemetry-details" id="quotaDetails">
+        <summary>
+          <span>Provider Quota</span>
+          <span id="quotaSummaryText" class="summary-pill">Click to view</span>
+        </summary>
+        <div class="telemetry-actions">
+          <button id="refreshQuotaBtn" class="mini-btn" type="button">Refresh</button>
+          <button id="openQuotaLogBtn" class="mini-btn" type="button">Open Log</button>
+        </div>
+        <div id="quotaAlert" class="quota-alert" hidden></div>
+        <div id="quotaCards" class="quota-cards">
+          <div class="quota-empty">Quota status loads from the local backend.</div>
+        </div>
+        <p class="help-link">Quota checks read local counters only; they do not call providers or spend API credits.</p>
+      </details>
+      <details class="telemetry-details" id="vramDetails">
+        <summary>
+          <span>GPU VRAM</span>
+          <span id="vramSummaryText" class="summary-pill">Not checked</span>
+        </summary>
+        <div class="telemetry-actions">
+          <button id="refreshVramBtn" class="mini-btn" type="button">Show VRAM Usage</button>
+          <button id="releaseGpuBtn" class="mini-btn mini-btn-danger" type="button">Release GPU</button>
+          <button id="openVramLogBtn" class="mini-btn" type="button">Open Log</button>
+        </div>
+        <div id="vramAlert" class="quota-alert" hidden></div>
+        <div id="vramCards" class="vram-cards">
+          <div class="quota-empty">VRAM status loads from the local backend.</div>
+        </div>
+      </details>
     </section>
 
     <section class="section">
@@ -126,8 +212,10 @@
       <div id="statusText">Local pipeline ready</div>
       <div id="statsText" class="stats"></div>
     </footer>
+    <div id="hoverHelp" class="hover-help" role="tooltip" hidden></div>
   </div>
 
   <script src="popup.js"></script>
 </body>
 </html>
+

@@ -1,5 +1,5 @@
-
-
+// Free Manga Translator - Content Script
+// Detects manga images on pages and overlays translations
 
 (function () {
   'use strict';
@@ -7,23 +7,33 @@
   if (window.__mangaTranslatorInjected) return;
   window.__mangaTranslatorInjected = true;
 
-  
+  // ===== Constants =====
   const MIN_IMAGE_SIZE = 200;
-  const MAX_DIMENSION = 1800;
+  const MIN_PAGE_IMAGE_SIZE = 360;
+  const MIN_PAGE_IMAGE_AREA = 220000;
+  const MAX_DIMENSION = 4096;
+  const CAPTURE_IMAGE_TYPE = 'image/jpeg';
+  const CAPTURE_IMAGE_QUALITY = 0.92;
   const TRANSLATED_ATTR = 'data-fmt-translated';
   const PROCESSING_ATTR = 'data-fmt-processing';
   const ORIGINAL_SRC_ATTR = 'data-fmt-original-src';
   const ORIGINAL_SRCSET_ATTR = 'data-fmt-original-srcset';
+  const ORIGINAL_WIDTH_ATTR = 'data-fmt-original-width';
+  const ORIGINAL_HEIGHT_ATTR = 'data-fmt-original-height';
   const TRANSLATED_SRC_ATTR = 'data-fmt-translated-src';
   const CACHE_KEY_ATTR = 'data-fmt-cache-key';
   const MAX_RETRIES = 3;
   const BASE_RETRY_DELAY = 3000;
+  const DEFAULT_AUTO_QUEUE_LIMIT = 20;
+  const MAX_AUTO_QUEUE_LIMIT = 50;
+  const EXTENSION_VERSION = '1.1.14';
 
-  
+  // ===== State =====
   let isEnabled = false;
   let isPaused = false;
   let fontFamily = 'CC Wild Words';
   let fontColor = '#000000';
+  let autoQueueLimit = DEFAULT_AUTO_QUEUE_LIMIT;
 
   const translatedSrcs = new Set();
   const pendingSrcs = new Set();
@@ -36,12 +46,57 @@
   let lastNavigationKey = '';
   let autoWatchdogTimer = null;
 
-  
-  chrome.storage.local.get(['translationEnabled', 'translationPaused', 'mangaFontStyle', 'mangaFontColor'], (result) => {
-    isEnabled = result.translationEnabled === true; 
+  function makeTraceId(prefix = 'live') {
+    return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function compactDiagnosticValue(value) {
+    if (value === null || value === undefined) return value;
+    if (typeof value === 'string') {
+      if (value.startsWith('data:image/')) return `<data-url:${value.length}>`;
+      return value.length > 220 ? `${value.slice(0, 220)}...` : value;
+    }
+    if (Array.isArray(value)) return value.slice(0, 12).map(compactDiagnosticValue);
+    if (typeof value === 'object') {
+      const result = {};
+      for (const [key, item] of Object.entries(value)) {
+        result[key] = /base64|imageData|translatedImageDataUrl|imageDataUrl/i.test(key)
+          ? '<redacted>'
+          : compactDiagnosticValue(item);
+      }
+      return result;
+    }
+    return value;
+  }
+
+  function emitDiagnostic(event, traceId, details = {}) {
+    const payload = {
+      kind: 'diagnosticLog',
+      event,
+      traceId,
+      pageUrl: window.location.href,
+      details: {
+        version: EXTENSION_VERSION,
+        ...compactDiagnosticValue(details),
+      },
+    };
+    console.log(`[MangaTranslator][trace=${traceId}] ${event}`, payload.details);
+    chrome.runtime.sendMessage(payload).catch(() => {});
+  }
+
+  // ===== Load Settings (auto-translate OFF by default) =====
+  function normalizeAutoQueueLimit(value) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed)) return DEFAULT_AUTO_QUEUE_LIMIT;
+    return Math.max(0, Math.min(MAX_AUTO_QUEUE_LIMIT, parsed));
+  }
+
+  chrome.storage.local.get(['translationEnabled', 'translationPaused', 'mangaFontStyle', 'mangaFontColor', 'translationQueuePages'], (result) => {
+    isEnabled = result.translationEnabled === true; // OFF by default
     isPaused = result.translationPaused === true;
     fontFamily = result.mangaFontStyle || 'CC Wild Words';
     fontColor = result.mangaFontColor || '#000000';
+    autoQueueLimit = normalizeAutoQueueLimit(result.translationQueuePages);
     if (isEnabled && !isPaused) scheduleInitialScan();
     if (!isPaused) schedulePassiveCacheRestore();
   });
@@ -54,7 +109,7 @@
     if (changes.translationPaused) {
       isPaused = changes.translationPaused.newValue === true;
       if (isPaused) {
-        cancelPageWork();
+        cancelPageWork({ pause: true });
       } else if (isEnabled) {
         scanForImages();
       } else {
@@ -63,9 +118,13 @@
     }
     if (changes.mangaFontStyle) fontFamily = changes.mangaFontStyle.newValue;
     if (changes.mangaFontColor) fontColor = changes.mangaFontColor.newValue;
+    if (changes.translationQueuePages) {
+      autoQueueLimit = normalizeAutoQueueLimit(changes.translationQueuePages.newValue);
+      if (isEnabled && !isPaused) scanForImages();
+    }
   });
 
-  
+  // ===== Font Injection =====
   function injectFonts() {
     if (document.getElementById('fmt-fonts')) return;
     const style = document.createElement('style');
@@ -90,7 +149,7 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
-  
+  // ===== Spinner Styles & Helpers (prominent dark badge with white spinner) =====
   function injectSpinnerStyles() {
     if (document.getElementById('fmt-spinner-styles')) return;
     const style = document.createElement('style');
@@ -134,7 +193,7 @@
     }
     injectSpinnerStyles();
     const rect = img.getBoundingClientRect();
-    if (rect.width < 10 || rect.height < 10) return; 
+    if (rect.width < 10 || rect.height < 10) return; // not visible
     const spinner = document.createElement('div');
     spinner.className = 'fmt-img-spinner';
     document.body.appendChild(spinner);
@@ -153,8 +212,32 @@
     stopSpinnerLoopIfIdle();
   }
 
+  function imageHasAttr(img, attr) {
+    return typeof img.hasAttribute === 'function'
+      ? img.hasAttribute(attr)
+      : img.getAttribute(attr) !== null && img.getAttribute(attr) !== undefined;
+  }
+
+  function pruneStaleSpinners() {
+    for (const img of Array.from(spinnerMap.keys())) {
+      if (
+        !img.isConnected
+        || !imageHasAttr(img, PROCESSING_ATTR)
+        || imageHasAttr(img, TRANSLATED_ATTR)
+        || isPaused
+      ) {
+        hideSpinner(img);
+      }
+    }
+  }
+
   function positionSpinner(img, spinner) {
-    if (!img.isConnected) {
+    if (
+      !img.isConnected
+      || !imageHasAttr(img, PROCESSING_ATTR)
+      || imageHasAttr(img, TRANSLATED_ATTR)
+      || isPaused
+    ) {
       hideSpinner(img);
       return;
     }
@@ -170,6 +253,7 @@
   }
 
   function updateSpinners() {
+    pruneStaleSpinners();
     for (const [img, spinner] of Array.from(spinnerMap.entries())) {
       positionSpinner(img, spinner);
     }
@@ -198,7 +282,8 @@
     });
   }
 
-  function cancelPageWork() {
+  function cancelPageWork(options = {}) {
+    if (options.pause === true) isPaused = true;
     pendingSrcs.clear();
     retryCountMap.clear();
     document.querySelectorAll(`[${PROCESSING_ATTR}]`).forEach((img) => {
@@ -208,14 +293,14 @@
     for (const img of Array.from(spinnerMap.keys())) hideSpinner(img);
   }
 
-  
+  // ===== Image Size Calculation =====
   function calculateResizedDimensions(width, height) {
     if (width <= MAX_DIMENSION && height <= MAX_DIMENSION) return { width, height };
     const ratio = Math.min(MAX_DIMENSION / width, MAX_DIMENSION / height);
     return { width: Math.round(width * ratio), height: Math.round(height * ratio) };
   }
 
-  
+  // ===== Get effective image src (handles lazy-load patterns) =====
   function getEffectiveSrc(img) {
     if (img.currentSrc && img.currentSrc !== '') return img.currentSrc;
     if (img.src && img.src !== '' && !img.src.endsWith('/')) return img.src;
@@ -244,6 +329,8 @@
     img.removeAttribute(TRANSLATED_SRC_ATTR);
     img.removeAttribute(CACHE_KEY_ATTR);
     img.removeAttribute(PROCESSING_ATTR);
+    img.removeAttribute(ORIGINAL_WIDTH_ATTR);
+    img.removeAttribute(ORIGINAL_HEIGHT_ATTR);
     hideSpinner(img);
   }
 
@@ -282,8 +369,10 @@
   }
 
   function buildImageCacheKey(img, originalSrc) {
-    const width = img.naturalWidth || img.width || 0;
-    const height = img.naturalHeight || img.height || 0;
+    const storedWidth = Number.parseInt(img.getAttribute(ORIGINAL_WIDTH_ATTR) || '', 10);
+    const storedHeight = Number.parseInt(img.getAttribute(ORIGINAL_HEIGHT_ATTR) || '', 10);
+    const width = Number.isFinite(storedWidth) && storedWidth > 0 ? storedWidth : (img.naturalWidth || img.width || 0);
+    const height = Number.isFinite(storedHeight) && storedHeight > 0 ? storedHeight : (img.naturalHeight || img.height || 0);
     return `${originalSrc || ''}|${width}x${height}`;
   }
 
@@ -293,9 +382,35 @@
     return width >= MIN_IMAGE_SIZE && height >= MIN_IMAGE_SIZE;
   }
 
+  function isLikelyPageImage(img) {
+    if (isStandaloneImagePage()) return true;
+    const width = img.naturalWidth || img.width || 0;
+    const height = img.naturalHeight || img.height || 0;
+    if (width < MIN_PAGE_IMAGE_SIZE || height < MIN_PAGE_IMAGE_SIZE) return false;
+    if (width * height < MIN_PAGE_IMAGE_AREA) return false;
+
+    const src = getOriginalSrc(img) || getEffectiveSrc(img) || '';
+    if (/[?&]type=p100\b/i.test(src) && (width < 720 || height < 720)) return false;
+
+    const rect = img.getBoundingClientRect?.();
+    if (rect && rect.width > 0 && rect.height > 0) {
+      if (rect.width < 180 || rect.height < 180) return false;
+      if (rect.width * rect.height < 80000) return false;
+    }
+    return true;
+  }
+
   function rememberOriginalImage(img, originalSrc) {
     if (originalSrc && !img.getAttribute(ORIGINAL_SRC_ATTR)) {
       img.setAttribute(ORIGINAL_SRC_ATTR, originalSrc);
+    }
+    const width = img.naturalWidth || img.width || 0;
+    const height = img.naturalHeight || img.height || 0;
+    if (width > 0 && !img.getAttribute(ORIGINAL_WIDTH_ATTR)) {
+      img.setAttribute(ORIGINAL_WIDTH_ATTR, String(width));
+    }
+    if (height > 0 && !img.getAttribute(ORIGINAL_HEIGHT_ATTR)) {
+      img.setAttribute(ORIGINAL_HEIGHT_ATTR, String(height));
     }
     if (!img.getAttribute(ORIGINAL_SRCSET_ATTR) && img.srcset) {
       img.setAttribute(ORIGINAL_SRCSET_ATTR, img.srcset);
@@ -306,6 +421,7 @@
     if (!translatedImageDataUrl) return;
     if (!isCurrentImageSource(img, originalSrc)) {
       console.log('[MangaTranslator] Skipped stale translation result for:', String(originalSrc).substring(0, 80));
+      cleanupProcessing(img, cacheKey || buildImageCacheKey(img, originalSrc));
       return;
     }
     rememberOriginalImage(img, originalSrc);
@@ -313,6 +429,7 @@
     img.setAttribute(TRANSLATED_SRC_ATTR, translatedImageDataUrl);
     img.setAttribute(CACHE_KEY_ATTR, cacheKey || buildImageCacheKey(img, originalSrc));
     img.removeAttribute(PROCESSING_ATTR);
+    hideSpinner(img);
     if (img.srcset) img.removeAttribute('srcset');
     img.src = translatedImageDataUrl;
     translatedSrcs.add(cacheKey || buildImageCacheKey(img, originalSrc));
@@ -340,6 +457,18 @@
     img.removeAttribute(TRANSLATED_SRC_ATTR);
     img.removeAttribute(CACHE_KEY_ATTR);
     img.removeAttribute(PROCESSING_ATTR);
+    hideSpinner(img);
+  }
+
+  function resetTranslatedStateForForce(img, cacheKey) {
+    if (!img.getAttribute(TRANSLATED_ATTR)) return;
+    if (cacheKey) {
+      translatedSrcs.delete(cacheKey);
+      pendingSrcs.delete(cacheKey);
+      cacheMissSrcs.delete(cacheKey);
+      retryCountMap.delete(cacheKey);
+    }
+    restoreOriginalImage(img);
   }
 
   async function lookupCachedTranslation(img, originalSrc, cacheKey) {
@@ -369,7 +498,7 @@
     return { hit: false, inFlight: false };
   }
 
-  
+  // ===== Detect standalone image page =====
   function isStandaloneImagePage() {
     const ct = document.contentType || '';
     if (ct.startsWith('image/')) return true;
@@ -378,7 +507,7 @@
     return false;
   }
 
-  
+  // ===== Get Image as Base64 =====
   function getImageBase64(img) {
     return new Promise((resolve, reject) => {
       try {
@@ -394,7 +523,7 @@
         ctx.fillStyle = '#FFFFFF';
         ctx.fillRect(0, 0, resized.width, resized.height);
         ctx.drawImage(img, 0, 0, resized.width, resized.height);
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        const dataUrl = canvas.toDataURL(CAPTURE_IMAGE_TYPE, CAPTURE_IMAGE_QUALITY);
         resolve({
           dataUrl,
           width: resized.width,
@@ -408,7 +537,7 @@
     });
   }
 
-  
+  // ===== Fetch Image Cross-Origin =====
   async function fetchImageCrossOrigin(url) {
     try {
       const response = await fetch(url, { mode: 'cors' });
@@ -425,7 +554,7 @@
     }
   }
 
-  
+  // ===== Word Wrap (handles long words via character breaking) =====
   function wrapText(ctx, text, maxWidth) {
     const content = String(text || '');
     if (maxWidth <= 0) return [content];
@@ -471,7 +600,7 @@
     return lines.length > 0 ? lines : [''];
   }
 
-  
+  // ===== Fit Text to Box (strict: guarantees text fits within box) =====
   function fitText(ctx, text, boxWidth, boxHeight, fontFam) {
     const MIN_FONT_SIZE = 7;
     const PADDING = 8;
@@ -515,7 +644,7 @@
     };
   }
 
-  
+  // ===== Overlay Translations onto Image (strict masking + clipped text) =====
   function overlayTranslations(img, translations, imageData) {
     if (!translations || translations.length === 0) return;
 
@@ -542,19 +671,19 @@
 
       if (boxW < 8 || boxH < 8) continue;
 
-      
+      // STEP 1: MASK - solid white rectangle
       ctx.save();
       ctx.globalAlpha = 1;
       ctx.globalCompositeOperation = 'source-over';
       ctx.fillStyle = 'rgba(255,255,255,1)';
       ctx.fillRect(minX, minY, boxW, boxH);
 
-      
+      // STEP 2: CLIP
       ctx.beginPath();
       ctx.rect(minX, minY, boxW, boxH);
       ctx.clip();
 
-      
+      // STEP 3: TEXT
       const fit = fitText(ctx, t.translatedText, boxW, boxH, fontFamily);
       ctx.font = `bold ${fit.fontSize}px "${fontFamily}", "Comic Sans MS", cursive`;
       ctx.textAlign = 'center';
@@ -590,14 +719,15 @@
     }
   }
 
-  
+  // ===== Check if Element Qualifies for Translation =====
   function shouldTranslate(img, options = {}) {
-    const allowManual = options.force === true || options.restoreOnly === true;
+    const allowManual = options.force === true || options.manualSpecific === true || options.restoreOnly === true;
     if (!allowManual && !isEnabled) return false;
     if (isPaused) return false;
     const originalSrc = getOriginalSrc(img);
     if (!originalSrc) return false;
     const cacheKey = buildImageCacheKey(img, originalSrc);
+    if (options.force === true) resetTranslatedStateForForce(img, cacheKey);
     if (img.getAttribute(TRANSLATED_ATTR)) return false;
     if (img.getAttribute(PROCESSING_ATTR)) {
       showSpinner(img);
@@ -608,6 +738,7 @@
     if (pendingSrcs.has(cacheKey)) return false;
     if (isDataImage(getEffectiveSrc(img)) && img.getAttribute(ORIGINAL_SRC_ATTR)) return false;
     if (!imageDimensionsReady(img)) return false;
+    if (!options.manualSpecific && !isLikelyPageImage(img)) return false;
 
     if (!isStandaloneImagePage()) {
       const rect = img.getBoundingClientRect();
@@ -617,13 +748,14 @@
     return true;
   }
 
-  
+  // ===== Translate a Single Image =====
   async function translateImage(img, options = {}) {
     if (!shouldTranslate(img, options)) return;
 
     const originalSrc = options.originalSrc || getOriginalSrc(img);
     if (!originalSrc) return;
     const cacheKey = options.cacheKey || buildImageCacheKey(img, originalSrc);
+    const traceId = options.traceId || makeTraceId('img');
 
     if (!options.skipLookup) {
       const lookup = await lookupCachedTranslation(img, originalSrc, cacheKey);
@@ -634,7 +766,14 @@
       }
     }
 
-    console.log('[MangaTranslator] Starting translation for:', originalSrc.substring(0, 80));
+    emitDiagnostic('content.translate.start', traceId, {
+      cacheKey,
+      src: originalSrc,
+      width: img.naturalWidth || img.width || 0,
+      height: img.naturalHeight || img.height || 0,
+      force: options.force === true,
+      skipLookup: options.skipLookup === true,
+    });
     rememberOriginalImage(img, originalSrc);
     pendingSrcs.add(cacheKey);
     img.setAttribute(PROCESSING_ATTR, 'true');
@@ -642,9 +781,31 @@
 
     try {
       let imageData;
+      const naturalWidth = img.naturalWidth || img.width || 0;
+      const naturalHeight = img.naturalHeight || img.height || 0;
+      const preferBackgroundFetch = /^https?:/i.test(originalSrc)
+        && Math.max(naturalWidth, naturalHeight) > MAX_DIMENSION;
 
       try {
-        imageData = await getImageBase64(img);
+        if (preferBackgroundFetch) {
+          imageData = {
+            dataUrl: null,
+            width: naturalWidth,
+            height: naturalHeight,
+            originalWidth: naturalWidth,
+            originalHeight: naturalHeight,
+            useBackgroundFetch: true
+          };
+          emitDiagnostic('content.capture.background_fetch_preferred', traceId, {
+            cacheKey,
+            src: originalSrc,
+            width: naturalWidth,
+            height: naturalHeight,
+            reason: 'preserve-full-resolution',
+          });
+        } else {
+          imageData = await getImageBase64(img);
+        }
       } catch (e) {
         if (originalSrc.startsWith('http://') || originalSrc.startsWith('https://') || originalSrc.startsWith('data:image/') || originalSrc.startsWith('file:')) {
           try {
@@ -667,16 +828,28 @@
               originalHeight: img.naturalHeight || img.height || 0,
               useBackgroundFetch: true
             };
+            emitDiagnostic('content.capture.background_fetch_required', traceId, {
+              cacheKey,
+              src: originalSrc,
+              error: corsError?.message || String(corsError || ''),
+            });
           }
         } else {
+          emitDiagnostic('content.capture.unsupported_source', traceId, { cacheKey, src: originalSrc });
           cleanupProcessing(img, cacheKey);
           return;
         }
       }
 
-      console.log('[MangaTranslator] Sending to API:', imageData.width, 'x', imageData.height);
+      emitDiagnostic('content.translate.send', traceId, {
+        cacheKey,
+        width: imageData.width,
+        height: imageData.height,
+        source: imageData.useBackgroundFetch ? 'background-fetch' : 'canvas',
+      });
       const response = await chrome.runtime.sendMessage({
         kind: 'translateImage',
+        traceId,
         base64Data: imageData.dataUrl || undefined,
         imageUrl: imageData.useBackgroundFetch ? originalSrc : undefined,
         originalImageUrl: originalSrc,
@@ -689,11 +862,17 @@
 
       if (response?.error) {
         console.warn('[MangaTranslator] API error:', response.error);
+        emitDiagnostic('content.translate.error_response', traceId, {
+          cacheKey,
+          error: response.error,
+          queueLength: response.queueLength,
+          queueLimit: response.queueLimit,
+        });
         if (response.error === 'TranslationPaused') {
           cleanupProcessing(img, cacheKey);
           return;
         }
-        if (response.error === 'FullQueue' || response.error === 'RATE_LIMITED') {
+        if (response.error === 'FullQueue' || response.error === 'QueueFull' || response.error === 'RATE_LIMITED') {
           const retryCount = (retryCountMap.get(cacheKey) || 0) + 1;
           retryCountMap.set(cacheKey, retryCount);
 
@@ -705,7 +884,7 @@
               pendingSrcs.delete(cacheKey);
               translateImage(img, { force: options.force === true, originalSrc, cacheKey });
             }, delay);
-            return; 
+            return; // spinner stays during retry
           } else {
             retryCountMap.delete(cacheKey);
           }
@@ -716,22 +895,35 @@
 
       retryCountMap.delete(cacheKey);
       translatedSrcs.add(cacheKey);
-      pendingSrcs.delete(cacheKey);
-      hideSpinner(img);
+      cleanupProcessing(img, cacheKey);
 
       if (response?.translatedImageDataUrl) {
         console.log(response.fromCache ? '[MangaTranslator] Got cached translated image' : '[MangaTranslator] Got local pipeline image result');
+        emitDiagnostic('content.translate.image_result', traceId, {
+          cacheKey,
+          fromCache: response.fromCache === true,
+          fromInFlight: response.fromInFlight === true,
+        });
         applyTranslatedImage(img, response.translatedImageDataUrl, originalSrc, cacheKey);
       } else if (response?.translations && response.translations.length > 0) {
         console.log('[MangaTranslator] Got', response.translations.length, 'translations');
+        emitDiagnostic('content.translate.overlay_result', traceId, {
+          cacheKey,
+          translationCount: response.translations.length,
+        });
         overlayTranslations(img, response.translations, imageData);
       } else {
         console.log('[MangaTranslator] No text found in image');
+        emitDiagnostic('content.translate.no_text_result', traceId, { cacheKey });
         img.setAttribute(TRANSLATED_ATTR, 'no-text');
         img.removeAttribute(PROCESSING_ATTR);
       }
     } catch (error) {
       console.error('[MangaTranslator] Error:', error);
+      emitDiagnostic('content.translate.exception', traceId, {
+        cacheKey,
+        error: error?.message || String(error || ''),
+      });
       cleanupProcessing(img, cacheKey);
     }
   }
@@ -773,7 +965,7 @@
     hideSpinner(img);
   }
 
-  
+  // ===== Process an Image Element =====
   async function processImage(img, options = {}) {
     const allowTranslate = options.force === true || isEnabled;
     const restoreOnly = options.restoreOnly === true || !allowTranslate;
@@ -781,6 +973,7 @@
     const originalSrc = getOriginalSrc(img);
     if (!originalSrc) return;
     const cacheKey = buildImageCacheKey(img, originalSrc);
+    if (options.force === true) resetTranslatedStateForForce(img, cacheKey);
     if (img.getAttribute(TRANSLATED_ATTR)) return;
     if (img.getAttribute(PROCESSING_ATTR)) {
       showSpinner(img);
@@ -809,7 +1002,57 @@
     }
   }
 
-  
+  function collectCandidateImages() {
+    const seen = new WeakSet();
+    const images = [];
+    const addImage = (img) => {
+      if (!img || img.nodeName !== 'IMG' || seen.has(img)) return;
+      seen.add(img);
+      images.push(img);
+    };
+    document.querySelectorAll('img').forEach(addImage);
+    document.querySelectorAll('picture img').forEach(addImage);
+    document.querySelectorAll('img[data-src], img[data-lazy-src], img[data-original]').forEach(addImage);
+    return images;
+  }
+
+  function imageViewportDistance(img) {
+    try {
+      const rect = img.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return Number.POSITIVE_INFINITY;
+      const viewportCenterY = (window.innerHeight || 0) / 2;
+      const viewportCenterX = (window.innerWidth || 0) / 2;
+      const imageCenterY = rect.top + rect.height / 2;
+      const imageCenterX = rect.left + rect.width / 2;
+      const verticalGap = rect.bottom < 0
+        ? Math.abs(rect.bottom)
+        : (rect.top > (window.innerHeight || 0) ? rect.top - (window.innerHeight || 0) : 0);
+      return verticalGap * 4 + Math.abs(imageCenterY - viewportCenterY) + Math.abs(imageCenterX - viewportCenterX) * 0.1;
+    } catch {
+      return Number.POSITIVE_INFINITY;
+    }
+  }
+
+  function selectImagesForScan(images, options = {}) {
+    const candidates = options.restoreOnly === true
+      ? images
+      : images.filter((img) => isLikelyPageImage(img));
+    if (options.force === true || options.restoreOnly === true || !isEnabled) return candidates;
+    const limit = autoQueueLimit <= 0 ? 1 : autoQueueLimit;
+    return [...candidates]
+      .sort((a, b) => imageViewportDistance(a) - imageViewportDistance(b))
+      .slice(0, limit);
+  }
+
+  function scheduleAutoScanForNewImages(reason) {
+    if (isEnabled) {
+      scheduleNavigationScan(reason, { delay: 350 });
+    } else {
+      scheduleNavigationScan(reason, { delay: 450 });
+    }
+  }
+
+  // ===== Scan Page for Images =====
   function scanForImages(options = {}) {
     const allowScan = options.force === true || options.restoreOnly === true || isEnabled;
     if (!allowScan) return;
@@ -818,26 +1061,25 @@
     refreshProcessingSpinners();
     console.log(options.restoreOnly ? '[MangaTranslator] Restoring cached images...' : '[MangaTranslator] Scanning for images...');
 
-    let count = 0;
-    document.querySelectorAll('img').forEach((img) => {
+    const images = collectCandidateImages();
+    images.forEach(observeWithIntersection);
+    const selectedImages = selectImagesForScan(images, options);
+    const selectedSet = new WeakSet(selectedImages);
+
+    selectedImages.forEach((img) => {
       processImage(img, options);
-      observeWithIntersection(img);
-      count++;
     });
 
-    document.querySelectorAll('picture img').forEach((img) => {
-      processImage(img, options);
-      observeWithIntersection(img);
-    });
+    if (isEnabled && options.force !== true && options.restoreOnly !== true) {
+      images.forEach((img) => {
+        if (!selectedSet.has(img)) processImage(img, { restoreOnly: true });
+      });
+    }
 
-    document.querySelectorAll('img[data-src], img[data-lazy-src], img[data-original]').forEach((img) => {
-      observeWithIntersection(img);
-    });
-
-    console.log('[MangaTranslator] Found', count, 'img elements');
+    console.log('[MangaTranslator] Found', images.length, 'img elements; scheduled', selectedImages.length);
   }
 
-  
+  // ===== Standalone Image Handler =====
   function handleStandaloneImage(options = {}) {
     if (!isStandaloneImagePage()) return;
     if (!options.force && !options.restoreOnly && !isEnabled) return;
@@ -855,7 +1097,7 @@
     }
   }
 
-  
+  // ===== Schedule Initial Scan =====
   function scheduleInitialScan() {
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', () => {
@@ -932,7 +1174,7 @@
     }
   }
 
-  
+  // ===== IntersectionObserver =====
   const intersectionObserver = new IntersectionObserver((entries) => {
     if (isPaused) return;
     for (const entry of entries) {
@@ -952,20 +1194,22 @@
     intersectionObserver.observe(img);
   }
 
-  
+  // ===== MutationObserver =====
   const mutationObserver = new MutationObserver((mutations) => {
     if (isPaused) return;
     for (const mutation of mutations) {
       if (mutation.type === 'childList') {
         for (const node of mutation.addedNodes) {
           if (node.nodeName === 'IMG') {
-            processImage(node, isEnabled ? {} : { restoreOnly: true });
             observeWithIntersection(node);
+            if (isEnabled) scheduleAutoScanForNewImages('mutation-image');
+            else processImage(node, { restoreOnly: true });
           } else if (node.querySelectorAll) {
             node.querySelectorAll('img').forEach((img) => {
-              processImage(img, isEnabled ? {} : { restoreOnly: true });
               observeWithIntersection(img);
+              if (!isEnabled) processImage(img, { restoreOnly: true });
             });
+            if (isEnabled) scheduleAutoScanForNewImages('mutation-images');
           }
         }
       }
@@ -982,14 +1226,15 @@
             img.removeAttribute(TRANSLATED_SRC_ATTR);
           }
           if (!img.getAttribute(PROCESSING_ATTR)) {
-            processImage(img, isEnabled ? {} : { restoreOnly: true });
+            if (isEnabled) scheduleAutoScanForNewImages('image-source-change');
+            else processImage(img, { restoreOnly: true });
           }
         }
       }
     }
   });
 
-  
+  // ===== Start Observers =====
   function startObservers() {
     const target = document.body || document.documentElement;
     if (!target) return;
@@ -1007,7 +1252,7 @@
     document.addEventListener('DOMContentLoaded', startObservers);
   }
 
-  
+  // ===== Message Handler =====
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.kind === 'pingContentScript') {
       sendResponse({ ok: true });
@@ -1026,7 +1271,7 @@
           img.removeAttribute(TRANSLATED_ATTR);
           img.removeAttribute(TRANSLATED_SRC_ATTR);
           img.removeAttribute(PROCESSING_ATTR);
-          translateImage(img, { force: true, originalSrc, cacheKey });
+          translateImage(img, { force: true, manualSpecific: true, originalSrc, cacheKey });
           break;
         }
       }
@@ -1055,16 +1300,19 @@
     if (message.kind === 'setTranslationPaused') {
       isPaused = message.paused === true;
       if (isPaused) {
-        cancelPageWork();
+        cancelPageWork({ pause: true });
       } else if (isEnabled) {
         scanForImages();
         handleStandaloneImage();
       } else {
         schedulePassiveCacheRestore();
       }
+      sendResponse({ success: true, paused: isPaused });
+      return true;
     }
 
     if (message.kind === 'retranslateAll') {
+      cancelPageWork();
       translatedSrcs.clear();
       pendingSrcs.clear();
       cacheMissSrcs.clear();
@@ -1073,9 +1321,12 @@
         restoreOriginalImage(img);
       });
       if (!isPaused) setTimeout(() => scanForImages({ force: true }), 500);
+      sendResponse({ success: true });
+      return true;
     }
 
     if (message.kind === 'clearTranslations') {
+      cancelPageWork();
       translatedSrcs.clear();
       pendingSrcs.clear();
       cacheMissSrcs.clear();
@@ -1083,10 +1334,12 @@
       document.querySelectorAll(`[${TRANSLATED_ATTR}]`).forEach(img => {
         restoreOriginalImage(img);
       });
+      sendResponse({ success: true });
+      return true;
     }
   });
 
-  
+  // Initial scan
   lastNavigationKey = getNavigationKey();
   patchHistoryNavigation();
   startAutoWatchdog();
@@ -1110,3 +1363,4 @@
   if (isEnabled && !isPaused) scheduleInitialScan();
   if (!isPaused) schedulePassiveCacheRestore();
 })();
+

@@ -1,10 +1,13 @@
-
+// Free Manga Translator - Local-only popup script.
 
 document.addEventListener('DOMContentLoaded', () => {
   const translationToggle = document.getElementById('translationToggle');
+  const startEngineBtn = document.getElementById('startEngineBtn');
   const translatePageBtn = document.getElementById('translatePageBtn');
   const translationPanelBtn = document.getElementById('translationPanelBtn');
   const pauseBtn = document.getElementById('pauseBtn');
+  const softStopBtn = document.getElementById('softStopBtn');
+  const hardStopBtn = document.getElementById('hardStopBtn');
   const resumeBtn = document.getElementById('resumeBtn');
   const clearBtn = document.getElementById('clearBtn');
   const clearCacheBtn = document.getElementById('clearCacheBtn');
@@ -17,17 +20,45 @@ document.addEventListener('DOMContentLoaded', () => {
   const localPipelineUrl = document.getElementById('localPipelineUrl');
   const localPipelineLanguage = document.getElementById('localPipelineLanguage');
   const translationCachePages = document.getElementById('translationCachePages');
+  const translationQueuePages = document.getElementById('translationQueuePages');
+  const translationParallelPages = document.getElementById('translationParallelPages');
   const saveLocalPipelineBtn = document.getElementById('saveLocalPipelineBtn');
   const apiStatus = document.getElementById('apiStatus');
+  const quotaCards = document.getElementById('quotaCards');
+  const quotaAlert = document.getElementById('quotaAlert');
+  const quotaSummaryText = document.getElementById('quotaSummaryText');
+  const refreshQuotaBtn = document.getElementById('refreshQuotaBtn');
+  const openQuotaLogBtn = document.getElementById('openQuotaLogBtn');
+  const vramCards = document.getElementById('vramCards');
+  const vramAlert = document.getElementById('vramAlert');
+  const vramSummaryText = document.getElementById('vramSummaryText');
+  const refreshVramBtn = document.getElementById('refreshVramBtn');
+  const releaseGpuBtn = document.getElementById('releaseGpuBtn');
+  const openVramLogBtn = document.getElementById('openVramLogBtn');
+  const activeJobsText = document.getElementById('activeJobsText');
+  const queuedJobsText = document.getElementById('queuedJobsText');
+  const parallelJobsText = document.getElementById('parallelJobsText');
+  const queueMeterFill = document.getElementById('queueMeterFill');
+  const clearQueueBtn = document.getElementById('clearQueueBtn');
+  const engineStatusText = document.getElementById('engineStatusText');
+  const hoverHelp = document.getElementById('hoverHelp');
+  const versionBadge = document.getElementById('versionBadge');
 
   const DEFAULT_LOCAL_PIPELINE_URL = 'http://127.0.0.1:8766/v1/translate-image';
   const DEFAULT_CACHE_LIMIT = 12;
+  const DEFAULT_QUEUE_LIMIT = 20;
+  const DEFAULT_PARALLEL_LIMIT = 2;
+
+  const manifestVersion = chrome.runtime.getManifest?.().version || '1.1.14';
+  if (versionBadge) versionBadge.textContent = `v${manifestVersion}`;
 
   async function loadSettings() {
     const result = await chrome.storage.local.get([
       'translationEnabled',
       'translationPaused',
       'translationCachePages',
+      'translationQueuePages',
+      'translationParallelPages',
       'mangaFontStyle',
       'mangaFontColor',
       'localPipelineUrl',
@@ -38,9 +69,12 @@ document.addEventListener('DOMContentLoaded', () => {
     localPipelineUrl.value = result.localPipelineUrl || DEFAULT_LOCAL_PIPELINE_URL;
     localPipelineLanguage.value = result.localPipelineLanguage || 'ja';
     translationCachePages.value = String(result.translationCachePages ?? DEFAULT_CACHE_LIMIT);
+    translationQueuePages.value = String(result.translationQueuePages ?? DEFAULT_QUEUE_LIMIT);
+    translationParallelPages.value = String(result.translationParallelPages ?? DEFAULT_PARALLEL_LIMIT);
     if (result.mangaFontStyle) fontSelect.value = result.mangaFontStyle;
     if (result.mangaFontColor) fontColorInput.value = result.mangaFontColor;
     statusText.textContent = result.translationPaused === true ? 'Translation paused' : 'Local pipeline mode';
+    setEngineStatus('Not checked');
   }
 
   function activeTab() {
@@ -84,6 +118,12 @@ document.addEventListener('DOMContentLoaded', () => {
     setTimeout(() => button.classList.remove('is-saved'), 1100);
   }
 
+  function flashAction(button) {
+    if (!button) return;
+    button.classList.add('is-saved');
+    setTimeout(() => button.classList.remove('is-saved'), 1200);
+  }
+
   async function withButton(button, action) {
     setBusy(button, true);
     try {
@@ -92,6 +132,62 @@ document.addEventListener('DOMContentLoaded', () => {
     } finally {
       setBusy(button, false);
     }
+  }
+
+  function setEngineStatus(text) {
+    if (engineStatusText) engineStatusText.textContent = text;
+  }
+
+  function renderFloatingHelp(title, items) {
+    if (!hoverHelp || !Array.isArray(items) || items.length === 0) return;
+    hoverHelp.textContent = '';
+    const strong = document.createElement('strong');
+    strong.textContent = title || 'Details';
+    const list = document.createElement('ul');
+    items.forEach((item) => {
+      const text = String(item || '').trim();
+      if (!text) return;
+      const row = document.createElement('li');
+      row.textContent = text;
+      list.appendChild(row);
+    });
+    hoverHelp.append(strong, list);
+    hoverHelp.hidden = list.childElementCount === 0;
+  }
+
+  function positionFloatingHelp(element) {
+    if (!hoverHelp || typeof element.getBoundingClientRect !== 'function') return;
+    const rect = element.getBoundingClientRect();
+    const width = Math.min(320, Math.max(220, document.documentElement?.clientWidth - 24 || 320));
+    hoverHelp.style.width = `${width}px`;
+    const viewportWidth = document.documentElement?.clientWidth || 372;
+    const left = Math.max(8, Math.min(rect.left, viewportWidth - width - 8));
+    const top = Math.max(8, rect.bottom + 8);
+    hoverHelp.style.left = `${left}px`;
+    hoverHelp.style.top = `${top}px`;
+  }
+
+  function setupHelpPanels() {
+    if (typeof document.querySelectorAll !== 'function') return;
+    document.querySelectorAll('[data-help-panel]').forEach((element) => {
+      const show = () => {
+        const items = String(element.dataset.help || '')
+          .split('|')
+          .map((item) => item.trim())
+          .filter(Boolean);
+        renderFloatingHelp(element.dataset.helpTitle || element.textContent, items);
+        positionFloatingHelp(element);
+      };
+      const hide = () => {
+        if (hoverHelp) hoverHelp.hidden = true;
+      };
+      element.addEventListener('mouseenter', show);
+      element.addEventListener('focus', show);
+      element.addEventListener('click', show);
+      element.addEventListener('mouseleave', hide);
+      element.addEventListener('blur', hide);
+      element.title = String(element.dataset.help || '').replaceAll('|', '\n');
+    });
   }
 
   async function activateActiveTab(status, options = {}) {
@@ -109,6 +205,23 @@ document.addEventListener('DOMContentLoaded', () => {
     return response;
   }
 
+  async function stopActiveTab(mode) {
+    const tab = await activeTab();
+    const response = await runtimeMessage({ kind: 'stopTranslations', mode, tabId: tab.id });
+    await chrome.storage.local.set({ translationEnabled: false });
+    translationToggle.checked = false;
+    await runtimeMessage({
+      kind: 'sendContentCommand',
+      tabId: tab.id,
+      command: { kind: 'setTranslationPaused', paused: true },
+    });
+    if (response.success === false) throw new Error(response.error || `${mode} stop failed`);
+    statusText.textContent = mode === 'hard' ? 'Hard stopped; GPU release requested' : 'Soft stopped; models kept warm';
+    refreshStats();
+    if (mode === 'hard') refreshVramStatus().catch(() => {});
+    return response;
+  }
+
   async function pauseActiveTab() {
     const tab = await activeTab();
     const response = await runtimeMessage({ kind: 'pausePageTranslation', tabId: tab.id });
@@ -123,16 +236,174 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!response) return;
       const cacheSize = response.cacheSize || 0;
       const cacheLimit = response.cacheLimit || 0;
+      const activeRequests = Number(response.activeRequests || 0);
+      const queueLength = Number(response.queueLength || 0);
+      const queueLimit = Number.isFinite(response.queueLimit) ? response.queueLimit : DEFAULT_QUEUE_LIMIT;
+      const parallelLimit = Number.isFinite(response.parallelLimit) ? response.parallelLimit : DEFAULT_PARALLEL_LIMIT;
+      const pressurePercent = Number.isFinite(response.pressurePercent)
+        ? Math.max(0, Math.min(100, response.pressurePercent))
+        : Math.min(100, Math.round(((activeRequests + queueLength) / Math.max(1, parallelLimit + queueLimit)) * 100));
       cacheStatusText.textContent = cacheLimit > 0
         ? `${cacheSize}/${cacheLimit} images cached`
         : 'Cache disabled';
+      if (activeJobsText) activeJobsText.textContent = String(activeRequests);
+      if (queuedJobsText) queuedJobsText.textContent = `${queueLength}/${queueLimit}`;
+      if (parallelJobsText) parallelJobsText.textContent = String(parallelLimit);
+      if (queueMeterFill) queueMeterFill.style.width = `${pressurePercent}%`;
 
       const parts = [];
       if (response.isPaused) parts.push('paused');
-      if (response.activeRequests > 0) parts.push(`${response.activeRequests} active`);
-      if (response.queueLength > 0) parts.push(`${response.queueLength} queued`);
-      statsText.textContent = parts.length ? parts.join(' · ') : 'ready';
+      if (activeRequests > 0) parts.push(`${activeRequests} active`);
+      if (parallelLimit > 1) parts.push(`parallel ${parallelLimit}`);
+      if (queueLength > 0) parts.push(`${queueLength}/${queueLimit} queued`);
+      statsText.textContent = parts.length ? parts.join(' Â· ') : 'ready';
     });
+  }
+
+  function quotaHealthClass(provider) {
+    if (!provider?.configured) return 'quota-muted';
+    if (provider.health === 'exhausted' || provider.health === 'auth_locked') return 'quota-red';
+    if (provider.health === 'rate_limited' || provider.health === 'warning' || Number(provider.remainingPercent) < 50) return 'quota-yellow';
+    return 'quota-green';
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function renderQuotaStatus(payload) {
+    if (!quotaCards || !quotaAlert) return;
+    const providers = Array.isArray(payload?.providers) ? payload.providers : [];
+    const configuredProviders = providers.filter((provider) => provider.configured);
+    const healthyProviders = configuredProviders.filter((provider) => (
+      provider.health !== 'exhausted' && provider.health !== 'auth_locked' && provider.health !== 'rate_limited' && Number(provider.remainingPercent || 0) >= 50
+    ));
+    quotaAlert.hidden = true;
+    quotaAlert.textContent = '';
+    if (payload?.globalLimitReached) {
+      quotaAlert.hidden = false;
+      quotaAlert.textContent = payload.message || 'Daily translation limit reached to protect API quotas.';
+      if (quotaSummaryText) quotaSummaryText.textContent = 'Limit reached';
+    } else if (payload?.globalAuthLocked) {
+      quotaAlert.hidden = false;
+      quotaAlert.textContent = payload.message || 'All providers are access-blocked. Check API keys, account access, and network restrictions.';
+      if (quotaSummaryText) quotaSummaryText.textContent = 'Access blocked';
+    } else if (payload?.globalRateLimitReached) {
+      quotaAlert.hidden = false;
+      quotaAlert.textContent = payload.message || 'Provider per-minute rate limit reached. Translation will resume automatically after the next minute window.';
+      if (quotaSummaryText) quotaSummaryText.textContent = 'Rate limited';
+    } else if (payload?.ok === false) {
+      quotaAlert.hidden = false;
+      quotaAlert.textContent = 'Quota status unavailable. Start the local backend and refresh.';
+      if (quotaSummaryText) quotaSummaryText.textContent = 'Unavailable';
+    } else if (quotaSummaryText) {
+      const envName = payload?.envFileLoaded ? String(payload.envFileLoaded).split(/[\\/]/).pop() : '';
+      quotaSummaryText.textContent = configuredProviders.length
+        ? `${healthyProviders.length}/${configuredProviders.length} healthy${envName ? ` - ${envName}` : ''}`
+        : `No keys configured${envName ? ` - ${envName}` : ''}`;
+    }
+    if (!providers.length) {
+      quotaCards.innerHTML = '<div class="quota-empty">No provider status returned.</div>';
+      return;
+    }
+    quotaCards.innerHTML = providers.map((provider) => {
+      const percent = Math.max(0, Math.min(100, Number(provider.remainingPercent || 0)));
+      const label = String(provider.provider || 'provider').replace(/(^|-)([a-z])/g, (match) => match.toUpperCase());
+      const healthClass = quotaHealthClass(provider);
+      const active = Number(provider.activeKeys || 0);
+      const total = Number(provider.keyCount || 0);
+      const detail = provider.configured
+        ? (
+          provider.health === 'exhausted' && provider.reason
+            ? `${active}/${total} keys active - locked: ${provider.reason}`
+            : provider.health === 'auth_locked' && provider.reason
+              ? `${active}/${total} keys active - access blocked: ${provider.reason}`
+              : provider.health === 'rate_limited'
+                ? `${active}/${total} keys active - rate-limited until ${provider.rateLimitedUntil || 'next minute'}`
+                : `${active}/${total} keys active - ${Math.round(percent)}% safe quota`
+        )
+        : (provider.reason || 'not configured');
+      return `
+        <div class="quota-card ${healthClass}">
+          <div class="quota-card-top">
+            <span class="quota-provider">${escapeHtml(label)}</span>
+            <span class="quota-pill">${escapeHtml(provider.health || 'unknown')}</span>
+          </div>
+          <div class="quota-meter" aria-label="${escapeHtml(label)} remaining quota">
+            <span style="width:${percent}%"></span>
+          </div>
+          <div class="quota-detail">${escapeHtml(detail)}</div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  async function refreshQuotaStatus() {
+    const payload = await runtimeMessage({ kind: 'getQuotaStatus' });
+    renderQuotaStatus(payload);
+  }
+
+  function vramHealthClass(percent) {
+    if (percent >= 90) return 'quota-red';
+    if (percent >= 70) return 'quota-yellow';
+    return 'quota-green';
+  }
+
+  function renderVramStatus(payload) {
+    if (!vramCards || !vramAlert) return;
+    const gpus = Array.isArray(payload?.gpus) ? payload.gpus : [];
+    vramAlert.hidden = true;
+    vramAlert.textContent = '';
+    if (payload?.ok === false || payload?.available === false) {
+      vramAlert.hidden = false;
+      vramAlert.textContent = payload.reason || 'VRAM status unavailable. nvidia-smi is required on NVIDIA systems.';
+      if (vramSummaryText) vramSummaryText.textContent = 'Unavailable';
+    }
+    if (!gpus.length) {
+      vramCards.innerHTML = '<div class="quota-empty">No GPU VRAM data returned.</div>';
+      return;
+    }
+    const peakUsage = Math.max(...gpus.map((gpu) => Number(gpu.usagePercent || 0)));
+    if (vramSummaryText) vramSummaryText.textContent = `${Math.round(peakUsage)}% used`;
+    vramCards.innerHTML = gpus.map((gpu) => {
+      const used = Number(gpu.memoryUsedMiB || 0);
+      const total = Number(gpu.memoryTotalMiB || 0);
+      const free = Number(gpu.memoryFreeMiB || 0);
+      const percent = Math.max(0, Math.min(100, Number(gpu.usagePercent || 0)));
+      const utilization = Number(gpu.utilizationGpuPercent || 0);
+      const gpuIndex = escapeHtml(gpu.index ?? 0);
+      const gpuName = escapeHtml(gpu.name || 'NVIDIA GPU');
+      return `
+        <div class="vram-card ${vramHealthClass(percent)}">
+          <div class="quota-card-top">
+            <span class="quota-provider">GPU ${gpuIndex}: ${gpuName}</span>
+            <span class="quota-pill">${Math.round(percent)}% used</span>
+          </div>
+          <div class="quota-meter" aria-label="GPU ${gpuIndex} VRAM usage">
+            <span style="width:${percent}%"></span>
+          </div>
+          <div class="quota-detail">${used}/${total} MiB used Â· ${free} MiB free Â· ${utilization}% GPU load</div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  async function refreshVramStatus() {
+    const payload = await runtimeMessage({ kind: 'getVramStatus' });
+    renderVramStatus(payload);
+  }
+
+  async function openLogWindow(logType) {
+    const response = await runtimeMessage({ kind: 'openLogWindow', logType });
+    if (response.success === false || response.ok === false) {
+      throw new Error(response.error || `Could not open ${logType} log window`);
+    }
+    statusText.textContent = `${logType === 'vram' ? 'VRAM' : 'Quota'} log window opened`;
   }
 
   function checkServerHealth() {
@@ -140,14 +411,26 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!response) return;
       apiStatus.classList.toggle('active', response.ok === true);
       apiStatus.classList.toggle('error', response.ok !== true);
-      if (response.ok !== true) statusText.textContent = 'Local server unreachable; cache cleared';
+      if (response.ok === true) {
+        setEngineStatus('Reachable');
+      } else {
+        setEngineStatus('Offline');
+        statusText.textContent = 'Local server unreachable; browser cache cleared';
+      }
       refreshStats();
+      refreshQuotaStatus().catch(() => {});
     });
   }
 
   function reportPopupError(error) {
     console.error('[FMT popup]', error);
-    statusText.textContent = error?.message || 'Extension command failed';
+    const message = error?.message || 'Extension command failed';
+    statusText.textContent = message;
+    if (message.includes('daily translation limit') && quotaAlert) {
+      quotaAlert.hidden = false;
+      quotaAlert.textContent = message;
+      refreshQuotaStatus().catch(() => {});
+    }
     refreshStats();
   }
 
@@ -165,6 +448,40 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (error) {
       translationToggle.checked = false;
       reportPopupError(error);
+    }
+  });
+
+  startEngineBtn?.addEventListener('click', async () => {
+    const originalLabel = startEngineBtn.textContent;
+    try {
+      startEngineBtn.textContent = 'Checking engine...';
+      setEngineStatus('Checking...');
+      statusText.textContent = 'Checking local backend...';
+      const response = await withButton(startEngineBtn, () => runtimeMessage({ kind: 'startEngine' }));
+      apiStatus.classList.toggle('active', response.ok === true);
+      apiStatus.classList.toggle('error', response.ok !== true);
+      if (response.ok === true) {
+        const warmupStatus = response.warmup?.payload?.status || response.warmup?.payload?.warmup?.status || 'warming';
+        setEngineStatus(warmupStatus === 'pass' ? 'Ready' : 'Warming');
+        statusText.textContent = response.warmup?.skipped
+          ? 'Engine already reachable'
+          : 'Engine reachable; warmup requested';
+        startEngineBtn.textContent = warmupStatus === 'pass' ? 'Engine Ready' : 'Warmup Requested';
+        flashAction(startEngineBtn);
+        refreshVramStatus().catch(() => {});
+      } else {
+        setEngineStatus('Offline');
+        statusText.textContent = response.message || 'Start the local backend first';
+        startEngineBtn.textContent = 'Backend Offline';
+      }
+      refreshStats();
+    } catch (error) {
+      setEngineStatus('Error');
+      reportPopupError(error);
+    } finally {
+      setTimeout(() => {
+        startEngineBtn.textContent = originalLabel || 'Start Engine';
+      }, 1400);
     }
   });
 
@@ -193,7 +510,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
   pauseBtn.addEventListener('click', async () => {
     try {
-      await withButton(pauseBtn, pauseActiveTab);
+      await withButton(pauseBtn, () => pauseActiveTab());
+    } catch (error) {
+      reportPopupError(error);
+    }
+  });
+
+  softStopBtn.addEventListener('click', async () => {
+    try {
+      await withButton(softStopBtn, () => stopActiveTab('soft'));
+    } catch (error) {
+      reportPopupError(error);
+    }
+  });
+
+  hardStopBtn.addEventListener('click', async () => {
+    try {
+      await withButton(hardStopBtn, () => stopActiveTab('hard'));
     } catch (error) {
       reportPopupError(error);
     }
@@ -214,9 +547,12 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       await withButton(clearBtn, async () => {
         await sendActivePageCommand({ kind: 'clearTranslations' });
-        await runtimeMessage({ kind: 'clearCache' });
+        const response = await runtimeMessage({ kind: 'clearCache' });
+        if (response.success === false) throw new Error(response.error || 'Cache clear failed');
+        statusText.textContent = response.backendCleared === false
+          ? 'Page cleared; backend cache unavailable'
+          : 'Page and runtime caches cleared';
       });
-      statusText.textContent = 'Translations cleared';
       refreshStats();
     } catch (error) {
       reportPopupError(error);
@@ -225,8 +561,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
   clearCacheBtn.addEventListener('click', async () => {
     try {
-      await withButton(clearCacheBtn, () => runtimeMessage({ kind: 'clearCache' }));
-      statusText.textContent = 'Translation cache cleared';
+      const response = await withButton(clearCacheBtn, () => runtimeMessage({ kind: 'clearCache' }));
+      if (response.success === false) throw new Error(response.error || 'Cache clear failed');
+      statusText.textContent = response.backendCleared === false
+        ? 'Browser cache cleared; backend cache unavailable'
+        : 'Browser and backend runtime caches cleared';
+      refreshStats();
+    } catch (error) {
+      reportPopupError(error);
+    }
+  });
+
+  clearQueueBtn?.addEventListener('click', async () => {
+    try {
+      const response = await withButton(clearQueueBtn, () => runtimeMessage({ kind: 'clearQueue' }));
+      if (response.success === false) throw new Error(response.error || 'Queue clear failed');
+      statusText.textContent = response.dropped > 0 ? `Cleared ${response.dropped} queued jobs` : 'Queue already empty';
       refreshStats();
     } catch (error) {
       reportPopupError(error);
@@ -236,11 +586,12 @@ document.addEventListener('DOMContentLoaded', () => {
   retranslateBtn.addEventListener('click', async () => {
     try {
       await withButton(retranslateBtn, async () => {
-        await runtimeMessage({ kind: 'clearCache' });
+        const response = await runtimeMessage({ kind: 'clearCache' });
+        if (response.success === false) throw new Error(response.error || 'Cache clear failed');
         await runtimeMessage({ kind: 'setTranslationPaused', paused: false });
         await sendActivePageCommand({ kind: 'retranslateAll' });
       });
-      statusText.textContent = 'Re-translating current page...';
+      statusText.textContent = 'Caches cleared; re-translating current page...';
       refreshStats();
       window.close();
     } catch (error) {
@@ -266,6 +617,56 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  refreshQuotaBtn?.addEventListener('click', async () => {
+    try {
+      await withButton(refreshQuotaBtn, refreshQuotaStatus);
+      statusText.textContent = 'Provider quota refreshed';
+    } catch (error) {
+      reportPopupError(error);
+    }
+  });
+
+  openQuotaLogBtn?.addEventListener('click', async () => {
+    try {
+      await withButton(openQuotaLogBtn, () => openLogWindow('quota'));
+    } catch (error) {
+      reportPopupError(error);
+    }
+  });
+
+  refreshVramBtn?.addEventListener('click', async () => {
+    try {
+      await withButton(refreshVramBtn, refreshVramStatus);
+      statusText.textContent = 'GPU VRAM refreshed';
+    } catch (error) {
+      reportPopupError(error);
+    }
+  });
+
+  releaseGpuBtn?.addEventListener('click', async () => {
+    try {
+      const response = await withButton(releaseGpuBtn, () => runtimeMessage({ kind: 'releaseGpu' }));
+      if (response.success === false && response.status !== 'deferred') {
+        throw new Error(response.error || 'GPU release failed');
+      }
+      statusText.textContent = response.status === 'deferred'
+        ? 'GPU release deferred until active work stops'
+        : 'GPU models released';
+      refreshVramStatus().catch(() => {});
+      refreshStats();
+    } catch (error) {
+      reportPopupError(error);
+    }
+  });
+
+  openVramLogBtn?.addEventListener('click', async () => {
+    try {
+      await withButton(openVramLogBtn, () => openLogWindow('vram'));
+    } catch (error) {
+      reportPopupError(error);
+    }
+  });
+
   localPipelineLanguage.addEventListener('change', async () => {
     await chrome.storage.local.set({ localPipelineLanguage: localPipelineLanguage.value || 'ja' });
     await runtimeMessage({ kind: 'clearCache' });
@@ -281,6 +682,32 @@ document.addEventListener('DOMContentLoaded', () => {
     refreshStats();
   });
 
+  translationQueuePages.addEventListener('change', async () => {
+    try {
+      const limit = Number.parseInt(translationQueuePages.value, 10);
+      await chrome.storage.local.set({ translationQueuePages: limit });
+      const response = await runtimeMessage({ kind: 'setQueueLimit', limit });
+      if (response.success === false) throw new Error(response.error || 'Queue limit update failed');
+      statusText.textContent = limit > 0 ? `Queue limit set to ${limit}` : 'Queue waits disabled';
+      refreshStats();
+    } catch (error) {
+      reportPopupError(error);
+    }
+  });
+
+  translationParallelPages.addEventListener('change', async () => {
+    try {
+      const limit = Number.parseInt(translationParallelPages.value, 10);
+      await chrome.storage.local.set({ translationParallelPages: limit });
+      const response = await runtimeMessage({ kind: 'setParallelLimit', limit });
+      if (response.success === false) throw new Error(response.error || 'Parallel limit update failed');
+      statusText.textContent = limit > 1 ? `Adaptive parallel limit set to ${limit}` : 'Sequential mode enabled';
+      refreshStats();
+    } catch (error) {
+      reportPopupError(error);
+    }
+  });
+
   fontSelect.addEventListener('change', () => {
     chrome.storage.local.set({ mangaFontStyle: fontSelect.value });
   });
@@ -290,6 +717,9 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   loadSettings();
+  setupHelpPanels();
   refreshStats();
+  refreshQuotaStatus().catch(() => {});
   checkServerHealth();
 });
+

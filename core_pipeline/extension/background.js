@@ -1,14 +1,24 @@
-
-
+// Free Manga Translator - Local-only background service worker.
+// All image translation goes through the local Python 8-step pipeline bridge.
 
 const DEFAULT_LOCAL_PIPELINE_URL = 'http://127.0.0.1:8766/v1/translate-image';
-const CACHE_VERSION = 'local-8-step-v12-manga-cleaner-device-overlay';
-const MAX_CONCURRENT = 1;
+const APP_VERSION = '1.1.14';
+// Every backend route except /health now requires this header (backend_api/app/main.py). It is
+// not a secret -- it forces the browser to CORS-preflight requests to the local pipeline server,
+// closing an unpreflighted "simple request" CSRF gap against a companion API with no other auth.
+const FMT_CLIENT_HEADER = 'X-Fmt-Client';
+const FMT_CLIENT_VALUE = 'free-manga-translator-extension';
+const CACHE_VERSION = `local-8-step-v13-quality-performance-hardening-v${APP_VERSION}`;
+const DEFAULT_PARALLEL_LIMIT = 2;
+const MAX_PARALLEL_LIMIT = 3;
 const DEFAULT_CACHE_LIMIT = 12;
 const MAX_CACHE_LIMIT = 40;
+const DEFAULT_QUEUE_LIMIT = 20;
+const MAX_QUEUE_LIMIT = 50;
 
 const outgoingRequests = new Map();
 const activeControllers = new Map();
+const queuedRequests = new Map();
 const requestQueue = [];
 const translationCache = new Map();
 
@@ -23,8 +33,7 @@ function fastHash(str) {
   if (!str) return '';
   const len = str.length;
   let hash = 2166136261 >>> 0;
-  const step = Math.max(1, Math.floor(len / 2000));
-  for (let i = 0; i < len; i += step) {
+  for (let i = 0; i < len; i += 1) {
     hash ^= str.charCodeAt(i);
     hash = Math.imul(hash, 16777619) >>> 0;
   }
@@ -43,14 +52,43 @@ async function getSettings() {
     'localPipelineUrl',
     'localPipelineLanguage',
     'translationCachePages',
+    'translationQueuePages',
+    'translationParallelPages',
   ]);
   const cacheLimit = Number.parseInt(result.translationCachePages, 10);
+  const queueLimit = Number.parseInt(result.translationQueuePages, 10);
+  const parallelLimit = Number.parseInt(result.translationParallelPages, 10);
   return {
     localPipelineUrl: String(result.localPipelineUrl || DEFAULT_LOCAL_PIPELINE_URL).trim() || DEFAULT_LOCAL_PIPELINE_URL,
     localPipelineLanguage: String(result.localPipelineLanguage || 'ja').trim() || 'ja',
     cacheLimit: Number.isFinite(cacheLimit)
       ? Math.max(0, Math.min(MAX_CACHE_LIMIT, cacheLimit))
       : DEFAULT_CACHE_LIMIT,
+    queueLimit: Number.isFinite(queueLimit)
+      ? Math.max(0, Math.min(MAX_QUEUE_LIMIT, queueLimit))
+      : DEFAULT_QUEUE_LIMIT,
+    parallelLimit: Number.isFinite(parallelLimit)
+      ? Math.max(1, Math.min(MAX_PARALLEL_LIMIT, parallelLimit))
+      : DEFAULT_PARALLEL_LIMIT,
+  };
+}
+
+function buildQueueStats(settings) {
+  const parallelLimit = settings?.parallelLimit ?? DEFAULT_PARALLEL_LIMIT;
+  const queueLimit = settings?.queueLimit ?? DEFAULT_QUEUE_LIMIT;
+  const capacity = Math.max(1, parallelLimit + queueLimit);
+  const queuedCount = requestQueue.length;
+  const activeCount = outgoingRequests.size;
+  return {
+    cacheSize: translationCache.size,
+    cacheLimit: settings?.cacheLimit ?? DEFAULT_CACHE_LIMIT,
+    activeRequests: activeCount,
+    queueLength: queuedCount,
+    queueLimit,
+    parallelLimit,
+    queuedUnique: queuedRequests.size,
+    isPaused,
+    pressurePercent: Math.min(100, Math.round(((activeCount + queuedCount) / capacity) * 100)),
   };
 }
 
@@ -72,6 +110,156 @@ function healthUrlForPipeline(pipelineUrl) {
   }
 }
 
+function warmupUrlForPipeline(pipelineUrl) {
+  try {
+    const url = new URL(pipelineUrl);
+    url.pathname = '/v1/warmup';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return 'http://127.0.0.1:8766/v1/warmup';
+  }
+}
+
+function quotaUrlForPipeline(pipelineUrl) {
+  try {
+    const url = new URL(pipelineUrl);
+    url.pathname = '/v1/quota-status';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return 'http://127.0.0.1:8766/v1/quota-status';
+  }
+}
+
+function vramUrlForPipeline(pipelineUrl) {
+  try {
+    const url = new URL(pipelineUrl);
+    url.pathname = '/v1/vram-status';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return 'http://127.0.0.1:8766/v1/vram-status';
+  }
+}
+
+function backendUrlForPipeline(pipelineUrl, pathname) {
+  try {
+    const url = new URL(pipelineUrl);
+    url.pathname = pathname;
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return `http://127.0.0.1:8766${pathname}`;
+  }
+}
+
+function diagnosticLogUrlForPipeline(pipelineUrl) {
+  return backendUrlForPipeline(pipelineUrl, '/v1/diagnostics/log');
+}
+
+function makeTraceId(prefix = 'bg') {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function compactForDiagnostics(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') {
+    if (value.startsWith('data:image/')) return `<data-url:${value.length}>`;
+    return value.length > 260 ? `${value.slice(0, 260)}...` : value;
+  }
+  if (Array.isArray(value)) return value.slice(0, 12).map(compactForDiagnostics);
+  if (typeof value === 'object') {
+    const result = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (/base64|imageData|translatedImageDataUrl|imageDataUrl/i.test(key)) {
+        result[key] = '<redacted>';
+      } else {
+        result[key] = compactForDiagnostics(item);
+      }
+    }
+    return result;
+  }
+  return value;
+}
+
+async function sendDiagnosticLog(event, details = {}, settings = null) {
+  try {
+    const resolvedSettings = settings || await getSettings();
+    const payload = {
+      event,
+      version: APP_VERSION,
+      traceId: details.traceId || makeTraceId('diag'),
+      timestamp: new Date().toISOString(),
+      details: compactForDiagnostics(details),
+    };
+    await fetch(diagnosticLogUrlForPipeline(resolvedSettings.localPipelineUrl), {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+      body: JSON.stringify(payload),
+    });
+  } catch {
+  }
+}
+
+function logWindowUrlForPipeline(pipelineUrl, logType) {
+  try {
+    const url = new URL(pipelineUrl);
+    url.pathname = `/v1/open-log-window/${encodeURIComponent(logType)}`;
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return `http://127.0.0.1:8766/v1/open-log-window/${encodeURIComponent(logType)}`;
+  }
+}
+
+async function postPipelineControl(settings, pathname) {
+  try {
+    const response = await fetch(backendUrlForPipeline(settings.localPipelineUrl, pathname), {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(responseErrorDetail(payload) || `CONTROL_${response.status}`);
+    return payload;
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+const warmupRequestedFor = new Set();
+
+async function requestPipelineWarmup(settings, force = false) {
+  const key = `${settings.localPipelineUrl}:${settings.localPipelineLanguage}`;
+  if (!force && warmupRequestedFor.has(key)) return { ok: true, skipped: true };
+  warmupRequestedFor.add(key);
+  try {
+    const response = await fetch(warmupUrlForPipeline(settings.localPipelineUrl), {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+    });
+    if (!response.ok) warmupRequestedFor.delete(key);
+    const payload = await response.json().catch(() => ({}));
+    return {
+      ok: response.ok,
+      skipped: false,
+      status: response.status,
+      payload,
+    };
+  } catch (error) {
+    warmupRequestedFor.delete(key);
+    return { ok: false, skipped: false, error: error.message };
+  }
+}
+
 async function checkPipelineHealth(settings, options = {}) {
   try {
     const response = await fetch(healthUrlForPipeline(settings.localPipelineUrl), {
@@ -79,6 +267,7 @@ async function checkPipelineHealth(settings, options = {}) {
       cache: 'no-store',
     });
     if (!response.ok) throw new Error(`HEALTH_${response.status}`);
+    requestPipelineWarmup(settings).catch(() => {});
     return true;
   } catch {
     if (options.clearCacheOnFailure) await clearTranslationCache();
@@ -86,11 +275,97 @@ async function checkPipelineHealth(settings, options = {}) {
   }
 }
 
+function manualStartStepsForEngine() {
+  return [
+    'Chrome and Brave extensions cannot directly launch Python for every user without a native messaging host.',
+    'Open PowerShell in the app core_pipeline folder.',
+    'Run .\\start_backend.ps1, or run python -m uvicorn backend_api.app.main:app --host 127.0.0.1 --port 8766.',
+    'After the terminal says Uvicorn is running, press Start Engine again.',
+  ];
+}
+
+async function startPipelineEngine() {
+  const settings = await getSettings();
+  const healthy = await checkPipelineHealth(settings, { clearCacheOnFailure: false });
+  if (!healthy) {
+    return {
+      ok: false,
+      available: false,
+      needsManualStart: true,
+      message: 'Local backend is not running. Start it from PowerShell, then retry.',
+      manualStartSteps: manualStartStepsForEngine(),
+    };
+  }
+  const warmup = await requestPipelineWarmup(settings, true);
+  return {
+    ok: warmup?.ok !== false,
+    available: true,
+    warmup,
+    message: warmup?.ok === false ? (warmup.error || 'Warmup request failed') : 'Local backend is reachable.',
+  };
+}
+
+async function getPipelineQuotaStatus(settings) {
+  try {
+    const response = await fetch(quotaUrlForPipeline(settings.localPipelineUrl), {
+      method: 'GET',
+      cache: 'no-store',
+      headers: { [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+    });
+    if (!response.ok) throw new Error(`QUOTA_${response.status}`);
+    return await response.json();
+  } catch (error) {
+    return { ok: false, error: error.message, providers: [] };
+  }
+}
+
+async function getPipelineVramStatus(settings) {
+  try {
+    const response = await fetch(vramUrlForPipeline(settings.localPipelineUrl), {
+      method: 'GET',
+      cache: 'no-store',
+      headers: { [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+    });
+    if (!response.ok) throw new Error(`VRAM_${response.status}`);
+    return await response.json();
+  } catch (error) {
+    return { ok: false, available: false, error: error.message, gpus: [] };
+  }
+}
+
+async function openPipelineLogWindow(settings, logType) {
+  try {
+    const response = await fetch(logWindowUrlForPipeline(settings.localPipelineUrl, logType), {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+    });
+    if (!response.ok) throw new Error(`LOG_WINDOW_${response.status}`);
+    return await response.json();
+  } catch (error) {
+    return { success: false, error: error.message, logType };
+  }
+}
+
+async function stopPipelineRuntime(settings, mode) {
+  const pathname = mode === 'hard' ? '/v1/runtime/hard-stop' : '/v1/runtime/soft-stop';
+  return postPipelineControl(settings, pathname);
+}
+
+async function releasePipelineGpu(settings) {
+  return postPipelineControl(settings, '/v1/gpu/release');
+}
+
+async function clearPipelineRuntimeCache(settings) {
+  return postPipelineControl(settings, '/v1/cache/clear');
+}
+
 function responseErrorDetail(payload) {
   if (!payload || typeof payload !== 'object') return '';
   if (payload.error) return String(payload.error);
   if (payload.detail) {
     if (typeof payload.detail === 'string') return payload.detail;
+    if (payload.detail.message) return String(payload.detail.message);
     try {
       return JSON.stringify(payload.detail);
     } catch {
@@ -145,7 +420,7 @@ async function persistCache() {
   try {
     await chrome.storage.session.set({ translationCacheEntries: entries });
   } catch {
-    
+    // Large pages can exceed browser session-storage quota. Memory cache remains active.
   }
 }
 
@@ -166,7 +441,7 @@ async function clearTranslationCache() {
     try {
       await chrome.storage.session.remove(['translationCacheEntries']);
     } catch {
-      
+      // no-op
     }
   }
 }
@@ -226,9 +501,10 @@ async function lookupCachedTranslation(message) {
 }
 
 async function callLocalPipeline(base64Data, width, height, settings, metadata = {}, signal = undefined) {
+  const traceId = metadata.traceId || makeTraceId('pipe');
   const response = await fetch(settings.localPipelineUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
     signal,
     body: JSON.stringify({
       imageData: base64Data,
@@ -238,6 +514,7 @@ async function callLocalPipeline(base64Data, width, height, settings, metadata =
       targetLanguage: 'en',
       qualityProfile: 'strict',
       requestedOutput: 'translatedImageDataUrl',
+      clientRequestId: traceId,
       metadata,
     }),
   });
@@ -250,10 +527,33 @@ async function callLocalPipeline(base64Data, width, height, settings, metadata =
     } catch {
       detail = await response.text().catch(() => '');
     }
+    await sendDiagnosticLog('background.pipeline.http_error', {
+      traceId,
+      status: response.status,
+      detail,
+      metadata,
+    }, settings);
     throw new Error(detail || `LOCAL_PIPELINE_${response.status}`);
   }
 
   const payload = await response.json();
+  const pipelineTranslationCount = Number(
+    payload.report?.translations
+    ?? payload.report?.rawTranslations
+    ?? payload.report?.renderedRegions
+    ?? 0
+  ) || 0;
+  await sendDiagnosticLog('background.pipeline.response', {
+    traceId,
+    status: response.status,
+    hasImage: Boolean(payload.translatedImageDataUrl || payload.imageDataUrl),
+    translationCount: Array.isArray(payload.translations) && payload.translations.length
+      ? payload.translations.length
+      : pipelineTranslationCount,
+    renderedRegions: Number(payload.report?.renderedRegions ?? 0) || 0,
+    reportStatus: payload.report?.outputSafety || payload.report?.status || null,
+    sample: payload.report?.sample || payload.report?.sampleName || null,
+  }, settings);
   if (payload.translatedImageDataUrl || payload.imageDataUrl) {
     return {
       translatedImageDataUrl: payload.translatedImageDataUrl || payload.imageDataUrl,
@@ -267,22 +567,25 @@ async function callLocalPipeline(base64Data, width, height, settings, metadata =
   throw new Error('LOCAL_PIPELINE_EMPTY_RESPONSE');
 }
 
-async function processTranslation(message) {
+async function processTranslation(message, options = {}) {
   if (isPaused) return { error: 'TranslationPaused' };
 
   const width = message.width || 0;
   const height = message.height || 0;
   const settings = await getSettings();
   const cacheId = buildCacheId(message, settings);
+  const traceId = message.traceId || makeTraceId('live');
 
   const cached = await getCachedResult(cacheId, settings);
   if (cached) {
     console.log(`[FMT] translateImage served from cache ${cacheId}`);
+    sendDiagnosticLog('background.translate.cache_hit', { traceId, cacheId }, settings).catch(() => {});
     return { ...cached, fromCache: true };
   }
 
   if (outgoingRequests.has(cacheId)) {
     console.log(`[FMT] joining in-flight translation ${cacheId}`);
+    sendDiagnosticLog('background.translate.join_in_flight', { traceId, cacheId }, settings).catch(() => {});
     try {
       const result = await outgoingRequests.get(cacheId);
       return { ...result, fromInFlight: true };
@@ -290,7 +593,15 @@ async function processTranslation(message) {
       return { error: error.message };
     }
   }
-  if (outgoingRequests.size >= MAX_CONCURRENT) return { error: 'FullQueue' };
+  if (!options.bypassQueueCheck && outgoingRequests.size >= settings.parallelLimit) {
+    sendDiagnosticLog('background.translate.deferred_to_queue', {
+      traceId,
+      cacheId,
+      activeRequests: outgoingRequests.size,
+      parallelLimit: settings.parallelLimit,
+    }, settings).catch(() => {});
+    return queueTranslation(message);
+  }
 
   const controller = new AbortController();
   activeControllers.set(cacheId, controller);
@@ -301,8 +612,20 @@ async function processTranslation(message) {
       if (isPaused) throw new Error('TranslationPaused');
       const base64Data = message.base64Data || await fetchImageAsDataUrl(message.imageUrl);
       if (isPaused) throw new Error('TranslationPaused');
-      console.log(`[FMT] local pipeline start ${cacheId} ${width}x${height}`);
+      console.log(`[FMT] local pipeline start trace=${traceId} ${cacheId} ${width}x${height}`);
+      await sendDiagnosticLog('background.translate.start', {
+        traceId,
+        cacheId,
+        width,
+        height,
+        source: message.imageUrl ? 'image-url' : 'canvas',
+        pageUrl: message.pageUrl || '',
+        originalImageUrl: message.originalImageUrl || '',
+        language: settings.localPipelineLanguage,
+      }, settings);
       const result = await callLocalPipeline(base64Data, width, height, settings, {
+        traceId,
+        extensionVersion: APP_VERSION,
         source: message.imageUrl ? 'extension-image-url' : 'extension-canvas',
         pageUrl: message.pageUrl || '',
         pageCacheKey: message.pageCacheKey || '',
@@ -312,11 +635,28 @@ async function processTranslation(message) {
       }, controller.signal);
       if (isPaused) throw new Error('TranslationPaused');
       await putCachedResult(cacheId, result, settings);
-      console.log(`[FMT] local pipeline done ${cacheId} in ${Math.round(nowMs() - startedAt)}ms`);
+      console.log(`[FMT] local pipeline done trace=${traceId} ${cacheId} in ${Math.round(nowMs() - startedAt)}ms`);
+      await sendDiagnosticLog('background.translate.done', {
+        traceId,
+        cacheId,
+        elapsedMs: Math.round(nowMs() - startedAt),
+        hasImage: Boolean(result?.translatedImageDataUrl),
+        translationCount: Array.isArray(result?.translations) && result.translations.length
+          ? result.translations.length
+          : (Number(result?.pipelineReport?.translations ?? result?.pipelineReport?.rawTranslations ?? 0) || 0),
+        renderedRegions: Number(result?.pipelineReport?.renderedRegions ?? 0) || 0,
+        outputSafety: result?.pipelineReport?.outputSafety || null,
+      }, settings);
       return result;
     } catch (error) {
       const messageText = error.name === 'AbortError' ? 'TranslationPaused' : error.message;
       if (messageText !== 'TranslationPaused') console.error('[FMT] Local pipeline error:', messageText);
+      await sendDiagnosticLog('background.translate.error', {
+        traceId,
+        cacheId,
+        error: messageText,
+        elapsedMs: Math.round(nowMs() - startedAt),
+      }, settings);
       return { error: messageText };
     } finally {
       outgoingRequests.delete(cacheId);
@@ -331,24 +671,70 @@ async function processTranslation(message) {
 
 function processQueue() {
   if (isPaused) return;
-  while (requestQueue.length > 0 && outgoingRequests.size < MAX_CONCURRENT) {
-    const { message, resolve } = requestQueue.shift();
-    processTranslation(message).then(resolve);
-  }
+  getSettings().then((settings) => {
+    while (requestQueue.length > 0 && outgoingRequests.size < settings.parallelLimit) {
+      const { message, resolve, cacheId } = requestQueue.shift();
+      if (cacheId) queuedRequests.delete(cacheId);
+      processTranslation(message, { bypassQueueCheck: true }).then(resolve);
+    }
+  }).catch(() => {});
 }
 
-function queueTranslation(message) {
-  return new Promise((resolve) => {
-    if (isPaused) {
-      resolve({ error: 'TranslationPaused' });
-      return;
-    }
-    if (outgoingRequests.size < MAX_CONCURRENT) {
-      processTranslation(message).then(resolve);
-    } else {
-      requestQueue.push({ message, resolve });
-    }
+function clearQueuedTranslations(reason = 'QueueCleared') {
+  const dropped = requestQueue.splice(0);
+  dropped.forEach(({ resolve, cacheId }) => {
+    if (cacheId) queuedRequests.delete(cacheId);
+    resolve?.({ error: reason, queueLength: 0 });
   });
+  return dropped.length;
+}
+
+async function queueTranslation(message) {
+  if (isPaused) return { error: 'TranslationPaused' };
+
+  const settings = await getSettings();
+  const cacheId = buildCacheId(message, settings);
+  const cached = await getCachedResult(cacheId, settings);
+  if (cached) {
+    console.log(`[FMT] queued request served from cache ${cacheId}`);
+    return { ...cached, fromCache: true };
+  }
+
+  if (outgoingRequests.has(cacheId)) {
+    console.log(`[FMT] queued request joining active translation ${cacheId}`);
+    try {
+      const result = await outgoingRequests.get(cacheId);
+      return { ...result, fromInFlight: true };
+    } catch (error) {
+      return { error: error.message };
+    }
+  }
+
+  if (queuedRequests.has(cacheId)) {
+    console.log(`[FMT] queued request joining queued translation ${cacheId}`);
+    return queuedRequests.get(cacheId);
+  }
+
+  if (outgoingRequests.size < settings.parallelLimit) {
+    return processTranslation(message, { bypassQueueCheck: true });
+  }
+
+  if (requestQueue.length >= settings.queueLimit) {
+    console.warn(`[FMT] queue full ${requestQueue.length}/${settings.queueLimit}`);
+    return {
+      error: 'QueueFull',
+      queueLength: requestQueue.length,
+      queueLimit: settings.queueLimit,
+    };
+  }
+
+  const queuedPromise = new Promise((resolve) => {
+    requestQueue.push({ message, resolve, cacheId });
+  });
+  queuedRequests.set(cacheId, queuedPromise);
+  queuedPromise.finally(() => queuedRequests.delete(cacheId));
+  console.log(`[FMT] queued translation ${requestQueue.length}/${settings.queueLimit} ${cacheId}`);
+  return queuedPromise;
 }
 
 async function setTranslationPaused(paused) {
@@ -356,19 +742,34 @@ async function setTranslationPaused(paused) {
   await chrome.storage.local.set({ translationPaused: isPaused });
 
   if (isPaused) {
-    const queued = requestQueue.splice(0);
-    queued.forEach(({ resolve }) => resolve({ error: 'TranslationPaused' }));
+    clearQueuedTranslations('TranslationPaused');
     for (const controller of activeControllers.values()) controller.abort();
   } else {
     processQueue();
   }
 
+  return { success: true, ...buildQueueStats(await getSettings()) };
+}
+
+async function stopTranslationRuntime(mode, tabId) {
+  isPaused = true;
+  await chrome.storage.local.set({ translationPaused: true });
+  const dropped = clearQueuedTranslations(mode === 'hard' ? 'HardStopped' : 'SoftStopped');
+  for (const controller of activeControllers.values()) controller.abort();
+  if (tabId) {
+    try {
+      await sendContentMessage(tabId, { kind: 'setTranslationPaused', paused: true, mode });
+    } catch {
+    }
+  }
+  const settings = await getSettings();
+  const backend = await stopPipelineRuntime(settings, mode);
   return {
-    success: true,
-    isPaused,
-    cacheSize: translationCache.size,
-    activeRequests: outgoingRequests.size,
-    queueLength: requestQueue.length,
+    success: backend.success !== false,
+    mode,
+    dropped,
+    backend,
+    ...buildQueueStats(settings),
   };
 }
 
@@ -414,7 +815,7 @@ async function pausePageTranslation(tabId) {
     try {
       await sendContentMessage(tabId, { kind: 'setTranslationPaused', paused: true });
     } catch {
-      
+      // A page without a content script still has background queue state paused.
     }
   }
   return state;
@@ -481,6 +882,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     queueTranslation(message).then(sendResponse);
     return true;
   }
+
+  if (message.kind === 'diagnosticLog') {
+    sendDiagnosticLog(message.event || 'content.diagnostic', {
+      ...(message.details || {}),
+      traceId: message.traceId,
+      pageUrl: message.pageUrl,
+    }).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
   if (message.kind === 'lookupCachedTranslation') {
     lookupCachedTranslation(message)
       .then(sendResponse)
@@ -494,13 +904,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.kind === 'getTranslationStats') {
     ensureCacheLoaded().then(async () => {
       const settings = await getSettings();
-      sendResponse({
-        cacheSize: translationCache.size,
-        cacheLimit: settings.cacheLimit,
-        activeRequests: outgoingRequests.size,
-        queueLength: requestQueue.length,
-        isPaused,
-      });
+      sendResponse(buildQueueStats(settings));
     });
     return true;
   }
@@ -511,8 +915,68 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
+  if (message.kind === 'startEngine') {
+    startPipelineEngine()
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        available: false,
+        error: error.message,
+        message: 'Local backend could not be started from the extension.',
+        manualStartSteps: manualStartStepsForEngine(),
+      }));
+    return true;
+  }
+  if (message.kind === 'getQuotaStatus') {
+    getSettings()
+      .then(getPipelineQuotaStatus)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, error: error.message, providers: [] }));
+    return true;
+  }
+  if (message.kind === 'getVramStatus') {
+    getSettings()
+      .then(getPipelineVramStatus)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, available: false, error: error.message, gpus: [] }));
+    return true;
+  }
+  if (message.kind === 'releaseGpu') {
+    getSettings()
+      .then(releasePipelineGpu)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+  if (message.kind === 'openLogWindow') {
+    getSettings()
+      .then((settings) => openPipelineLogWindow(settings, message.logType || 'quota'))
+      .then(sendResponse)
+      .catch((error) => sendResponse({ success: false, error: error.message, logType: message.logType || 'quota' }));
+    return true;
+  }
   if (message.kind === 'clearCache') {
-    clearTranslationCache().then(() => sendResponse({ success: true, cacheSize: 0 }));
+    getSettings()
+      .then(async (settings) => {
+        await clearTranslationCache();
+        const backend = await clearPipelineRuntimeCache(settings);
+        sendResponse({
+          success: true,
+          cacheSize: 0,
+          backendCleared: backend.success !== false,
+          backend,
+        });
+      })
+      .catch((error) => sendResponse({ success: false, error: error.message, cacheSize: 0 }));
+    return true;
+  }
+  if (message.kind === 'clearQueue') {
+    getSettings()
+      .then((settings) => {
+        const dropped = clearQueuedTranslations('QueueCleared');
+        sendResponse({ success: true, dropped, ...buildQueueStats(settings) });
+      })
+      .catch((error) => sendResponse({ success: false, error: error.message }));
     return true;
   }
   if (message.kind === 'setCacheLimit') {
@@ -522,8 +986,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((error) => sendResponse({ success: false, error: error.message }));
     return true;
   }
+  if (message.kind === 'setQueueLimit') {
+    getSettings()
+      .then(async (settings) => {
+        const limit = Math.max(0, Math.min(MAX_QUEUE_LIMIT, Number(message.limit ?? settings.queueLimit) || 0));
+        await chrome.storage.local.set({ translationQueuePages: limit });
+        while (requestQueue.length > limit) {
+          const dropped = requestQueue.pop();
+          if (dropped?.cacheId) queuedRequests.delete(dropped.cacheId);
+          dropped?.resolve?.({ error: 'QueueFull', queueLength: requestQueue.length, queueLimit: limit });
+        }
+        sendResponse({ success: true, ...buildQueueStats({ ...settings, queueLimit: limit }) });
+      })
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+  if (message.kind === 'setParallelLimit') {
+    getSettings()
+      .then(async (settings) => {
+        const limit = Math.max(1, Math.min(MAX_PARALLEL_LIMIT, Number(message.limit ?? settings.parallelLimit) || DEFAULT_PARALLEL_LIMIT));
+        await chrome.storage.local.set({ translationParallelPages: limit });
+        processQueue();
+        sendResponse({ success: true, ...buildQueueStats({ ...settings, parallelLimit: limit }) });
+      })
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
   if (message.kind === 'setTranslationPaused') {
     setTranslationPaused(message.paused).then(sendResponse);
+    return true;
+  }
+  if (message.kind === 'stopTranslations') {
+    stopTranslationRuntime(message.mode === 'hard' ? 'hard' : 'soft', message.tabId || sender?.tab?.id)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ success: false, error: error.message, mode: message.mode || 'soft' }));
     return true;
   }
   if (message.kind === 'activatePageTranslation') {
@@ -591,3 +1087,4 @@ chrome.storage.onChanged.addListener((changes) => {
 });
 
 updateIcon();
+
