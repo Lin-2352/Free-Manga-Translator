@@ -348,6 +348,21 @@ def classify_text_by_content(text: str) -> str:
     # Rule A: Predominantly katakana and short → SFX
     if katakana_ratio >= 0.65 and len(script_text) <= 10:
         return 'sfx'
+    # A hiragana-bearing fragment ending in a real question/exclamation mark
+    # reads as a reaction word ("あれ？" = "huh?", "えっ！？" = "eh!?", "まさか！"
+    # = "no way!") rather than a breath/gasp SFX ("はぁ", "ふぅ") -- gasp SFX are
+    # written plain, without terminal ？/！. Checked before Rules B/C so it wins
+    # over their short-length SFX bias; requires katakana == 0 so predominantly-
+    # katakana text keeps its SFX bias even with trailing punctuation (e.g.
+    # "ドカン！" is still genuine onomatopoeia, caught by Rule A above already).
+    # Verified offline against all 33 samples' current OCR data: only 5 items
+    # anywhere match this condition, and only 2 actually change final
+    # kept/rejected status (external_ja_2's "あれ？"/"えっ！？"); the other 3 are
+    # either already rescued via a different bubble_idx path or rejected
+    # earlier by an unrelated geometry check either way.
+    ends_with_terminal_punct = text_clean.rstrip().endswith(("？", "！", "?", "!"))
+    if ends_with_terminal_punct and hiragana >= 1 and katakana == 0:
+        return 'dialogue'
     # Rule B: Very short string (≤4 chars) with NO kanji → SFX/exclamation
     if len(script_text) <= 4 and kanji == 0:
         return 'sfx'

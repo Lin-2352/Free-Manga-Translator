@@ -173,6 +173,7 @@ def _split_word_to_fit(
     font: ImageFont.FreeTypeFont,
     draw: ImageDraw.ImageDraw,
     target_width: float,
+    min_split_length: int = 8,
 ) -> list[str]:
     if _text_width(word, font, draw) <= target_width:
         return [word]
@@ -185,7 +186,30 @@ def _split_word_to_fit(
     if not core:
         core = word
         trailing = ""
-    if len(core) < 8:
+    # The default 8-char gate is intentionally left unchanged for the main
+    # best-candidate search (run_step8_typeset's `for allow_word_split in
+    # (False, True)` loop), which scores a split candidate against a
+    # split_penalty and can select it purely because it also permits a much
+    # larger font size -- lowering the gate there let 6-7 char words that
+    # already rendered fine unsplit (e.g. "WORKERS...") get needlessly
+    # hyphenated into a bigger font just because the scoring allowed it, a
+    # regression on samples that needed no fix. `min_split_length` lets the
+    # narrow last-resort fallback path (used only when NO tested font size
+    # avoids clipping) pass 6 instead, since ITS suffix-aware heuristic
+    # (used when pyphen isn't installed) already anticipates splitting words
+    # as short as 7 characters (needs only a 4-char prefix before a suffix
+    # like "ING": len(core) - len(suffix) >= 4) -- one shorter than the old
+    # blanket 8-char gate allowed, silently blocking exactly those words.
+    # Verified regression: external_ja_1's "MOORING POST!" in a very narrow
+    # bubble (target width ~28px at the font-size floor) never got
+    # hyphenated because "MOORING" is 7 characters, so the whole word
+    # clipped instead, rendering as "OOR1. POST!". Scoping the lower
+    # threshold to only the fallback path fixes that case while a full
+    # 33-sample true-before/after diff confirms zero effect on any sample
+    # that didn't already need the fallback (the main search's behavior for
+    # every other word, at every length, is provably unchanged since its own
+    # calls still pass the default 8).
+    if len(core) < min_split_length:
         return [word]
 
     # A word that already contains a natural hyphen (e.g. "middle-aged")
@@ -276,6 +300,7 @@ def _wrap_standard(
     draw: ImageDraw.ImageDraw,
     target_width: float,
     allow_word_split: bool = False,
+    min_split_length: int = 8,
 ) -> list[str]:
     """
     Standard left-to-right greedy word wrap. Long words are split only when
@@ -287,7 +312,7 @@ def _wrap_standard(
     wrapped_words = []
     for word in words:
         if allow_word_split:
-            wrapped_words.extend(_split_word_to_fit(word, font, draw, target_width))
+            wrapped_words.extend(_split_word_to_fit(word, font, draw, target_width, min_split_length))
         else:
             wrapped_words.append(word)
 
@@ -2764,7 +2789,7 @@ def _find_mask_aware_layout(
             if is_floating and not text_style.get("source_cover")
             else text_style["stroke_color"]
         )
-        try_lines = _wrap_standard(words, try_font, measure_draw, max(8.0, bounds_width * 0.9), allow_word_split=True)
+        try_lines = _wrap_standard(words, try_font, measure_draw, max(8.0, bounds_width * 0.9), allow_word_split=True, min_split_length=6)
         try_block, try_alpha, try_metrics = _render_text_block(
             try_lines or words, try_font, try_size, try_outline,
             text_style["fill_color"], try_stroke,
@@ -2812,7 +2837,7 @@ def _find_mask_aware_layout(
             if is_floating and not text_style.get("source_cover")
             else text_style["stroke_color"]
         )
-        fallback_lines = _wrap_standard(words, fallback_font, measure_draw, max(8.0, bounds_width * 0.9), allow_word_split=True)
+        fallback_lines = _wrap_standard(words, fallback_font, measure_draw, max(8.0, bounds_width * 0.9), allow_word_split=True, min_split_length=6)
         fallback_block, fallback_alpha, fallback_metrics = _render_text_block(
             fallback_lines or words, fallback_font, fallback_font_size, fallback_outline,
             text_style["fill_color"], fallback_stroke_color,
