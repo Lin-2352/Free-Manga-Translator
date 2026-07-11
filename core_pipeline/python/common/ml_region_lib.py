@@ -32,17 +32,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# torch must be imported before cv2 in this process -- see run_step5_ocr.py
+# for the full explanation (verified import-order segfault reproduction).
+import torch  # noqa: F401  (import-order guard, see comment above)
 import cv2
 import numpy as np
 import os
 
-
-
-
-
-
-
-
+# ===================================================================
+# EMERGENCY CUDA DLL INJECTION (Windows Fix)
+# ===================================================================
+# ONNX Runtime on Windows requires cublasLt64_12.dll to be in the OS PATH.
+# Instead of forcing the user to install the massive CUDA Toolkit system-wide,
+# we dynamically steal the DLLs that came bundled with PyTorch and inject 
+# them into the runtime PATH before ONNX loads.
 try:
     import torch
     torch_lib = os.path.join(os.path.dirname(torch.__file__), 'lib')
@@ -52,12 +55,12 @@ try:
             os.add_dll_directory(torch_lib)
 except ImportError:
     pass
+# ===================================================================
 
 
-
-
-
-
+# ---------------------------------------------------------------------------
+# Box
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Box:
@@ -91,26 +94,26 @@ class Box:
                 "width": self.width, "height": self.height}
 
 
-
-
-
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 @dataclass
 class MLConfig:
-
+    # Model A: text detector (ONNX)
     text_model_path: str = "models/comictextdetector.pt.onnx"
     confidence_threshold: float = 0.05
     nms_iou_threshold: float = 0.45
     input_size: int = 1024
 
-
+    # Model A-S: semantic text detector/classifier loaded from Hugging Face.
     semantic_model_path: str = "ragavsachdeva/magi"
     semantic_confidence: float = 0.20
     semantic_nms_iou: float = 0.45
     semantic_input_size: int = 1600
     semantic_max_det: int = 400
 
-
+    # Step 2 precision controls (reduce non-text false positives)
     semantic_dialogue_confidence: float = 0.40
     semantic_onomatopoeia_confidence: float = 0.55
     semantic_post_nms_iou: float = 0.35
@@ -121,20 +124,20 @@ class MLConfig:
     semantic_max_ink_ratio: float = 0.70
     semantic_min_edge_ratio: float = 0.004
 
-
+    # Model B: bubble segmentor (PyTorch/Ultralytics)
     bubble_model_path: str = "models/manga109_bubble/best.pt"
     bubble_confidence: float = 0.50
     bubble_overlap_threshold: float = 0.50  # min overlap to classify as "inside bubble"
 
-
+    # Model C: LaMa inpainter (ONNX)
     lama_model_path: str = "models/lama/lama_fp32.onnx"
 
-
+    # Seg mask
     seg_threshold: float = 0.50      # threshold for text seg mask
     seg_dilate_kernel: int = 3       # dilate seg mask to cover anti-aliased edges
     seg_dilate_iterations: int = 1
 
-
+    # Legacy inpainting (kept as fallback)
     mask_padding: int = 8
     adaptive_block_size: int = 15
     adaptive_c: int = 4
@@ -142,14 +145,14 @@ class MLConfig:
     dilate_iterations: int = 1
     inpaint_radius: int = 3
 
-
+    # English text
     font_path: Optional[str] = None
     font_size_max: int = 28
     font_size_min: int = 8
     font_color: Tuple[int, int, int] = (0, 0, 0)
     line_spacing: float = 1.3
 
-
+    # Debug colours (BGR)
     green_color: Tuple[int, int, int] = (0, 255, 0)     # bubble text
     red_color: Tuple[int, int, int] = (0, 0, 255)       # floating text
     yellow_color: Tuple[int, int, int] = (0, 255, 255)   # expanded mask
@@ -157,9 +160,9 @@ class MLConfig:
     box_thickness: int = 2
 
 
-
-
-
+# ===================================================================
+# MODEL A — TEXT DETECTOR  (ONNX + CUDA)
+# ===================================================================
 
 def load_text_model(model_path: str, allow_cpu: bool = False):
     """Load ONNX text detector. STRICT CUDA-only."""
@@ -186,9 +189,23 @@ def load_semantic_model(model_path: str, allow_cpu: bool = False):
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
     
+    # Backward-compat shim: this installed transformers build (checked at import time, currently
+    # 5.12.0) does not define PreTrainedModel.all_tied_weights_keys as a real property, but the
+    # magi model-loading code below expects to read/write it. Only patch when it's actually
+    # missing/not-yet-a-property -- on a future transformers release that defines this natively,
+    # the condition below is False and this is a no-op, so the shim can't override real behavior.
+    _needs_tied_weights_shim = (
+        getattr(transformers.PreTrainedModel, "all_tied_weights_keys", None) is None
+        or isinstance(transformers.PreTrainedModel.all_tied_weights_keys, property)
+    )
+    if _needs_tied_weights_shim:
+        print(
+            f"  [Model A-S] applying all_tied_weights_keys compat shim for transformers "
+            f"{transformers.__version__} (PreTrainedModel does not define it natively)",
+            flush=True,
+        )
 
-    if getattr(transformers.PreTrainedModel, "all_tied_weights_keys", None) is None or isinstance(transformers.PreTrainedModel.all_tied_weights_keys, property):
-        def get_tied(self): 
+        def get_tied(self):
             v = getattr(self, '_tied_weights_keys', {})
             return v if (v is not None and getattr(v, "keys", None)) else {}
         def set_tied(self, value): self._tied_weights_keys = value
@@ -213,7 +230,7 @@ def load_semantic_model(model_path: str, allow_cpu: bool = False):
     for k, v in state_dict.items():
         new_k = k
         if "conv_encoder.model" in new_k: new_k = new_k.replace("conv_encoder.model", "model")
-
+        # Only apply attention/fc renames to the detection_transformer portion, not ocr_model
         if new_k.startswith("detection_transformer."):
             new_k = new_k.replace(".fc1.", ".mlp.fc1.").replace(".fc2.", ".mlp.fc2.")
             for sa in ["v", "qpos", "kpos", "qcontent", "kcontent"]:
@@ -222,7 +239,7 @@ def load_semantic_model(model_path: str, allow_cpu: bool = False):
             for ca in ["v", "qpos", "kpos", "qcontent", "kcontent", "qpos_sine"]:
                 new_k = new_k.replace(f".ca_{ca}_proj.", f".encoder_attn.{ca}_proj.")
             new_k = new_k.replace(".encoder_attn.out_proj.", ".encoder_attn.o_proj.")
-
+            # transformers >=5.x uses snake_case with underscores: kcontent -> k_content, etc.
             for prefix in ["self_attn.", "encoder_attn."]:
                 for old, new in [("kcontent_proj", "k_content_proj"), ("kpos_proj", "k_pos_proj"),
                                  ("qcontent_proj", "q_content_proj"), ("qpos_proj", "q_pos_proj"),
@@ -256,23 +273,16 @@ def classify_text_by_content(text: str) -> str:
 
     text_clean = text.strip()
 
-
-    letters = [c for c in text_clean if c.isalpha()]
-    if letters:
-        ascii_letters = [c for c in letters if c.isascii()]
-        if len(ascii_letters) / len(letters) > 0.20:
-            return 'english'
-
-
+    # 1. Strip to alphanumeric only for script analysis
     script_text = "".join(c for c in text_clean if c.isalnum())
     if not script_text:
         return 'noise'
 
-
+    # 2. Pure digit strings are always noise (page numbers, chapter numbers, standalone counts)
     if script_text.isdigit():
         return 'noise'
 
-
+    # 3. CJK script composition
     katakana = sum(1 for c in script_text if '\u30A0' <= c <= '\u30FF' or c == 'ー')
     hiragana = sum(1 for c in script_text if '\u3040' <= c <= '\u309F')
     kanji    = sum(1 for c in script_text if '\u4E00' <= c <= '\u9FFF')
@@ -285,14 +295,32 @@ def classify_text_by_content(text: str) -> str:
     cjk_total = katakana + hiragana + kanji + hangul
 
     if cjk_total == 0:
-
+        # No CJK text at all — noise
         return 'noise'
+
+    # 4. English/ASCII signage filter.
+    # Mixed CJK dialogue can contain terms such as "build" or "G". Do not let
+    # those ASCII fragments make otherwise valid CJK speech disappear.
+    letters = [c for c in text_clean if c.isalpha()]
+    if letters and cjk_total < 2:
+        ascii_letters = [c for c in letters if c.isascii()]
+        if len(ascii_letters) / len(letters) > 0.20:
+            return 'english'
+
+    # 4b. Digit + CJK-unit/counter expressions (e.g. "7일"/"7日" = "7 days",
+    # "3年"/"3년" = "3 years", "5개" = "5 items") are meaningful short
+    # content in every CJK language, not decorative SFX -- without this,
+    # any digit+single-CJK-char string falls into the generic short-string
+    # SFX rules below purely because it's short, regardless of language.
+    has_digit = any(c.isdigit() for c in script_text)
+    if has_digit and cjk_total >= 1:
+        return 'dialogue'
 
     katakana_ratio = katakana / cjk_total
 
-
-
-
+    # 5. Korean and Chinese dialogue gates.
+    # Hangul syllables are not handled by manga-ocr perfectly, but if a CJK OCR
+    # provider is swapped in later this prevents Step 6 from discarding them.
     if hangul >= 3:
         return 'dialogue'
     if hangul >= 2 and len(script_text) >= 3:
@@ -300,25 +328,34 @@ def classify_text_by_content(text: str) -> str:
     if hangul > 0 and len(script_text) <= 2:
         return 'sfx'
 
-
-
+    # Chinese-only text is usually dialogue/caption when it has multiple Han
+    # characters. Keep single/short Han glyph runs conservative to avoid SFX.
     if kanji >= 2 and hiragana == 0 and katakana == 0:
         return 'dialogue'
     if kanji == 1 and hiragana == 0 and katakana == 0:
         return 'sfx'
 
-
-
+    # 6. SFX heuristics — be very aggressive here
+    # Mixed hiragana+katakana is a grammatically structured sentence (the
+    # hiragana carries particles/conjugation) with a katakana word used for
+    # stylistic emphasis, e.g. "うん…カンペキ" = "Yeah... PERFECT" -- real
+    # onomatopoeia SFX is pure katakana with no hiragana. Must precede Rule A
+    # or emphasis-katakana dialogue gets misread as SFX and silently dropped
+    # (verified regression: modern_ja_2/ko_2/zh_2 panel-1 bubble never
+    # translated because its text hit this exact case).
+    if hiragana >= 2 and katakana >= 1 and cjk_total >= 4:
+        return 'dialogue'
+    # Rule A: Predominantly katakana and short → SFX
     if katakana_ratio >= 0.65 and len(script_text) <= 10:
         return 'sfx'
-
+    # Rule B: Very short string (≤4 chars) with NO kanji → SFX/exclamation
     if len(script_text) <= 4 and kanji == 0:
         return 'sfx'
-
+    # Rule C: All hiragana and very short → SFX breath/gasp (e.g. "はぁ", "ふぅ")
     if hiragana == cjk_total and len(script_text) <= 5:
         return 'sfx'
 
-
+    # 7. Confirmed Japanese dialogue: must have Kanji OR ≥2 hiragana mixed with something
     if kanji >= 1:
         return 'dialogue'
     if hiragana >= 3:
@@ -326,7 +363,7 @@ def classify_text_by_content(text: str) -> str:
     if hiragana >= 2 and katakana >= 1:
         return 'dialogue'
 
-
+    # Everything else is ambiguous — treat as noise to avoid false positives
     return 'noise'
 
 
@@ -435,12 +472,12 @@ def detect_text(session, image: np.ndarray, cfg: MLConfig) -> TextDetectionResul
     sx, sy = w_orig / cfg.input_size, h_orig / cfg.input_size
     blob = _preprocess(image, cfg.input_size)
 
-
+    # Get ALL outputs: blk (boxes), seg (text pixel mask), det (unused)
     outputs = session.run(None, {"images": blob})
     blk = outputs[0][0]            # [64512, 7]
     seg_raw = outputs[1][0][0]     # [1024, 1024] float [0,1]
 
-
+    # --- Process bounding boxes ---
     obj = blk[:, 4]
     mask = obj > cfg.confidence_threshold
     preds, obj_filtered = blk[mask], obj[mask]
@@ -456,11 +493,11 @@ def detect_text(session, image: np.ndarray, cfg: MLConfig) -> TextDetectionResul
             if bx2 > bx1 and by2 > by1:
                 boxes.append(Box(x1=bx1, y1=by1, x2=bx2, y2=by2))
 
-
+    # --- Process seg mask → binary at original resolution ---
     seg_binary = (seg_raw > cfg.seg_threshold).astype(np.uint8)
     seg_resized = cv2.resize(seg_binary, (w_orig, h_orig),
                              interpolation=cv2.INTER_NEAREST)
-
+    # Dilate slightly to cover anti-aliased text edges
     if cfg.seg_dilate_kernel > 0:
         kernel = np.ones((cfg.seg_dilate_kernel, cfg.seg_dilate_kernel), np.uint8)
         seg_resized = cv2.dilate(seg_resized, kernel,
@@ -502,7 +539,7 @@ def detect_semantic_text_regions(
             x2=int(max(0, min(w, tx[2]))),
             y2=int(max(0, min(h, tx[3])))
         )
-
+        # Extract Magi's dialogue confidence for this text box
         dialog_conf = float(magi_dialog_conf[idx]) if idx < len(magi_dialog_conf) else 0.5
         
         regions.append(
@@ -519,9 +556,9 @@ def detect_semantic_text_regions(
     return SemanticDetectionResult(regions=regions)
 
 
-
-
-
+# ===================================================================
+# MODEL B — SPEECH BUBBLE SEGMENTOR  (Ultralytics + PyTorch CUDA)
+# ===================================================================
 
 def load_bubble_model(model_path: str, allow_cpu: bool = False):
     """Load YOLOv11n bubble segmentor. STRICT CUDA-only."""
@@ -553,9 +590,12 @@ def detect_bubbles(
     image resolution. Each mask: 255 = inside bubble, 0 = outside.
     
     Post-processing: Validates that each detected region is actually a speech
-    bubble by checking that the interior is predominantly white (>55% of 
-    pixels above brightness threshold 200). This eliminates false positives
-    on clothes, character bodies, and background art.
+    bubble rather than a face/body/background-art false positive. A region
+    passes if either (a) its interior is predominantly white (classic bubble
+    fill), or (b) its interior is a low-variance flat/gradient fill of any
+    color (colored or screentoned bubble). Faces and clothing have much
+    higher local contrast (eyes, mouth, shading, patterns) than either kind
+    of bubble fill, so they still fail both tests.
     """
     h, w = image.shape[:2]
     results = model.predict(
@@ -575,20 +615,25 @@ def detect_bubbles(
             if len(interior_pixels) < 200:
                 continue  # Too small — not a real bubble
 
-
-
+            # Speech bubbles must have either a predominantly white interior
+            # or a flat/low-variance interior of any color (colored,
+            # screentoned, or gradient-filled bubbles). Faces/skin/patterned
+            # clothing fail both tests due to their higher local contrast.
             white_ratio = np.mean(interior_pixels > 200)
-            if white_ratio < 0.70:
-                continue  # Not white enough — likely face, body, or background art
+            interior_std = float(np.std(interior_pixels))
+            is_bright_uniform = white_ratio >= 0.70
+            is_flat_colored_fill = interior_std <= 35.0 and white_ratio >= 0.10
+            if not (is_bright_uniform or is_flat_colored_fill):
+                continue  # Not a flat bright/colored fill — likely face, body, or background art
 
-
+            # Additional check: reject if the mask is very thin/tall (face-shaped)
             ys_b, xs_b = np.nonzero(binary)
             if len(ys_b) == 0:
                 continue
             bw = int(xs_b.max()) - int(xs_b.min()) + 1
             bh = int(ys_b.max()) - int(ys_b.min()) + 1
-
-
+            # Faces are typically taller than wide; speech bubbles are wider or roughly square.
+            # Reject very tall+narrow (aspect ratio > 2.5 height:width) small blobs.
             if bh > bw * 2.5 and len(interior_pixels) < 5000:
                 continue
 
@@ -596,9 +641,9 @@ def detect_bubbles(
     return masks
 
 
-
-
-
+# ===================================================================
+# MODEL C — LaMa INPAINTER  (ONNX + CUDA)
+# ===================================================================
 
 def load_lama_model(model_path: str, allow_cpu: bool = False):
     """Load LaMa inpainting ONNX model. STRICT CUDA-only."""
@@ -632,8 +677,8 @@ def lama_inpaint(
     """
     h_orig, w_orig = image.shape[:2]
 
-
-
+    # Pad to multiple of 32 to support fully convolutional LaMa at native resolution
+    # This prevents the devastating blur of resizing manga screentones to 512x512 and back.
     pad_h = (32 - (h_orig % 32)) % 32
     pad_w = (32 - (w_orig % 32)) % 32
 
@@ -644,23 +689,23 @@ def lama_inpaint(
         img_padded = image
         mask_padded = mask
 
-
+    # Prepare tensors: [1, 3, H, W] float32 [0,1]
     img_rgb = cv2.cvtColor(img_padded, cv2.COLOR_BGR2RGB)
     img_tensor = img_rgb.astype(np.float32) / 255.0
     img_tensor = np.transpose(img_tensor, (2, 0, 1))[np.newaxis]
 
-
+    # Mask: [1, 1, H, W] float32, 1.0 = inpaint
     mask_tensor = (mask_padded > 127).astype(np.float32)
     mask_tensor = mask_tensor[np.newaxis, np.newaxis]
 
     try:
-
+        # Run LaMa at native resolution
         output = lama_session.run(None, {
             "image": img_tensor,
             "mask": mask_tensor,
         })[0]
     except Exception as e:
-
+        # Fallback if the ONNX model is strictly fixed to 512x512
         print(f"LaMa native resolution failed ({e}), falling back to 512x512 resize...")
         img_resized = cv2.resize(image, (512, 512))
         mask_resized = cv2.resize(mask, (512, 512), interpolation=cv2.INTER_NEAREST)
@@ -678,21 +723,21 @@ def lama_inpaint(
         result = cv2.resize(result, (w_orig, h_orig))
         return result
 
-
+    # Convert back to BGR uint8 at original resolution
     result = output[0]
     result = np.transpose(result, (1, 2, 0))
     result = np.clip(result * 255, 0, 255).astype(np.uint8)
     result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
     
-
+    # Crop the padding away
     result = result[:h_orig, :w_orig]
 
     return result
 
 
-
-
-
+# ===================================================================
+# INTERSECTION LOGIC — classify text as bubble vs floating
+# ===================================================================
 
 @dataclass
 class ClassifiedText:
@@ -747,10 +792,10 @@ def _get_bubble_mir_internal(bubble_mask: np.ndarray, cx: int, cy: int):
     cx = max(0, min(w - 1, cx))
     cy = max(0, min(h - 1, cy))
     
-
+    # 1. Identify the component
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((bubble_mask > 127).astype(np.uint8), connectivity=8)
     
-
+    # If center is not on a bubble, find the closest bubble within 50px
     label_id = labels[cy, cx]
     if label_id == 0:
         best_d = 10000
@@ -789,20 +834,20 @@ def _clamp_to_mask_pixel_perfect(x1, y1, x2, y2, mask, safety=4):
     
     if x2 <= x1 or y2 <= y1: return x1, y1, x2, y2
 
-
+    # If the box is already completely valid, just apply safety
     roi = mask[y1:y2, x1:x2]
     if roi.size > 0 and np.all(roi > 127):
         return int(x1 + safety), int(y1 + safety), int(x2 - safety), int(y2 - safety)
 
-
+    # Otherwise, shrink edges iteratively until contained
     for _ in range(300):
         roi = mask[y1:y2, x1:x2]
         if roi.size == 0: break
         if np.all(roi > 127):
             break
             
-
-
+        # Determine which edge to shrink (prioritize the one with most 'outside' pixels)
+        # We check top, bottom, left, right edges
         bad_top = np.count_nonzero(mask[y1, x1:x2] <= 127)
         bad_bot = np.count_nonzero(mask[y2-1, x1:x2] <= 127)
         bad_lft = np.count_nonzero(mask[y1:y2, x1] <= 127)
@@ -821,10 +866,10 @@ def _clamp_to_mask_pixel_perfect(x1, y1, x2, y2, mask, safety=4):
             
         if x2 <= x1 or y2 <= y1: break
         
-
+    # Apply safety margin
     x1, y1, x2, y2 = x1 + safety, y1 + safety, x2 - safety, y2 - safety
     
-
+    # Final sanity check: ensure at least a 1x1 box at the center if everything failed
     if x2 <= x1 or y2 <= y1:
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
         return int(cx), int(cy), int(cx + 1), int(cy + 1)
@@ -840,16 +885,16 @@ def _clamp_to_mask_centered(cx, cy, x1, y1, x2, y2, mask, safety=4):
     h, w = mask.shape
     cx, cy = float(cx), float(cy)
     
-
+    # Calculate current half-widths
     dx = max(0.0, abs(x1 - cx), abs(x2 - cx))
     dy = max(0.0, abs(y1 - cy), abs(y2 - cy))
     
     for _ in range(300):
-
+        # Current symmetric candidate
         nx1, ny1 = int(cx - dx), int(cy - dy)
         nx2, ny2 = int(cx + dx), int(cy + dy)
         
-
+        # Clip to image boundaries
         cx1, cy1 = max(0, nx1), max(0, ny1)
         cx2, cy2 = min(w, nx2), min(h, ny2)
         
@@ -857,11 +902,11 @@ def _clamp_to_mask_centered(cx, cy, x1, y1, x2, y2, mask, safety=4):
         
         roi = mask[cy1:cy2, cx1:cx2]
         if roi.size > 0 and np.all(roi > 127):
-
+            # Found it! Apply safety and return
             return int(cx1 + safety), int(cy1 + safety), int(cx2 - safety), int(cy2 - safety)
             
-
-
+        # Symmetrically shrink whichever dimension is more problematic
+        # Check horizontal vs vertical edges
         bad_h = np.count_nonzero(mask[cy1, cx1:cx2] <= 127) + np.count_nonzero(mask[cy2-1, cx1:cx2] <= 127)
         bad_v = np.count_nonzero(mask[cy1:cy2, cx1] <= 127) + np.count_nonzero(mask[cy1:cy2, cx2-1] <= 127)
         
@@ -885,7 +930,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
     if not routed: return []
     h, w = seg_mask.shape
 
-
+    # 1. The Whiteness Gate (Face Protection)
     valid_bubbles = []
     for bmask in bubble_masks:
         if gray_image is not None:
@@ -905,18 +950,18 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
     consolidated = []
     handled_mask = np.zeros((h, w), dtype=np.uint8)
 
-
+    # 2. Isolated Bubble Clustering (Edge-Based Voronoi)
     for b_idx, bmask in enumerate(bubble_masks):
         M_bubble_text = cv2.bitwise_and(seg_mask, bmask)
         ys, xs = np.nonzero(M_bubble_text > 127)
         if len(ys) == 0:
             continue
 
-
+        # Raw ink canvas — only actual text segmentation pixels
         canvas = np.zeros((h, w), dtype=np.uint8)
         canvas[ys, xs] = 255
 
-
+        # ---------------------------------------------------------------
         run_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 30))
         closed_runs = cv2.morphologyEx(canvas, cv2.MORPH_CLOSE, run_kernel)
 
@@ -927,14 +972,14 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
             c_x, c_y, c_w, c_h = cv2.boundingRect(c)
             if c_w * c_h < 30:
                 continue
-
+            # Extract raw ink pixels that fall inside this contour's bbox
             c_mask = np.zeros((h, w), dtype=np.uint8)
             cv2.drawContours(c_mask, [c], -1, 255, -1)
             raw_in_run = cv2.bitwise_and(canvas, c_mask)
             ys_r, xs_r = np.nonzero(raw_in_run)
             if len(ys_r) == 0:
                 continue
-
+            # Tight bounding box of actual ink strokes
             rx1 = int(xs_r.min())
             ry1 = int(ys_r.min())
             rx2 = int(xs_r.max()) + 1
@@ -944,8 +989,8 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
                     'coords': (rx1, ry1, rx2, ry2)
                 })
 
-
-
+        # Intelligent horizontal/vertical merge heuristic
+        # Merges columns that are horizontally close (< 25px) and have significant vertical overlap (> 30%)
         merged = True
         while merged:
             merged = False
@@ -976,7 +1021,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
         if not bubble_red_boxes:
             continue
             
-
+        # Dynamic Shrink
         ys_b, xs_b = np.nonzero(bmask)
         bx1, by1 = int(xs_b.min()), int(ys_b.min())
         bx2, by2 = int(xs_b.max()), int(ys_b.max())
@@ -994,18 +1039,18 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
         
         if len(ys_safe) > 0:
             dist_maps = []
-
+            # Calculate distance from the EDGES of each Red Box
             for box in bubble_red_boxes:
                 rx1, ry1, rx2, ry2 = box['coords']
-
+                # Create a white image, draw the Red Box in black
                 mask = np.ones_like(bmask, dtype=np.uint8) * 255
                 cv2.rectangle(mask, (int(rx1), int(ry1)), (int(rx2), int(ry2)), 0, -1)
                 
-
+                # Distance is 0 inside the box, increasing outward
                 dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
                 dist_maps.append(dist)
 
-
+            # Stack maps and find the closest Red Box for every pixel
             if dist_maps:
                 dist_stack = np.stack(dist_maps)
                 territory_ids_arr = np.argmin(dist_stack, axis=0)
@@ -1032,7 +1077,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
             gx1, gy1 = min(gx_arr), min(gy_arr)
             gx2, gy2 = max(gx_arr), max(gy_arr)
 
-
+            # Emit one ClassifiedText per individual tight red box
             for ind_box in individual_boxes:
                 rx1, ry1, rx2, ry2 = ind_box['coords']
 
@@ -1067,7 +1112,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
             
         handled_mask = np.maximum(handled_mask, bmask)
 
-
+    # 3. Morphology for Floating Text
     floating_seg = cv2.bitwise_and(seg_mask, cv2.bitwise_not(handled_mask))
     floating_canvas = floating_seg.copy()
 
@@ -1078,9 +1123,9 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
 
     for c in final_floating_contours:
         rx, ry, rw, rh = cv2.boundingRect(c)
-
+        # Strict minimum: ignore tiny noise blobs
         if rw * rh < 300: continue
-
+        # Also skip very thin/narrow fragments (likely line art, not text)
         if rw < 10 or rh < 10: continue
 
         rx1, ry1 = rx, ry
@@ -1129,15 +1174,15 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
             green_polygon=poly_points
         ))
 
-
-
-
+    # Enforce green polygon sizing constraints:
+    # - Green must be >= 1% larger than the red box in each dimension
+    # - Green must be <= 95% of the blue bubble bounding box in each dimension
     for ct in consolidated:
         rb = ct.box
         gb = ct.expanded_box
         poly = ct.green_polygon
 
-
+        # 1% expansion minimum over red box
         min_gx1 = int(rb.x1 - max(1, rb.width * 0.005))
         min_gy1 = int(rb.y1 - max(1, rb.height * 0.005))
         min_gx2 = int(rb.x2 + max(1, rb.width * 0.005))
@@ -1148,7 +1193,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
         new_gx2 = max(gb.x2, min_gx2)
         new_gy2 = max(gb.y2, min_gy2)
 
-
+        # 95% ceiling of bubble bounds if inside a bubble
         if ct.bubble_idx != -1 and ct.bubble_idx < len(bubble_masks):
             bm = bubble_masks[ct.bubble_idx]
             ys_b, xs_b = np.nonzero(bm)
@@ -1166,7 +1211,7 @@ def consolidate_by_bubble(routed: List[ClassifiedText], seg_mask: np.ndarray, bu
 
         ct.expanded_box = Box(new_gx1, new_gy1, new_gx2, new_gy2)
         if poly and len(poly) >= 3:
-
+            # Clamp polygon points to new bounds
             ct.green_polygon = [
                 [max(new_gx1, min(new_gx2, p[0])), max(new_gy1, min(new_gy2, p[1]))]
                 for p in poly
@@ -1226,7 +1271,7 @@ def build_step2_routing_state(
     for original_box in text_result.boxes:
         roi_text = text_result.seg_mask[original_box.y1:original_box.y2, original_box.x1:original_box.x2].copy()
         
-
+        # 1. Extract text strictly inside ANY detected bubble
         for i, bmask in enumerate(bubble_masks):
             roi_bmask = bmask[original_box.y1:original_box.y2, original_box.x1:original_box.x2]
             text_in_this_bubble = cv2.bitwise_and(roi_text, roi_bmask)
@@ -1236,7 +1281,7 @@ def build_step2_routing_state(
                 dilated = cv2.dilate(text_in_this_bubble, kernel, iterations=1)
                 contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 
-
+                # Fetch bubble bounding box for strict geometric clamping
                 ys_b, xs_b = np.nonzero(bmask)
                 if len(ys_b) == 0: continue
                 b_x1, b_y1, b_x2, b_y2 = xs_b.min(), ys_b.min(), xs_b.max() + 1, ys_b.max() + 1
@@ -1257,13 +1302,13 @@ def build_step2_routing_state(
                             if strict_box.area < 120: # Area-based noise filter
                                 continue
 
-
+                            # --- BUBBLE OCR FILTER (Precision: Skip English/SFX/Noise) ---
                             ocr_text = ''
                             ocr_class = 'dialogue'
                             if ocr_model is not None and image is not None:
                                 ocr_text, ocr_class = ocr_classify_region(ocr_model, image, strict_box)
                             
-
+                            # Skip English, SFX, and Noise inside bubbles
                             if ocr_class in ['english', 'sfx', 'noise']:
                                 continue
                                 
@@ -1287,10 +1332,10 @@ def build_step2_routing_state(
                                 confidence=1.0,
                             ))
                 
-
+                # Remove pixels from roi_text to prevent processing as floating
                 roi_text = cv2.bitwise_and(roi_text, cv2.bitwise_not(roi_bmask))
 
-
+        # 2. Extract remaining text, classify using OCR (manga-ocr + Unicode analysis)
         if np.count_nonzero(roi_text) > 30:
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
             dilated = cv2.dilate(roi_text, kernel, iterations=1)
@@ -1312,14 +1357,14 @@ def build_step2_routing_state(
                         if strict_box.area < 120:
                             continue
                         
-
+                        # --- OCR-powered classification ---
                         ocr_text = ''
                         ocr_class = 'dialogue'  # safe default
                         
                         if ocr_model is not None and image is not None:
                             ocr_text, ocr_class = ocr_classify_region(ocr_model, image, strict_box)
                         
-
+                        # Skip English, SFX, and Noise outside bubbles
                         if ocr_class in ['english', 'sfx', 'noise']:
                             continue
 
@@ -1341,7 +1386,7 @@ def build_step2_routing_state(
                             confidence=1.0,
                         ))
 
-
+    # 3. Magi recall boost: add Magi text boxes that don't overlap with anything already routed
     routed_boxes = [r.box for r in routed]
     for magi_reg in semantic_result.regions:
         m_box = magi_reg.box
@@ -1357,8 +1402,8 @@ def build_step2_routing_state(
         if already_covered:
             continue
             
-
-
+        # This Magi detection was missed by Model A — add it
+        # Check if it's inside a bubble
         inside_bubble = False
         best_bubble_idx = -1
         for i, bmask in enumerate(bubble_masks):
@@ -1387,13 +1432,13 @@ def build_step2_routing_state(
                 confidence=magi_reg.confidence,
             ))
         else:
-
+            # Outside bubble — OCR classify
             ocr_text = ''
             ocr_class = 'dialogue'
             if ocr_model is not None and image is not None:
                 ocr_text, ocr_class = ocr_classify_region(ocr_model, image, m_box)
             
-
+            # Skip English, SFX, and Noise
             if ocr_class in ['english', 'sfx', 'noise']:
                 continue
             
@@ -1411,8 +1456,8 @@ def build_step2_routing_state(
                 confidence=magi_reg.confidence,
             ))
 
-
-
+    # 4. Empty Bubble Rescue
+    # If a speech bubble has NO text routed to it, create a fallback box using its Maximum Inscribed Rectangle (MIR)
     routed_bubble_indices = set(r.bubble_idx for r in routed if r.bubble_idx != -1)
     
     for i, bmask in enumerate(bubble_masks):
@@ -1487,9 +1532,9 @@ def draw_step2_routing_debug(
     return debug
 
 
-
-
-
+# ===================================================================
+# STEP 3 — DYNAMIC MASK BUILDER & ROUTE-SPECIFIC POST-PROCESSING
+# ===================================================================
 
 def _extract_text_strokes(image: np.ndarray, coords: Tuple[int, int, int, int], is_bubble: bool) -> np.ndarray:
     x1, y1, x2, y2 = coords
@@ -1498,45 +1543,45 @@ def _extract_text_strokes(image: np.ndarray, coords: Tuple[int, int, int, int], 
     if bh <= 0 or bw <= 0:
         return np.zeros((max(1, bh), max(1, bw)), dtype=np.uint8)
     
-
+    # 1. Extract ROI
     img_roi = image[y1:y2, x1:x2]
     
-
+    # 2. Grayscale
     gray = cv2.cvtColor(img_roi, cv2.COLOR_BGR2GRAY)
     
     if is_bubble:
-
-
+        # --- BUBBLE DIALOGUE (Clean white background) ---
+        # Very light blur to prevent deleting thin strokes (furigana)
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
         
-
+        # Otsu's perfectly separates dark ink from solid white backgrounds
         _, strokes = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
         
-
+        # Very light noise filter: area < 3
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(strokes, connectivity=8)
         for i in range(1, num_labels):
             if stats[i, cv2.CC_STAT_AREA] < 3:
                 strokes[labels == i] = 0
                 
-
+        # Morph CLOSE to glue any tiny gaps
         strokes = cv2.morphologyEx(strokes, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
         
     else:
-
-
+        # --- FLOATING DIALOGUE / SFX (Complex noisy background) ---
+        # Determine text color based on median brightness BEFORE blurs/CLAHE
         median_val = np.median(gray)
-
-
+        # If the background is dark (median < 160), the text is white (we use THRESH_BINARY)
+        # otherwise the text is black (we use THRESH_BINARY_INV)
         thresh_type = cv2.THRESH_BINARY if median_val < 160 else cv2.THRESH_BINARY_INV
         
-
+        # 3. Screentone killer: ksize=3 (reduced from 5) to save thin text
         gray = cv2.medianBlur(gray, 3)
         
-
+        # 4. Contrast Boost
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
         
-
+        # 5. Adaptive threshold to isolate ink from dark screentone
         strokes = cv2.adaptiveThreshold(
             gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -1545,13 +1590,13 @@ def _extract_text_strokes(image: np.ndarray, coords: Tuple[int, int, int, int], 
             12,  # slightly more forgiving C
         )
         
-
+        # 6. Area Filter: strict dropping of screentone dots
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(strokes, connectivity=8)
         for i in range(1, num_labels):
             if stats[i, cv2.CC_STAT_AREA] < 10:  # Much more aggressive area filter for floating
                 strokes[labels == i] = 0
                 
-
+        # 7. Morph CLOSE: reconnect text
         strokes = cv2.morphologyEx(strokes, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
         
     return strokes
@@ -1585,7 +1630,7 @@ def build_step3_dynamic_mask(
     bubble_mask_out = np.zeros((h, w), dtype=np.uint8)
     floating_mask_out = np.zeros((h, w), dtype=np.uint8)
     
-
+    # Pre-merge all bubble masks into a single union mask for fast clipping
     bubble_union = None
     if bubble_masks:
         bubble_union = np.zeros((h, w), dtype=np.uint8)
@@ -1595,22 +1640,22 @@ def build_step3_dynamic_mask(
     for ct in routed:
         box = ct.box
         
-
+        # Safe padding (+4 pixels) on all sides, clamped to image boundaries
         pad = 4
         y1, y2 = max(0, box.y1 - pad), min(h, box.y2 + pad)
         x1, x2 = max(0, box.x1 - pad), min(w, box.x2 + pad)
         
-
-
-
-
+        # Heuristic: Object detectors (Magi/ComicTextDetector) frequently miss stylized 
+        # chapter numbers (e.g. 第90話) that sit immediately above horizontal floating titles.
+        # By expanding the masking region upwards for floating text, we allow the 
+        # text-stroke extractor to catch and erase them.
         if ct.route_state == "floating_dialogue":
             y1 = max(0, y1 - 50)
             
         padded_coords = (x1, y1, x2, y2)
         
         if ct.route_state == "bubble_dialogue":
-
+            # FALSE POSITIVE PROTECTION
             box_area = (x2 - x1) * (y2 - y1)
             roi_seg_check = seg_mask[y1:y2, x1:x2]
             seg_density = np.count_nonzero(roi_seg_check) / max(1, box_area)
@@ -1627,11 +1672,11 @@ def build_step3_dynamic_mask(
             else:
                 strokes = roi_seg_bin
                 
-
+            # Dilation for cleaner LaMa inpainting
             kernel = np.ones((3, 3), np.uint8)
             strokes = cv2.dilate(strokes, kernel, iterations=2)
             
-
+            # Clip to bubble contour so we never leak outside the bubble
             if bubble_union is not None:
                 bubble_roi = bubble_union[y1:y2, x1:x2]
                 strokes = cv2.bitwise_and(strokes, bubble_roi)
@@ -1639,27 +1684,27 @@ def build_step3_dynamic_mask(
             bubble_mask_out[y1:y2, x1:x2] = np.maximum(bubble_mask_out[y1:y2, x1:x2], strokes)
         
         elif ct.route_state == "floating_dialogue":
-
-
-
-
+            # FALSE POSITIVE PROTECTION: If the bounding box is very large but
+            # Model A's seg_mask has very few actual text pixels inside it,
+            # this is likely a false detection over character art (e.g. shirt text
+            # "DOPYE" causing a giant bbox over a face). Skip it.
             box_area = (x2 - x1) * (y2 - y1)
             roi_seg_check = seg_mask[y1:y2, x1:x2]
             seg_density = np.count_nonzero(roi_seg_check) / max(1, box_area)
             if box_area > 5000 and seg_density < 0.05:
                 continue  # Skip: giant box with almost no text pixels = false positive
             
-
+            # Extract seg_mask for this region (very accurate pixel mask from Model A)
             roi_seg = seg_mask[y1:y2, x1:x2].copy()
             _, roi_seg_bin = cv2.threshold(roi_seg, 127, 255, cv2.THRESH_BINARY)
             
-
+            # Use Model A's seg_mask directly when available to capture both black characters and white outlines, falling back to adaptive strokes.
             if np.count_nonzero(roi_seg_bin) >= 10:
                 roi_mask = roi_seg_bin
             else:
                 roi_mask = _extract_text_strokes(image, (x1, y1, x2, y2), is_bubble=False)
                 
-
+            # Apply a razor-thin 3x3 mask (3x3 dilation, 1 iteration)
             dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             dilated_strokes = cv2.dilate(roi_mask, dilate_kernel, iterations=1)
             
@@ -1667,16 +1712,16 @@ def build_step3_dynamic_mask(
                 floating_mask_out[y1:y2, x1:x2], dilated_strokes
             )
 
-
+        # onomatopoeia: skip entirely
     
-
+    # Merge both masks into a single union
     final_full_mask = np.maximum(bubble_mask_out, floating_mask_out)
     return final_full_mask
 
 
-
-
-
+# ===================================================================
+# STEP 4 — SELECTIVE INPAINTING WITH LaMa
+# ===================================================================
 
 def expand_boxes(boxes: List[Box], pad: int, img_w: int, img_h: int) -> List[Box]:
     return [b.expanded(pad, img_w, img_h) for b in boxes]
@@ -1697,31 +1742,31 @@ def erase_regions_selective(
     """
     h, w = image.shape[:2]
 
-
-
+    # Build the final inpainting mask:
+    # seg_mask (text pixels) AND inside any bubble that contains bubble_text
     final_mask = np.zeros((h, w), dtype=np.uint8)
 
     for ct in classified:
         if ct.text_type != "bubble_text":
             continue  # SKIP floating text
 
-
+        # Use the expanded box region
         b = ct.expanded_box
-
+        # Extract seg mask within this expanded box
         roi_seg = seg_mask[b.y1:b.y2, b.x1:b.x2]
-
+        # Place into final mask
         final_mask[b.y1:b.y2, b.x1:b.x2] = np.maximum(
             final_mask[b.y1:b.y2, b.x1:b.x2], roi_seg
         )
 
-
+    # If nothing to inpaint, return original
     if np.count_nonzero(final_mask) == 0:
         return image.copy()
 
-
+    # Run LaMa on the full image with the combined mask
     inpainted = lama_inpaint(lama_session, image, final_mask)
 
-
+    # Only apply inpainted pixels where mask is active (keep rest untouched)
     result = image.copy()
     mask_bool = final_mask > 127
     result[mask_bool] = inpainted[mask_bool]
@@ -1729,9 +1774,9 @@ def erase_regions_selective(
     return result
 
 
-
-
-
+# ===================================================================
+# STEP 5 — ENGLISH TEXT INSERTION
+# ===================================================================
 
 def insert_text(image, expanded_boxes, translations, cfg):
     result = image.copy()
@@ -1817,9 +1862,9 @@ def _wrap_text_pillow(draw, text, font, max_w):
     return lines or [text]
 
 
-
-
-
+# ===================================================================
+# DEBUG VISUALISATION
+# ===================================================================
 
 def draw_debug_boxes(
     image: np.ndarray,
@@ -1837,18 +1882,18 @@ def draw_debug_boxes(
     """
     debug = image.copy()
 
-
+    # ── 1. Blue: Speech Bubble Boundaries ─────────────────────────────
     for bmask in bubble_masks:
         contours, _ = cv2.findContours(bmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(debug, contours, -1, (255, 0, 0), 2)  # Blue, 2px
 
-
+    # ── 2. Red + Green: Text regions ──────────────────────────────────
     for ct in classified:
         rb = ct.box
-
+        # Red: tight erasure zone
         cv2.rectangle(debug, (rb.x1, rb.y1), (rb.x2, rb.y2), (0, 0, 255), 2)
 
-
+        # Green: typesetting zone (polygon preferred, rect fallback)
         poly = getattr(ct, 'green_polygon', [])
         if poly and len(poly) >= 3:
             pts = np.array(poly, np.int32).reshape((-1, 1, 2))
@@ -1880,9 +1925,9 @@ def draw_semantic_class_debug(
     return debug
 
 
-
-
-
+# ===================================================================
+# FULL PIPELINE
+# ===================================================================
 
 def run_pipeline(
     image_path: str | Path,
@@ -1899,22 +1944,22 @@ def run_pipeline(
         raise FileNotFoundError(f"Cannot load image: {image_path}")
     h, w = image.shape[:2]
 
-
+    # Step 1: Model A — detect text boxes + seg mask
     text_result = detect_text(text_session, image, cfg)
     seg_mask = text_result.seg_mask
     print(f"  [Step 1] Model A: {len(text_result.boxes)} text regions")
 
-
+    # Step 1b: Magi supplementary detection
     if semantic_handle is None:
         semantic_handle = load_semantic_model(cfg.semantic_model_path)
     semantic_result = detect_semantic_text_regions(semantic_handle, image, cfg)
     print(f"  [Step 1b] Magi: {len(semantic_result.regions)} semantic regions")
 
-
+    # Step 2: Model B — segment bubbles
     bubble_masks = detect_bubbles(bubble_model, bubble_device, image, cfg)
     print(f"  [Step 2] Model B: {len(bubble_masks)} speech bubbles")
 
-
+    # Step 3: Routing & Consolidation
     if ocr_model is None:
         ocr_model = load_ocr_model()
     
@@ -1929,13 +1974,13 @@ def run_pipeline(
     n_float = sum(1 for c in consolidated if c.route_state == "floating_dialogue")
     print(f"  [Step 3] Consolidation: {n_bubble} bubble dialogue, {n_float} floating dialogue")
 
-
+    # Step 4: Selective LaMa inpainting (bubble dialogue only)
     erased_image = erase_regions_selective(
         image, consolidated, seg_mask, bubble_masks, lama_session, cfg,
     )
     print(f"  [Step 4] LaMa inpainted {n_bubble} bubble regions")
 
-
+    # Debug image
     debug_image = draw_debug_boxes(image, consolidated, bubble_masks, seg_mask, cfg)
 
     return {
@@ -1949,9 +1994,9 @@ def run_pipeline(
     }
 
 
-
-
-
+# ===================================================================
+# BATCH RUNNER
+# ===================================================================
 
 SAMPLE_MAP = {
     "sample1": "sample.jpg",
@@ -1973,7 +2018,7 @@ def run_all_samples(
     bubble_device: str,
     lama_session,
 ):
-
+    # Pre-load all models to avoid re-loading per sample
     print("Pre-loading models for batch run...")
     semantic_handle = load_semantic_model(cfg.semantic_model_path)
     ocr_model = load_ocr_model()
@@ -1985,7 +2030,7 @@ def run_all_samples(
             continue
 
         sample_dir = samples_dir / sample_name
-
+        # Single output directory
         out_dir = sample_dir / "step_final_output"
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2003,7 +2048,7 @@ def run_all_samples(
             ocr_model=ocr_model,
         )
 
-
+        # Save all relevant artifacts to the single folder
         cv2.imwrite(str(out_dir / "seg_mask.png"), result["seg_mask"])
         cv2.imwrite(str(out_dir / "erased_inpainted.png"), result["erased_image"])
         cv2.imwrite(str(out_dir / "debug_layout_boxes.jpg"), result["debug_image"])
@@ -2143,9 +2188,9 @@ def run_step2_routing_test(
     print(f"[Step2 Test] saved: {out_img}")
 
 
-
-
-
+# ===================================================================
+# CLI
+# ===================================================================
 
 def main():
     import argparse
@@ -2186,11 +2231,11 @@ def main():
         mask_padding=args.padding,
     )
 
-
+    # Step-1 verification mode: semantic detector only (single image)
     if args.semantic_test:
         test_image_path = args.semantic_test_image
 
-
+        # Helpful fallback for this repo's known sample4 filenames.
         if not test_image_path.exists() and str(args.semantic_test_image).replace("\\", "/") == "samples/sample4/sample4.jpg":
             candidates = [
                 Path("samples/sample4/sample4.jpg"),
@@ -2223,13 +2268,13 @@ def main():
         print(f"[Semantic Test] saved: {out_path}")
         return
 
-
+    # Step-1 verification mode: semantic detector only (all samples)
     if args.semantic_test_all:
         semantic_handle = load_semantic_model(cfg.semantic_model_path, allow_cpu=args.allow_cpu)
         run_semantic_test_all_samples(cfg, args.samples_dir, semantic_handle)
         return
 
-
+    # Step-2 verification mode: class remap + routing state debug
     if args.step2_routing_test:
         test_image_path = args.semantic_test_image
         if not test_image_path.exists() and str(args.semantic_test_image).replace("\\", "/") == "samples/sample4/sample4.jpg":

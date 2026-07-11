@@ -10,7 +10,7 @@ Translation approach:
   - No curated per-sample translation database in the production path.
 """
 
-
+# --- Clean-copy path bootstrap ---
 from pathlib import Path as _BootstrapPath
 import sys as _bootstrap_sys
 _BOOTSTRAP_FILE = _BootstrapPath(__file__).resolve()
@@ -33,13 +33,14 @@ for _rel in (
     if _path not in _bootstrap_sys.path:
         _bootstrap_sys.path.insert(0, _path)
 del _BootstrapPath, _bootstrap_sys, _BOOTSTRAP_FILE, _candidate, _PROJECT_ROOT_FOR_IMPORTS, _rel, _path
-
+# --- End clean-copy path bootstrap ---
 import html
 import json
 import os
 import re
 import shutil
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -47,12 +48,23 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from api_manager import (
+    API_MANAGER,
+    DAILY_LIMIT_MESSAGE,
+    ApiProviderAuthLocked,
+    ApiProviderUnavailable,
+    ApiQuotaExhausted,
+    ApiRateLimited,
+)
 from ml_region_lib import SAMPLE_MAP
 from pipeline_paths import DEFAULT_SAMPLES_ROOT, PROJECT_ROOT, sample_root_from_env
 
 _LOCAL_TRANSLATOR = None
 _LOCAL_TOKENIZERS: dict[str, object] = {}
-_LOCAL_TRANSLATOR_MODEL = "facebook/nllb-200-distilled-600M"
+_LOCAL_TRANSLATOR_MODEL = os.environ.get("LOCAL_TRANSLATOR_MODEL", "facebook/nllb-200-distilled-600M").strip() or "facebook/nllb-200-distilled-600M"
+# Guards the check-then-act singleton loads below against concurrent cold-start requests (the GPU
+# scheduler allows 2-4 concurrent pipeline runs; see the matching lock in run_step4_inpaint.py).
+_LOCAL_TRANSLATOR_LOAD_LOCK = threading.Lock()
 ENV_FILE = PROJECT_ROOT / ".env"
 API_PROVIDER_FAILURES: list[dict[str, object]] = []
 API_PROVIDER_USES: list[dict[str, object]] = []
@@ -89,7 +101,15 @@ def _configured(value: str | None) -> bool:
 
 
 def _csv_env(name: str) -> list[str]:
-    return [part.strip() for part in os.environ.get(name, "").split(",") if _configured(part.strip())]
+    values: list[str] = []
+    candidate_names = [name]
+    candidate_names.extend(f"{name}_{index}" for index in range(1, 51))
+    for candidate_name in candidate_names:
+        for part in os.environ.get(candidate_name, "").split(","):
+            value = part.strip()
+            if _configured(value) and value not in values:
+                values.append(value)
+    return values
 
 
 def _csv_values_from_env(*names: str) -> list[str]:
@@ -126,10 +146,20 @@ SECRET_ENV_NAMES = {
     "MISTRAL_API_KEY",
     "OPENROUTER_API_KEYS",
     "OPENROUTER_API_KEY",
+    "CEREBRAS_API_KEYS",
+    "CEREBRAS_API_KEY",
+    "CEREBERAS_API_KEYS",
+    "CEREBERAS_API_KEY",
     "NVIDIA_API_KEYS",
     "NVIDIA_API_KEY",
     "NVIDIA_NIM_API_KEYS",
     "NVIDIA_NIM_API_KEY",
+    "FIREWORKS_API_KEYS",
+    "FIREWORKS_API_KEY",
+    "CLOUDFLARE_WORKERS_API_KEYS",
+    "CLOUDFLARE_WORKERS_API_KEY",
+    "CLOUDFLARE_API_KEYS",
+    "CLOUDFLARE_API_KEY",
 }
 SECRETS_TO_SCRUB: list[str] = []
 for secret_name in SECRET_ENV_NAMES:
@@ -152,12 +182,15 @@ def _scrub_secret(text: Any) -> str:
 def _has_api_keys() -> bool:
     return any(
         [
-            _csv_env("GEMINI_API_KEYS"),
-            _provider_keys("GITHUB_API_KEYS", "GITHUB_API_KEY"),
-            _provider_keys("GROQ_API_KEYS", "GROQ_API_KEY"),
-            _provider_keys("MISTRAL_API_KEYS", "MISTRAL_API_KEY"),
-            _provider_keys("OPENROUTER_API_KEYS", "OPENROUTER_API_KEY"),
-            _provider_keys("NVIDIA_API_KEYS", "NVIDIA_API_KEY", "NVIDIA_NIM_API_KEYS", "NVIDIA_NIM_API_KEY"),
+            API_MANAGER.provider_keys("gemini"),
+            API_MANAGER.provider_keys("github"),
+            API_MANAGER.provider_keys("groq"),
+            API_MANAGER.provider_keys("mistral"),
+            API_MANAGER.provider_keys("openrouter"),
+            API_MANAGER.provider_keys("cerebras"),
+            API_MANAGER.provider_keys("nvidia"),
+            API_MANAGER.provider_keys("fireworks"),
+            API_MANAGER.provider_keys("cloudflare"),
         ]
     )
 
@@ -171,6 +204,100 @@ def _api_translation_enabled() -> bool:
     return _has_api_keys()
 
 
+def _translation_items_with_layout_merges(ocr_results: list[dict], sample_dir: Path) -> list[dict]:
+    layout_path = sample_dir / "step_6_layout" / "layout_constraints.json"
+    if not layout_path.exists():
+        return ocr_results
+    try:
+        layout_data = json.loads(layout_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ocr_results
+    if not isinstance(layout_data, list):
+        return ocr_results
+
+    # Step 6 records a semantic_role ("dialogue"/"sfx"/...) per constraint;
+    # carry it onto every OCR item so translation/typesetting downstream can
+    # give SFX text a different (punchier, non-sentence) treatment instead
+    # of translating and rendering it identically to ordinary dialogue.
+    # short_fragment similarly flags a rescued tiny particle box (see
+    # run_step6_layout.py) so its translation stays proportionally short.
+    role_by_id: dict[int, str] = {}
+    short_fragment_ids: set[int] = set()
+    for layout in layout_data:
+        if not isinstance(layout, dict):
+            continue
+        try:
+            layout_id = int(layout.get("id"))
+        except (TypeError, ValueError):
+            continue
+        role_by_id[layout_id] = str(layout.get("semantic_role") or "")
+        if layout.get("short_fragment"):
+            short_fragment_ids.add(layout_id)
+    for item in ocr_results:
+        try:
+            item_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        role = role_by_id.get(item_id)
+        if role:
+            item["semantic_role"] = role
+        if item_id in short_fragment_ids:
+            item["short_fragment"] = True
+
+    original_by_id: dict[int, dict] = {}
+    for item in ocr_results:
+        try:
+            original_by_id[int(item.get("id"))] = item
+        except (TypeError, ValueError):
+            continue
+
+    replacements: dict[int, dict] = {}
+    skip_ids: set[int] = set()
+    for layout in layout_data:
+        if not isinstance(layout, dict):
+            continue
+        fragment_ids = layout.get("line_fragment_ids")
+        if not isinstance(fragment_ids, list) or len(fragment_ids) <= 1:
+            continue
+        try:
+            primary_id = int(layout.get("id"))
+            normalized_fragment_ids = [int(item_id) for item_id in fragment_ids]
+        except (TypeError, ValueError):
+            continue
+        base = dict(original_by_id.get(primary_id) or original_by_id.get(normalized_fragment_ids[0]) or {})
+        if not base:
+            continue
+        text = str(layout.get("text") or "").strip()
+        red_box = layout.get("red_box")
+        if not text or not isinstance(red_box, list) or len(red_box) < 4:
+            continue
+        x1, y1, x2, y2 = [int(value) for value in red_box[:4]]
+        base["id"] = primary_id
+        base["text"] = text
+        base["box"] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "width": x2 - x1, "height": y2 - y1}
+        base["line_fragment_ids"] = normalized_fragment_ids
+        fallback_source = str(base.get("fallback_source") or "")
+        base["fallback_source"] = f"{fallback_source}+layout_line_merge" if fallback_source else "layout_line_merge"
+        replacements[primary_id] = base
+        skip_ids.update(item_id for item_id in normalized_fragment_ids if item_id != primary_id)
+
+    if not replacements:
+        return ocr_results
+
+    merged_results: list[dict] = []
+    for item in ocr_results:
+        try:
+            item_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            merged_results.append(item)
+            continue
+        if item_id in skip_ids:
+            continue
+        merged_results.append(replacements.pop(item_id, item))
+    merged_results.extend(replacements.values())
+    return merged_results
+
+
 def _provider_order() -> list[str]:
     preferred = os.environ.get("PREFERRED_PROVIDER", "").strip().lower()
     explicit = [
@@ -179,12 +306,15 @@ def _provider_order() -> list[str]:
         if provider.strip()
     ]
     defaults = [
-        "mistral",
-        "github",
-        "gemini",
-        "openrouter",
         "groq",
+        "cerebras",
         "nvidia",
+        "github",
+        "openrouter",
+        "gemini",
+        "cloudflare",
+        "fireworks",
+        "mistral",
     ]
     ordered = []
     for provider in [preferred, *explicit, *defaults]:
@@ -193,9 +323,17 @@ def _provider_order() -> list[str]:
             "google-gemini": "gemini",
             "gh": "github",
             "github-models": "github",
+            "qwen": "openrouter",
+            "qwen-mt": "openrouter",
+            "alibaba": "openrouter",
+            "alibaba-cloud": "openrouter",
             "open-router": "openrouter",
+            "cerebras-ai": "cerebras",
             "nvidia-nim": "nvidia",
             "nim": "nvidia",
+            "workers": "cloudflare",
+            "workers-ai": "cloudflare",
+            "cloudflare-workers": "cloudflare",
         }.get(provider, provider)
         if normalized and normalized not in ordered:
             ordered.append(normalized)
@@ -289,7 +427,11 @@ def _detect_source_lang(text: str) -> str:
     if re.search(r"[\u3040-\u30ff]", text):
         return "jpn_Jpan"
     if re.search(r"[\u4e00-\u9fff]", text):
-        return "zho_Hant"
+        traditional_markers = set("臺灣繁體國與學會還過後發個萬億醫藥龍鳳門風雲廣東話語")
+        simplified_markers = set("台湾简体国与学会还过后发个万亿医药龙凤门风云广东话语")
+        traditional_score = sum(1 for ch in text if ch in traditional_markers)
+        simplified_score = sum(1 for ch in text if ch in simplified_markers)
+        return "zho_Hant" if traditional_score > simplified_score else "zho_Hans"
     return "jpn_Jpan"
 
 
@@ -298,25 +440,37 @@ def _load_local_translator():
     if _LOCAL_TRANSLATOR is not None:
         return _LOCAL_TRANSLATOR
 
-    import torch
-    from transformers import AutoModelForSeq2SeqLM
+    with _LOCAL_TRANSLATOR_LOAD_LOCK:
+        if _LOCAL_TRANSLATOR is not None:
+            return _LOCAL_TRANSLATOR
 
-    model = AutoModelForSeq2SeqLM.from_pretrained(_LOCAL_TRANSLATOR_MODEL)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
-    model.eval()
-    _LOCAL_TRANSLATOR = (model, device)
-    return _LOCAL_TRANSLATOR
+        import torch
+        from transformers import AutoModelForSeq2SeqLM
+
+        model = AutoModelForSeq2SeqLM.from_pretrained(_LOCAL_TRANSLATOR_MODEL)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cpu":
+            print(
+                "  [LocalTranslator] CUDA unavailable; falling back to CPU. This is a real "
+                "slowdown for the local NLLB fallback translator, not a silent no-op.",
+                flush=True,
+            )
+        model.to(device)
+        model.eval()
+        _LOCAL_TRANSLATOR = (model, device)
+        return _LOCAL_TRANSLATOR
 
 
 def _local_tokenizer(source_lang: str):
     if source_lang not in _LOCAL_TOKENIZERS:
-        from transformers import AutoTokenizer
+        with _LOCAL_TRANSLATOR_LOAD_LOCK:
+            if source_lang not in _LOCAL_TOKENIZERS:
+                from transformers import AutoTokenizer
 
-        _LOCAL_TOKENIZERS[source_lang] = AutoTokenizer.from_pretrained(
-            _LOCAL_TRANSLATOR_MODEL,
-            src_lang=source_lang,
-        )
+                _LOCAL_TOKENIZERS[source_lang] = AutoTokenizer.from_pretrained(
+                    _LOCAL_TRANSLATOR_MODEL,
+                    src_lang=source_lang,
+                )
     return _LOCAL_TOKENIZERS[source_lang]
 
 
@@ -345,7 +499,7 @@ def _local_translate(text: str) -> str:
             output = model.generate(
                 **inputs,
                 forced_bos_token_id=forced_bos_token_id,
-                max_new_tokens=96,
+                max_length=96,
                 num_beams=4,
                 no_repeat_ngram_size=3,
             )
@@ -519,24 +673,67 @@ def _valid_api_translation(source: str, translated: object) -> bool:
     return True
 
 
+def _source_requires_translation(source: object) -> bool:
+    text = str(source or "").strip()
+    if not text:
+        return False
+    cjk_count = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", text))
+    if cjk_count == 0:
+        return False
+    alnum_count = len(re.findall(r"[A-Za-z0-9\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", text))
+    if alnum_count == 0:
+        return False
+    if cjk_count <= 1 and len(text) <= 3:
+        return False
+    return True
+
+
+def _pretranslated_text(item: dict[str, object]) -> str:
+    for key in ("pretranslated_text", "vision_english", "english"):
+        text = _clean_api_translation(item.get(key))
+        if text and _valid_api_translation(str(item.get("text", "")), text):
+            return text
+    return ""
+
+
 def _translation_prompt(items: list[dict[str, object]], sample_name: str) -> str:
     compact_items = []
     for item in items:
         source_text = str(item.get("text", "")).strip()
-        if not source_text:
+        if not _source_requires_translation(source_text):
             continue
         payload = {"id": int(item["id"]), "source_text": source_text}
+        if str(item.get("semantic_role") or "") == "sfx":
+            payload["role"] = "sfx"
+        elif item.get("short_fragment"):
+            payload["role"] = "brief"
         compact_items.append(payload)
     return (
         "You are a professional manga, manhwa, and manhua translator/typesetter assistant.\n"
-        "Translate OCR text fragments from Japanese, Korean, or Chinese into natural English.\n"
-        "Use the surrounding list as page context, but translate each id independently.\n"
-        "Preserve names, SFX tone, stutters, ellipses, shouting, and short reactions.\n"
+        "Translate OCR text fragments from Japanese, Korean, or Chinese into accurate, natural English.\n"
+        "Items tagged \"role\": \"sfx\" are sound effects, not dialogue: render them as a short punchy "
+        "English sound-effect word (e.g. BAM, THUD, WHOOSH, CRASH) or onomatopoeia rather than a full "
+        "grammatical sentence, and keep them in the same emphatic/exclamatory register as the source.\n"
+        "Items tagged \"role\": \"brief\" are a tiny 1-4 character spoken fragment (a trailing particle, "
+        "interjection, or reaction sound) that occupies a very small area on the page -- translate it as a "
+        "similarly short interjection or trailing word (1-3 English words, e.g. \"...!\", \"Huh?\", \"Right...\", "
+        "\"I know.\"), never as a full explanatory sentence, even if the source is ambiguous out of context.\n"
+        "Use the full list of items as shared page context: before translating, identify any token that "
+        "repeats across multiple items or looks like a personal name, honorific-attached name, or title "
+        "(rather than a common noun/adjective) and translate it the same way — as a proper noun/name — in "
+        "every item where it appears. Do not translate a name as an unrelated common word (e.g. a name must "
+        "never become an object, animal, place, or furniture word) even if a literal character-by-character "
+        "reading would suggest one.\n"
+        "Still translate each item's own sentence independently for grammar and meaning — only reuse the "
+        "cross-item context for proper-noun and terminology consistency, not for inventing plot relationships.\n"
+        "Understand manga/comic reading direction, connected speech bubbles, character tone, social hierarchy, slang, honorifics, and implied subjects.\n"
+        "Preserve names, SFX tone when translated as dialogue, stutters, ellipses, shouting, short reactions, and punctuation rhythm.\n"
         "Preserve speaker/addressee perspective. Do not swap my/your/his/her/their.\n"
         "Japanese often omits subjects and objects: infer pronouns from local page context only when clear; otherwise use neutral wording instead of inventing ownership.\n"
         "For commands addressed to another person, use second person when the grammar/context implies it.\n"
         "If OCR is slightly noisy, infer the most plausible intended line.\n"
         "Do not include source-language characters in the English output unless they are proper names intentionally romanized.\n"
+        "Keep each translation concise enough for manga typesetting while preserving meaning.\n"
         "Return JSON only, exactly this shape: [{\"id\": 0, \"en_text\": \"...\"}].\n"
         f"Sample: {sample_name}\n"
         f"Items: {json.dumps(compact_items, ensure_ascii=False)}"
@@ -569,6 +766,9 @@ def _parse_translation_response(payload: object) -> dict[int, str]:
         if isinstance(choices, list) and choices:
             message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
             content = str(message.get("content", ""))
+        result = payload.get("result")
+        if not content and isinstance(result, dict):
+            content = str(result.get("response", ""))
         candidates = payload.get("candidates")
         if not content and isinstance(candidates, list) and candidates:
             candidate = candidates[0] if isinstance(candidates[0], dict) else {}
@@ -596,7 +796,11 @@ def _openai_payload(model: str, prompt: str) -> dict[str, object]:
         "messages": [
             {
                 "role": "system",
-                "content": "You translate CJK manga OCR fragments to concise, natural English and return strict JSON only.",
+                "content": (
+                    "You are a senior manga/manhwa/manhua translator. Preserve character voice, "
+                    "speaker perspective, implied subjects, tone, punctuation rhythm, honorific nuance, "
+                    "and layout-safe concision. Return strict JSON only."
+                ),
             },
             {"role": "user", "content": prompt},
         ],
@@ -605,216 +809,313 @@ def _openai_payload(model: str, prompt: str) -> dict[str, object]:
     }
 
 
+
+def _api_max_tokens() -> int:
+    return int(os.environ.get("API_TRANSLATION_MAX_TOKENS", "1400"))
+
+
+def _estimated_translation_tokens(prompt: str) -> int:
+    return API_MANAGER.estimate_tokens(prompt, output_tokens=_api_max_tokens())
+
+
+def _call_with_quota(
+    provider: str,
+    prompt: str,
+    models: list[str],
+    request_builder,
+    parser=_parse_translation_response,
+) -> tuple[dict[int, str], dict[str, object]]:
+    if not API_MANAGER.provider_keys(provider):
+        raise RuntimeError(f"{provider} has no configured API keys")
+    estimated_tokens = _estimated_translation_tokens(prompt)
+    last_error = None
+    for model_index, model in enumerate(models, start=1):
+        attempted_hashes: set[str] = set()
+        while True:
+            try:
+                lease = API_MANAGER.reserve_key(provider, estimated_tokens, capability="translation")
+            except ApiProviderUnavailable as error:
+                raise RuntimeError(str(error)) from error
+            except ApiProviderAuthLocked:
+                raise
+            except ApiRateLimited:
+                raise
+            except ApiQuotaExhausted:
+                raise
+            if lease.key_hash in attempted_hashes:
+                break
+            attempted_hashes.add(lease.key_hash)
+            status, payload, elapsed = request_builder(lease.key, model)
+            if status == 200:
+                API_MANAGER.mark_success(lease, payload)
+                return parser(payload), {
+                    "provider": provider,
+                    "model": model,
+                    "model_index": model_index,
+                    "model_count": len(models),
+                    "key_index": lease.key_index,
+                    "key_count": len(API_MANAGER.provider_keys(provider)),
+                    "key_fingerprint": lease.key_hash[:8],
+                    "http_status": status,
+                    "elapsed_ms": elapsed,
+                    "estimated_tokens": estimated_tokens,
+                }
+            last_error = f"{provider} key {lease.key_index} model {model} HTTP {status}: {_scrub_secret(payload)}"
+            API_MANAGER.mark_failure(lease, status, _scrub_secret(payload))
+            if API_MANAGER.is_terminal_quota_error(status, payload) or status in {401, 402, 403, 429}:
+                continue
+            break
+    raise RuntimeError(last_error or f"{provider} request failed")
+
+
+def _call_openai_compatible(
+    provider: str,
+    prompt: str,
+    endpoint: str,
+    headers_factory,
+    models: list[str],
+) -> tuple[dict[int, str], dict[str, object]]:
+    def request_builder(key: str, model: str):
+        return _http_json(
+            "POST",
+            endpoint,
+            headers=headers_factory(key),
+            payload=_openai_payload(model, prompt),
+        )
+
+    return _call_with_quota(provider, prompt, models, request_builder)
+
+
 def _call_mistral(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
-    keys = _provider_keys("MISTRAL_API_KEYS", "MISTRAL_API_KEY")
-    if not keys:
-        raise RuntimeError("MISTRAL_API_KEY/MISTRAL_API_KEYS is not configured")
     models = _model_candidates(
         ("MISTRAL_TRANSLATION_MODELS", "MISTRAL_TRANSLATION_MODEL"),
-        ["mistral-small-latest", "mistral-medium-latest", "ministral-8b-latest"],
+        ["mistral-large-latest", "mistral-small-latest", "mistral-medium-latest"],
     )
-    last_error = None
-    for key_index, key in _rotated_provider_keys("mistral", keys):
-        key_statuses: list[int] = []
-        for model_index, model in enumerate(models, start=1):
-            status, payload, elapsed = _http_json(
-                "POST",
-                "https://api.mistral.ai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                payload=_openai_payload(model, prompt),
-            )
-            key_statuses.append(status)
-            if status == 200:
-                return _parse_translation_response(payload), {"provider": "mistral", "model": model, "model_index": model_index, "model_count": len(models), "key_index": key_index, "key_count": len(keys), "http_status": status, "elapsed_ms": elapsed}
-            last_error = f"Mistral key {key_index} model {model} HTTP {status}: {_scrub_secret(payload)}"
-        if _auth_or_network_block(key_statuses):
-            _disable_provider_key("mistral", key_index, last_error)
-    if _all_provider_keys_disabled("mistral", keys):
-        raise RuntimeError(_disabled_key_error("mistral"))
-    raise RuntimeError(last_error or "Mistral request failed")
+    return _call_openai_compatible(
+        "mistral",
+        prompt,
+        "https://api.mistral.ai/v1/chat/completions",
+        lambda key: {"Authorization": f"Bearer {key}"},
+        models,
+    )
 
 
 def _call_github(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
-    keys = _provider_keys("GITHUB_API_KEYS", "GITHUB_API_KEY")
-    if not keys:
-        raise RuntimeError("GITHUB_API_KEY/GITHUB_API_KEYS is not configured")
     models = _model_candidates(
         ("GITHUB_TRANSLATION_MODELS", "GITHUB_TRANSLATION_MODEL"),
-        ["openai/gpt-4.1-mini", "openai/gpt-4o-mini", "mistral-ai/mistral-small-2503"],
+        ["openai/gpt-4o-mini", "openai/gpt-4.1-mini", "mistral-ai/mistral-small-2503"],
     )
-    last_error = None
-    for key_index, key in _rotated_provider_keys("github", keys):
-        key_statuses: list[int] = []
-        for model_index, model in enumerate(models, start=1):
-            status, payload, elapsed = _http_json(
-                "POST",
-                "https://models.github.ai/inference/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Accept": "application/vnd.github+json",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                },
-                payload=_openai_payload(model, prompt),
-            )
-            key_statuses.append(status)
-            if status == 200:
-                return _parse_translation_response(payload), {"provider": "github", "model": model, "model_index": model_index, "model_count": len(models), "key_index": key_index, "key_count": len(keys), "http_status": status, "elapsed_ms": elapsed}
-            last_error = f"GitHub Models key {key_index} model {model} HTTP {status}: {_scrub_secret(payload)}"
-        if _auth_or_network_block(key_statuses):
-            _disable_provider_key("github", key_index, last_error)
-    if _all_provider_keys_disabled("github", keys):
-        raise RuntimeError(_disabled_key_error("github"))
-    raise RuntimeError(last_error or "GitHub Models request failed")
+    return _call_openai_compatible(
+        "github",
+        prompt,
+        "https://models.github.ai/inference/chat/completions",
+        lambda key: {
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        models,
+    )
 
 
 def _call_openrouter(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
-    keys = _provider_keys("OPENROUTER_API_KEYS", "OPENROUTER_API_KEY")
-    if not keys:
-        raise RuntimeError("OPENROUTER_API_KEY/OPENROUTER_API_KEYS is not configured")
     models = _model_candidates(
         ("OPENROUTER_TRANSLATION_MODELS", "OPENROUTER_TRANSLATION_MODEL"),
-        ["openrouter/free", "meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-exp:free", "qwen/qwen-2.5-72b-instruct:free"],
+        [
+            "qwen/qwen3-235b-a22b:free",
+            "qwen/qwen-2.5-72b-instruct:free",
+            "google/gemini-2.5-flash",
+            "openai/gpt-4o-mini",
+            "anthropic/claude-3.5-sonnet",
+            "meta-llama/llama-3.3-70b-instruct:free",
+        ],
     )
-    last_error = None
-    for key_index, key in _rotated_provider_keys("openrouter", keys):
-        key_statuses: list[int] = []
-        for model_index, model in enumerate(models, start=1):
-            status, payload, elapsed = _http_json(
-                "POST",
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "HTTP-Referer": "http://127.0.0.1",
-                    "X-Title": "Free Manga Translator Step 7",
-                },
-                payload=_openai_payload(model, prompt),
-            )
-            key_statuses.append(status)
-            if status == 200:
-                return _parse_translation_response(payload), {"provider": "openrouter", "model": model, "model_index": model_index, "model_count": len(models), "key_index": key_index, "key_count": len(keys), "http_status": status, "elapsed_ms": elapsed}
-            last_error = f"OpenRouter key {key_index} model {model} HTTP {status}: {_scrub_secret(payload)}"
-        if _auth_or_network_block(key_statuses):
-            _disable_provider_key("openrouter", key_index, last_error)
-    if _all_provider_keys_disabled("openrouter", keys):
-        raise RuntimeError(_disabled_key_error("openrouter"))
-    raise RuntimeError(last_error or "OpenRouter request failed")
+    return _call_openai_compatible(
+        "openrouter",
+        prompt,
+        "https://openrouter.ai/api/v1/chat/completions",
+        lambda key: {
+            "Authorization": f"Bearer {key}",
+            "HTTP-Referer": "http://127.0.0.1",
+            "X-Title": "Free Manga Translator Step 7",
+        },
+        models,
+    )
 
 
 def _call_groq(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
-    keys = _provider_keys("GROQ_API_KEYS", "GROQ_API_KEY")
-    if not keys:
-        raise RuntimeError("GROQ_API_KEY/GROQ_API_KEYS is not configured")
     models = _model_candidates(
         ("GROQ_TRANSLATION_MODELS", "GROQ_TRANSLATION_MODEL"),
-        ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "openai/gpt-oss-20b", "gemma2-9b-it"],
+        ["qwen/qwen3-32b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b", "llama-3.1-8b-instant"],
     )
-    last_error = None
-    for key_index, key in _rotated_provider_keys("groq", keys):
-        key_statuses: list[int] = []
-        for model_index, model in enumerate(models, start=1):
-            status, payload, elapsed = _http_json(
-                "POST",
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                payload=_openai_payload(model, prompt),
-            )
-            key_statuses.append(status)
-            if status == 200:
-                return _parse_translation_response(payload), {"provider": "groq", "model": model, "model_index": model_index, "model_count": len(models), "key_index": key_index, "key_count": len(keys), "http_status": status, "elapsed_ms": elapsed}
-            last_error = f"Groq key {key_index} model {model} HTTP {status}: {_scrub_secret(payload)}"
-        if _auth_or_network_block(key_statuses):
-            _disable_provider_key("groq", key_index, last_error)
-    if _all_provider_keys_disabled("groq", keys):
-        raise RuntimeError(_disabled_key_error("groq"))
-    raise RuntimeError(last_error or "Groq request failed")
+    return _call_openai_compatible(
+        "groq",
+        prompt,
+        "https://api.groq.com/openai/v1/chat/completions",
+        lambda key: {"Authorization": f"Bearer {key}"},
+        models,
+    )
+
+
+def _call_cerebras(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
+    base_url = os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1").rstrip("/")
+    models = _model_candidates(
+        ("CEREBRAS_TRANSLATION_MODELS", "CEREBRAS_TRANSLATION_MODEL"),
+        ["qwen-3-32b", "llama-3.3-70b", "gpt-oss-120b"],
+    )
+    return _call_openai_compatible(
+        "cerebras",
+        prompt,
+        f"{base_url}/chat/completions",
+        lambda key: {"Authorization": f"Bearer {key}"},
+        models,
+    )
 
 
 def _call_nvidia(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
-    keys = _provider_keys("NVIDIA_API_KEYS", "NVIDIA_API_KEY", "NVIDIA_NIM_API_KEYS", "NVIDIA_NIM_API_KEY")
-    if not keys:
-        raise RuntimeError("NVIDIA_API_KEY/NVIDIA_NIM_API_KEY is not configured")
     base_url = os.environ.get("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
     models = _model_candidates(
         ("NVIDIA_NIM_TRANSLATION_MODELS", "NVIDIA_NIM_TRANSLATION_MODEL"),
-        ["meta/llama-3.1-8b-instruct", "meta/llama-3.1-70b-instruct", "mistralai/mistral-7b-instruct-v0.3"],
+        ["qwen/qwen3-5-122b-a10b", "qwen/qwen3.5-397b-a17b", "meta/llama-3.1-70b-instruct", "mistralai/mistral-7b-instruct-v0.3", "meta/llama-3.1-8b-instruct"],
     )
-    last_error = None
-    for key_index, key in _rotated_provider_keys("nvidia", keys):
-        key_statuses: list[int] = []
-        for model_index, model in enumerate(models, start=1):
-            status, payload, elapsed = _http_json(
-                "POST",
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                payload=_openai_payload(model, prompt),
-            )
-            key_statuses.append(status)
-            if status == 200:
-                return _parse_translation_response(payload), {"provider": "nvidia", "model": model, "model_index": model_index, "model_count": len(models), "key_index": key_index, "key_count": len(keys), "http_status": status, "elapsed_ms": elapsed}
-            last_error = f"NVIDIA NIM key {key_index} model {model} HTTP {status}: {_scrub_secret(payload)}"
-        if _auth_or_network_block(key_statuses):
-            _disable_provider_key("nvidia", key_index, last_error)
-    if _all_provider_keys_disabled("nvidia", keys):
-        raise RuntimeError(_disabled_key_error("nvidia"))
-    raise RuntimeError(last_error or "NVIDIA NIM request failed")
+    return _call_openai_compatible(
+        "nvidia",
+        prompt,
+        f"{base_url}/chat/completions",
+        lambda key: {"Authorization": f"Bearer {key}"},
+        models,
+    )
+
+
+def _call_fireworks(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
+    models = _model_candidates(
+        ("FIREWORKS_TRANSLATION_MODELS", "FIREWORKS_TRANSLATION_MODEL"),
+        [
+            "accounts/fireworks/models/qwen3p235b-a22b",
+            "accounts/fireworks/models/qwen2p5-72b-instruct",
+            "accounts/fireworks/models/llama-v3p1-70b-instruct",
+            "accounts/fireworks/models/llama-v3p1-8b-instruct",
+        ],
+    )
+    return _call_openai_compatible(
+        "fireworks",
+        prompt,
+        "https://api.fireworks.ai/inference/v1/chat/completions",
+        lambda key: {"Authorization": f"Bearer {key}"},
+        models,
+    )
+
+
+def _call_cloudflare(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
+    models = _model_candidates(
+        ("CLOUDFLARE_TRANSLATION_MODELS", "CLOUDFLARE_TRANSLATION_MODEL"),
+        ["@cf/qwen/qwen3-30b-a3b-fp8", "@cf/qwen/qwq-32b", "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", "@cf/qwen/qwen1.5-14b-chat-awq", "@cf/meta/llama-3.1-8b-instruct"],
+    )
+
+    def request_builder(key: str, model: str):
+        keys = API_MANAGER.provider_keys("cloudflare")
+        try:
+            key_index = keys.index(key) + 1
+        except ValueError:
+            key_index = 1
+        account_id = API_MANAGER.cloudflare_account_id_for_key_index(key_index)
+        return _http_json(
+            "POST",
+            f"https://api.cloudflare.com/client/v4/accounts/{urllib.parse.quote(account_id)}/ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            payload=_openai_payload(model, prompt),
+        )
+
+    return _call_with_quota("cloudflare", prompt, models, request_builder)
 
 
 def _call_gemini(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
-    keys = _csv_env("GEMINI_API_KEYS")
-    if not keys:
-        raise RuntimeError("GEMINI_API_KEYS is not configured")
     models = _model_candidates(
         ("GEMINI_TRANSLATION_MODELS", "GEMINI_TRANSLATION_MODEL"),
-        ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash-lite", "gemini-2.0-flash"],
+        ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
     )
-    last_error = None
-    for key_index, key in _rotated_provider_keys("gemini", keys):
-        key_statuses: list[int] = []
-        for model_index, model in enumerate(models, start=1):
-            status, payload, elapsed = _http_json(
-                "POST",
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={urllib.parse.quote(key)}",
-                payload={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "temperature": 0.1,
-                        "maxOutputTokens": int(os.environ.get("API_TRANSLATION_MAX_TOKENS", "1400")),
-                        "responseMimeType": "application/json",
-                    },
+
+    def request_builder(key: str, model: str):
+        return _http_json(
+            "POST",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={urllib.parse.quote(key)}",
+            payload={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": _api_max_tokens(),
+                    "responseMimeType": "application/json",
                 },
-            )
-            key_statuses.append(status)
-            if status == 200:
-                parsed = _parse_translation_response(payload)
-                return parsed, {"provider": "gemini", "model": model, "model_index": model_index, "model_count": len(models), "key_index": key_index, "key_count": len(keys), "http_status": status, "elapsed_ms": elapsed}
-            last_error = f"Gemini key {key_index} model {model} HTTP {status}: {_scrub_secret(payload)}"
-        if _auth_or_network_block(key_statuses):
-            _disable_provider_key("gemini", key_index, last_error)
-    if _all_provider_keys_disabled("gemini", keys):
-        raise RuntimeError(_disabled_key_error("gemini"))
-    raise RuntimeError(last_error or "Gemini request failed")
+            },
+        )
+
+    return _call_with_quota("gemini", prompt, models, request_builder)
 
 
 PROVIDER_CALLS = {
     "mistral": _call_mistral,
     "github": _call_github,
     "gemini": _call_gemini,
+    "cerebras": _call_cerebras,
+    "fireworks": _call_fireworks,
     "openrouter": _call_openrouter,
     "groq": _call_groq,
     "nvidia": _call_nvidia,
+    "cloudflare": _call_cloudflare,
 }
 
 
 def _api_translate_items(items: list[dict[str, object]], sample_name: str) -> tuple[dict[int, str], dict[str, object]]:
     if not _api_translation_enabled():
         return {}, {"enabled": False, "reason": "API translation disabled or no provider keys configured"}
-    prompt = _translation_prompt(items, sample_name)
-    source_by_id = {int(item["id"]): str(item.get("text", "")) for item in items if "id" in item}
+    skipped_ids = [
+        int(item["id"])
+        for item in items
+        if "id" in item and not _source_requires_translation(item.get("text", ""))
+    ]
+    pretranslated_ids = [
+        int(item["id"])
+        for item in items
+        if "id" in item and _source_requires_translation(item.get("text", "")) and _pretranslated_text(item)
+    ]
+    translatable_items = [
+        item
+        for item in items
+        if "id" in item
+        and _source_requires_translation(item.get("text", ""))
+        and int(item["id"]) not in pretranslated_ids
+    ]
+    source_by_id = {int(item["id"]): str(item.get("text", "")) for item in translatable_items}
     pending_ids = set(source_by_id)
     translations: dict[int, str] = {}
     provider_attempts: list[dict[str, object]] = []
+    provider_order = _provider_order()
+    if not pending_ids:
+        return translations, {
+            "enabled": True,
+            "attempts": provider_attempts,
+            "translated": 0,
+            "missing": [],
+            "skipped_nontranslatable": sorted(skipped_ids),
+            "pretranslated": sorted(pretranslated_ids),
+        }
+    if API_MANAGER.all_configured_providers_exhausted(provider_order):
+        if _local_fallback_enabled():
+            return translations, {
+                "enabled": True,
+                "status": "api_quota_exhausted_local_fallback",
+                "reason": DAILY_LIMIT_MESSAGE,
+                "attempts": provider_attempts,
+                "translated": 0,
+                "missing": sorted(pending_ids),
+                "skipped_nontranslatable": sorted(skipped_ids),
+                "pretranslated": sorted(pretranslated_ids),
+            }
+        raise ApiQuotaExhausted(DAILY_LIMIT_MESSAGE)
 
-    for provider in _provider_order():
+    prompt = _translation_prompt(translatable_items, sample_name)
+
+    for provider in provider_order:
         if not pending_ids:
             break
         if provider in API_PROVIDER_DISABLED:
@@ -851,6 +1152,48 @@ def _api_translate_items(items: list[dict[str, object]], sample_name: str) -> tu
                 print(f"  [api-translate] {provider} attempt {attempt}: accepted {accepted}, remaining {len(pending_ids)}")
                 if accepted:
                     break
+            except ApiProviderAuthLocked as error:
+                failure = {
+                    "sample": sample_name,
+                    "provider": provider,
+                    "attempt": attempt,
+                    "error": _scrub_secret(error),
+                    "status": "auth_locked",
+                    "remaining": len(pending_ids),
+                }
+                API_PROVIDER_FAILURES.append(failure)
+                provider_attempts.append(failure)
+                API_PROVIDER_DISABLED[provider] = _scrub_secret(error)
+                print(f"  [api-translate-access-blocked] {provider}: {_scrub_secret(error)}", file=sys.stderr)
+                break
+            except ApiQuotaExhausted as error:
+                failure = {
+                    "sample": sample_name,
+                    "provider": provider,
+                    "attempt": attempt,
+                    "error": _scrub_secret(error),
+                    "status": "quota_exhausted",
+                    "remaining": len(pending_ids),
+                }
+                API_PROVIDER_FAILURES.append(failure)
+                provider_attempts.append(failure)
+                API_PROVIDER_DISABLED[provider] = _scrub_secret(error)
+                print(f"  [api-translate-critical] {provider}: {_scrub_secret(error)}", file=sys.stderr)
+                break
+            except ApiRateLimited as error:
+                failure = {
+                    "sample": sample_name,
+                    "provider": provider,
+                    "attempt": attempt,
+                    "error": _scrub_secret(error),
+                    "status": "rate_limited",
+                    "remaining": len(pending_ids),
+                }
+                API_PROVIDER_FAILURES.append(failure)
+                provider_attempts.append(failure)
+                API_PROVIDER_DISABLED[provider] = _scrub_secret(error)
+                print(f"  [api-translate-rate-limit] {provider}: {_scrub_secret(error)}", file=sys.stderr)
+                break
             except Exception as error:
                 failure = {
                     "sample": sample_name,
@@ -861,27 +1204,42 @@ def _api_translate_items(items: list[dict[str, object]], sample_name: str) -> tu
                 API_PROVIDER_FAILURES.append(failure)
                 provider_attempts.append({**failure, "status": "fail"})
                 print(f"  [api-translate-warn] {provider} attempt {attempt}: {_scrub_secret(error)}", file=sys.stderr)
+                if "no active API keys" in str(error).lower() or "http 401" in str(error).lower() or "http 403" in str(error).lower():
+                    API_PROVIDER_DISABLED[provider] = _scrub_secret(error)
+                    break
                 if attempt < API_RETRIES_PER_PROVIDER:
                     time.sleep(min(4, attempt * 1.5))
                 else:
                     API_PROVIDER_DISABLED[provider] = _scrub_secret(error)
+    if pending_ids and API_MANAGER.all_configured_providers_exhausted(provider_order):
+        if _local_fallback_enabled():
+            provider_attempts.append({
+                "status": "api_quota_exhausted_local_fallback",
+                "reason": DAILY_LIMIT_MESSAGE,
+                "remaining": len(pending_ids),
+            })
+        else:
+            raise ApiQuotaExhausted(DAILY_LIMIT_MESSAGE)
     return translations, {
         "enabled": True,
         "attempts": provider_attempts,
         "translated": len(translations),
         "missing": sorted(pending_ids),
+        "skipped_nontranslatable": sorted(skipped_ids),
+        "pretranslated": sorted(pretranslated_ids),
     }
 
 
-def run_step7_translate():
+def run_step7_translate(sample_map: dict[str, str] | None = None, samples_dir: Path | None = None):
     RUN_NAME = "step_7_translate"
-    samples_dir = sample_root_from_env(DEFAULT_SAMPLES_ROOT)
+    samples_dir = Path(samples_dir) if samples_dir is not None else sample_root_from_env(DEFAULT_SAMPLES_ROOT)
+    sample_map = sample_map or SAMPLE_MAP
     
     print("=" * 60)
     print("  Step 7 — Contextual Translation")
     print("=" * 60)
     
-    for sample_name, img_file in SAMPLE_MAP.items():
+    for sample_name, img_file in sample_map.items():
         ocr_json_path = samples_dir / sample_name / "step_5_ocr" / "ocr_results.json"
         
         if not ocr_json_path.exists():
@@ -889,14 +1247,70 @@ def run_step7_translate():
             
         print(f"\nProcessing {sample_name}")
         ocr_results = json.loads(ocr_json_path.read_text(encoding="utf-8"))
+        ocr_results = _translation_items_with_layout_merges(ocr_results, samples_dir / sample_name)
 
-        api_translations, api_report = _api_translate_items(ocr_results, sample_name)
+        # Reuse translations from a prior run for ids whose source text is
+        # byte-identical to what it was then, so a rerun only pays API cost
+        # for genuinely new/changed ids (Step 6 relayout, retried OCR, etc.).
+        # "fallback" entries are deliberately excluded from the reusable set:
+        # they mean the API was unavailable/rate-limited last time, not that
+        # the text was untranslatable, so a later run with quota available
+        # should get a real shot at them instead of being locked into the
+        # degraded dictionary fallback forever.
+        prior_out_dir = samples_dir / sample_name / RUN_NAME
+        prior_results_path = prior_out_dir / "translation_results.json"
+        reusable_by_id: dict[int, dict[str, object]] = {}
+        if prior_results_path.exists():
+            try:
+                prior_results = json.loads(prior_results_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                prior_results = []
+            for entry in prior_results:
+                if entry.get("translation_source") == "fallback":
+                    continue
+                if "id" not in entry:
+                    continue
+                reusable_by_id[int(entry["id"])] = entry
+
+        reused_ids: set[int] = set()
+        for item in ocr_results:
+            if "id" not in item:
+                continue
+            prior_entry = reusable_by_id.get(int(item["id"]))
+            if prior_entry is not None and prior_entry.get("jp_text") == item.get("text", ""):
+                reused_ids.add(int(item["id"]))
+
+        items_for_api = [item for item in ocr_results if int(item.get("id", -1)) not in reused_ids]
+        api_translations, api_report = _api_translate_items(items_for_api, sample_name)
+        api_report["reused_from_prior_run"] = sorted(reused_ids)
 
         translated_texts = []
         for item in ocr_results:
             item_id = int(item["id"])
+            if item_id in reused_ids:
+                prior_entry = reusable_by_id[item_id]
+                translated_texts.append({
+                    "id": item["id"],
+                    "box": item["box"],
+                    "jp_text": item["text"],
+                    "en_text": prior_entry.get("en_text", ""),
+                    "translation_source": prior_entry.get("translation_source", "api"),
+                    "semantic_role": item.get("semantic_role", ""),
+                })
+                print(f"  [{item['id']}] {item['text'][:30]}  →  {prior_entry.get('en_text', '')[:50]} [reused]")
+                continue
+            vision_text = _pretranslated_text(item)
             api_text = api_translations.get(item_id)
-            if api_text and _valid_api_translation(item["text"], api_text):
+            if vision_text:
+                en_text = _shorten_for_small_box(
+                    _repair_translation_perspective(item["text"], vision_text),
+                    item,
+                )
+                source = "vision"
+            elif not _source_requires_translation(item.get("text", "")):
+                en_text = ""
+                source = "skipped"
+            elif api_text and _valid_api_translation(item["text"], api_text):
                 en_text = _shorten_for_small_box(
                     _repair_translation_perspective(item["text"], api_text),
                     item,
@@ -914,10 +1328,11 @@ def run_step7_translate():
                 "jp_text": item["text"],
                 "en_text": en_text,
                 "translation_source": source,
+                "semantic_role": item.get("semantic_role", ""),
             })
             print(f"  [{item['id']}] {item['text'][:30]}  →  {en_text[:50]} [{source}]")
 
-
+        # === Output ===
         out_dir = samples_dir / sample_name / RUN_NAME
         if out_dir.exists():
             shutil.rmtree(out_dir)
@@ -947,8 +1362,8 @@ def run_step7_translate():
                         for provider, disabled in API_PROVIDER_KEY_DISABLED.items()
                     },
                     "translation_source_counts": {
-                        "api": sum(1 for item in translated_texts if item["translation_source"] == "api"),
-                        "fallback": sum(1 for item in translated_texts if item["translation_source"] == "fallback"),
+                        source: sum(1 for item in translated_texts if item["translation_source"] == source)
+                        for source in sorted({item["translation_source"] for item in translated_texts})
                     },
                 },
                 ensure_ascii=False,

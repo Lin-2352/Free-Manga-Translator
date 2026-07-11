@@ -7,7 +7,7 @@ Step 5 — OCR & Consolidation (v4: Self-Contained Detection)
 4. Save results for Layout and Translation.
 """
 
-
+# --- Clean-copy path bootstrap ---
 from pathlib import Path as _BootstrapPath
 import sys as _bootstrap_sys
 _BOOTSTRAP_FILE = _BootstrapPath(__file__).resolve()
@@ -30,12 +30,27 @@ for _rel in (
     if _path not in _bootstrap_sys.path:
         _bootstrap_sys.path.insert(0, _path)
 del _BootstrapPath, _bootstrap_sys, _BOOTSTRAP_FILE, _candidate, _PROJECT_ROOT_FOR_IMPORTS, _rel, _path
-
+# --- End clean-copy path bootstrap ---
+# torch must be imported before cv2 in this process: on this platform,
+# loading opencv-python's native runtime first and torch's afterward
+# causes a hard segfault (not a catchable exception) the first time a
+# torch-based model (manga-ocr, NLLB) actually runs -- verified via
+# isolated import-order reproduction. Whichever step script imports first
+# in a given process determines the load order for everything downstream,
+# so every entry point that eventually touches cv2 needs this guard.
+import torch  # noqa: F401  (import-order guard, see comment above)
 import json
 import os
+import base64
+import tempfile
+import threading
+import urllib.parse
+import urllib.request
+import urllib.error
 import cv2
 import numpy as np
 from pathlib import Path
+from api_manager import API_MANAGER, ApiProviderAuthLocked, ApiProviderUnavailable, ApiQuotaExhausted, ApiRateLimited
 from pipeline_paths import DEFAULT_SAMPLES_ROOT, sample_root_from_env
 from ml_region_lib import (
     MLConfig, load_ocr_model, load_text_model, load_bubble_model, load_semantic_model,
@@ -52,6 +67,8 @@ _TEXT_HANDLE = None
 _BUBBLE_MODEL = None
 _BUBBLE_DEVICE = None
 _SEMANTIC_HANDLE = None
+_STEP5_RUN_LOCK = threading.RLock()
+ENV_FILE = _PROJECT_ROOT_FOR_IMPORTS / ".env" if "_PROJECT_ROOT_FOR_IMPORTS" in globals() else Path(__file__).resolve().parents[2] / ".env"
 
 
 def _local_cjk_mode() -> bool:
@@ -60,11 +77,17 @@ def _local_cjk_mode() -> bool:
 
 def _sample_cjk_ocr_language(sample_name: str) -> str | None:
     lowered = sample_name.lower()
-    if "_zh_" in lowered or lowered.startswith(("external_zh", "modern_zh", "runtime_zh")):
+    chinese_markers = ("_zh_", "zh_", "_chi", "(chi", "_chinese", "(chinese", "_cn", "(cn")
+    korean_markers = ("_ko_", "ko_", "_kor", "(ko", "(kor", "_korean", "(korean", "_kr", "(kr")
+    if any(marker in lowered for marker in chinese_markers) or lowered.startswith(("external_zh", "modern_zh", "runtime_zh")):
         return "ch_tra"
-    if "_ko_" in lowered or lowered.startswith(("external_ko", "modern_ko", "runtime_ko")):
+    if any(marker in lowered for marker in korean_markers) or lowered.startswith(("external_ko", "modern_ko", "runtime_ko")):
         return "ko"
     return None
+
+
+def _is_chinese_ocr_language(language: str | None) -> bool:
+    return language in {"ch_tra", "ch_sim"}
 
 
 def _easyocr_reader(language: str):
@@ -83,6 +106,7 @@ def _paddleocr_reader(language: str):
         return None
     if language not in _PADDLEOCR_READERS:
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+        os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
         try:
             from paddleocr import PaddleOCR
         except ModuleNotFoundError:
@@ -101,6 +125,519 @@ def _paddleocr_reader(language: str):
     return _PADDLEOCR_READERS[language]
 
 
+def _load_env_file(path: Path = ENV_FILE) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _csv_env(name: str) -> list[str]:
+    return [part.strip() for part in os.environ.get(name, "").split(",") if part.strip()]
+
+
+def _extract_json_array(text: str) -> list[object]:
+    import re
+
+    stripped = str(text or "").strip()
+    stripped = re.sub(r"^```(?:json)?", "", stripped, flags=re.IGNORECASE).strip()
+    stripped = re.sub(r"```$", "", stripped).strip()
+    try:
+        parsed = json.loads(stripped)
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\[[\s\S]*\]", stripped)
+    if not match:
+        return []
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def _tighten_box_with_segmentation(box: Box, seg_mask: np.ndarray | None, img_w: int, img_h: int) -> Box:
+    if seg_mask is None:
+        return box
+    roi = seg_mask[box.y1:box.y2, box.x1:box.x2]
+    if roi.size == 0:
+        return box
+    ys, xs = np.nonzero(roi > 0)
+    if len(xs) < 20:
+        return box
+    tightened = Box(
+        max(0, box.x1 + int(xs.min()) - 2),
+        max(0, box.y1 + int(ys.min()) - 2),
+        min(img_w, box.x1 + int(xs.max()) + 3),
+        min(img_h, box.y1 + int(ys.max()) + 3),
+    )
+    if tightened.width < 8 or tightened.height < 8:
+        return box
+    return tightened
+
+
+def _region_too_art_heavy(image: np.ndarray, box: Box) -> bool:
+    roi = image[box.y1:box.y2, box.x1:box.x2]
+    if roi.size == 0:
+        return True
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    dark_fraction = float(np.mean(gray < 80))
+    pale_fraction = float(np.mean(gray > 235))
+    return dark_fraction > 0.45 and pale_fraction < 0.28
+
+
+def _gemini_vision_region_ocr(
+    image_path: Path,
+    image: np.ndarray,
+    text_boxes: list[Box],
+    language_hint: str,
+    seg_mask: np.ndarray | None = None,
+) -> list[dict]:
+    if os.environ.get("USE_API_VISION_OCR", "auto").strip().lower() in {"0", "false", "no", "off"}:
+        return []
+    _load_env_file()
+    if not API_MANAGER.provider_keys("gemini") or not text_boxes:
+        return []
+
+    img_h, img_w = image.shape[:2]
+    usable_boxes = []
+    for box in text_boxes:
+        tightened = _tighten_box_with_segmentation(box, seg_mask, img_w, img_h)
+        if tightened.width < 8 or tightened.height < 8 or tightened.width * tightened.height < 80:
+            continue
+        if _region_too_art_heavy(image, tightened):
+            continue
+        usable_boxes.append(tightened)
+    usable_boxes = usable_boxes[:24]
+    if not usable_boxes:
+        return []
+
+    region_payload = [
+        {"id": index, "box": [box.x1, box.y1, box.x2, box.y2]}
+        for index, box in enumerate(usable_boxes)
+    ]
+    language_name = "Korean" if language_hint == "ko" else "Chinese"
+    prompt = (
+        f"Image size is exactly {img_w}x{img_h} pixels. "
+        f"OCR and translate only the boxed {language_name}/CJK text regions listed here: "
+        f"{json.dumps(region_payload, ensure_ascii=False)}. "
+        "Return valid JSON only in this exact shape: "
+        "[{\"id\":0,\"source_text\":\"...\",\"english\":\"...\"}]. "
+        "Omit regions that are not readable text. Do not add coordinates."
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": base64.b64encode(image_path.read_bytes()).decode("ascii"),
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": int(os.environ.get("VISION_OCR_MAX_TOKENS", "2048")),
+            "responseMimeType": "application/json",
+        },
+    }
+    models = [
+        model.strip()
+        for model in os.environ.get(
+            "GEMINI_VISION_OCR_MODELS",
+            "gemini-2.5-flash-lite,gemini-2.5-flash,gemini-2.0-flash",
+        ).split(",")
+        if model.strip()
+    ]
+
+    last_error = None
+    estimated_tokens = API_MANAGER.estimate_tokens(prompt, output_tokens=int(os.environ.get("VISION_OCR_MAX_TOKENS", "2048")))
+    for model in models:
+        attempted_hashes: set[str] = set()
+        while True:
+            try:
+                lease = API_MANAGER.reserve_key("gemini", estimated_tokens, capability="vision_ocr")
+            except (ApiProviderUnavailable, ApiProviderAuthLocked, ApiQuotaExhausted, ApiRateLimited) as error:
+                last_error = str(error)
+                break
+            if lease.key_hash in attempted_hashes:
+                break
+            attempted_hashes.add(lease.key_hash)
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{urllib.parse.quote(model)}:generateContent?key={urllib.parse.quote(lease.key)}"
+            )
+            request = urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=max(20, int(os.environ.get("VISION_OCR_TIMEOUT_SECONDS", "60")))) as response:
+                    raw_payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            except urllib.error.HTTPError as error:
+                last_error = f"HTTP {error.code}"
+                API_MANAGER.mark_failure(lease, error.code, last_error)
+                if API_MANAGER.is_terminal_quota_error(error.code, last_error) or error.code in {401, 402, 403, 429}:
+                    continue
+                break
+            except Exception as error:
+                last_error = str(error)[:120]
+                API_MANAGER.mark_failure(lease, 0, last_error)
+                break
+            API_MANAGER.mark_success(lease, raw_payload)
+
+            content = ""
+            for candidate in raw_payload.get("candidates", []):
+                parts = (candidate.get("content") or {}).get("parts", [])
+                content += "\n".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
+            parsed = _extract_json_array(content)
+            final_results = []
+            seen_boxes: list[Box] = []
+            for entry in parsed:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    region_id = int(entry.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if region_id < 0 or region_id >= len(usable_boxes):
+                    continue
+                source_text = str(entry.get("source_text") or entry.get("text") or "").strip()
+                english_text = str(entry.get("english") or entry.get("en_text") or entry.get("translation") or "").strip()
+                if _script_count(source_text, "hangul") + _script_count(source_text, "han") < 2:
+                    continue
+                if not english_text or not any(ch.isalpha() for ch in english_text):
+                    continue
+                red_box = usable_boxes[region_id].expanded(4, img_w, img_h)
+                if any(_boxes_overlap(red_box, existing) > 0.76 for existing in seen_boxes):
+                    continue
+                seen_boxes.append(red_box)
+                green_box = red_box.expanded(max(8, min(24, int(min(red_box.width, red_box.height) * 0.12))), img_w, img_h)
+                final_results.append(
+                    {
+                        "id": len(final_results),
+                        "text": source_text,
+                        "pretranslated_text": english_text,
+                        "ocr_provider": f"gemini_vision_ocr:{model}",
+                        "ocr_confidence": None,
+                        "box": {k: int(v) for k, v in red_box.to_dict().items()},
+                        "erase_boxes": [{k: int(v) for k, v in red_box.to_dict().items()}],
+                        "green_box": {k: int(v) for k, v in green_box.to_dict().items()},
+                        "green_polygon": [
+                            [green_box.x1, green_box.y1],
+                            [green_box.x2, green_box.y1],
+                            [green_box.x2, green_box.y2],
+                            [green_box.x1, green_box.y2],
+                        ],
+                        "route": "floating_dialogue",
+                        "bubble_idx": -1,
+                        "mask_mode": "stroke",
+                        "fallback_source": "gemini_vision_region_ocr",
+                        "force_bubble_cleanup": False,
+                    }
+                )
+            if final_results:
+                print(f"  [vision-ocr] Gemini recovered {len(final_results)} regions with {model}")
+                return final_results
+            break
+    if last_error:
+        print(f"  [vision-ocr warn] Gemini region OCR failed: {last_error}")
+    return []
+
+
+def _openai_compatible_vision_region_ocr(
+    image_path: Path,
+    image: np.ndarray,
+    text_boxes: list[Box],
+    language_hint: str,
+    seg_mask: np.ndarray | None,
+    provider: str,
+    provider_label: str,
+    endpoint: str,
+    headers_factory,
+    model_env_names: tuple[str, ...],
+    default_models: list[str],
+    max_tokens_field: str = "max_tokens",
+) -> list[dict]:
+    if os.environ.get("USE_API_VISION_OCR", "auto").strip().lower() in {"0", "false", "no", "off"}:
+        return []
+    _load_env_file()
+    if not API_MANAGER.provider_keys(provider) or not text_boxes:
+        return []
+
+    img_h, img_w = image.shape[:2]
+    usable_boxes = []
+    for box in text_boxes:
+        tightened = _tighten_box_with_segmentation(box, seg_mask, img_w, img_h)
+        if tightened.width < 8 or tightened.height < 8 or tightened.width * tightened.height < 80:
+            continue
+        if _region_too_art_heavy(image, tightened):
+            continue
+        usable_boxes.append(tightened)
+    usable_boxes = usable_boxes[:24]
+    if not usable_boxes:
+        return []
+
+    region_payload = [
+        {"id": index, "box": [box.x1, box.y1, box.x2, box.y2]}
+        for index, box in enumerate(usable_boxes)
+    ]
+    language_name = "Korean" if language_hint == "ko" else "Chinese"
+    prompt = (
+        f"Image size is exactly {img_w}x{img_h} pixels. "
+        f"OCR and translate only the boxed {language_name}/CJK text regions listed here: "
+        f"{json.dumps(region_payload, ensure_ascii=False)}. "
+        "Return valid JSON only in this exact shape: "
+        "[{\"id\":0,\"source_text\":\"...\",\"english\":\"...\"}]. "
+        "For mixed Hangul/Hanja or historical vertical Korean text, preserve the source_text as read, "
+        "then provide concise natural English. Omit unreadable text, SFX, logos, and artwork. "
+        "Do not add coordinates."
+    )
+    image_data_url = "data:image/jpeg;base64," + base64.b64encode(image_path.read_bytes()).decode("ascii")
+    max_tokens = int(os.environ.get("VISION_OCR_MAX_TOKENS", "2048"))
+    payload_template = {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a careful manga/manhwa/manhua OCR and translation assistant. "
+                    "You only return strict JSON and never invent unreadable text."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            },
+        ],
+        "temperature": 0.0,
+        max_tokens_field: max_tokens,
+    }
+    model_env = next((os.environ.get(name, "").strip() for name in model_env_names if os.environ.get(name, "").strip()), "")
+    models = [model.strip() for model in (model_env or ",".join(default_models)).split(",") if model.strip()]
+
+    last_error = None
+    estimated_tokens = API_MANAGER.estimate_tokens(prompt, output_tokens=max_tokens)
+    for model in models:
+        attempted_hashes: set[str] = set()
+        while True:
+            try:
+                lease = API_MANAGER.reserve_key(provider, estimated_tokens, capability="vision_ocr")
+            except (ApiProviderUnavailable, ApiProviderAuthLocked, ApiQuotaExhausted, ApiRateLimited) as error:
+                last_error = str(error)
+                break
+            if lease.key_hash in attempted_hashes:
+                break
+            attempted_hashes.add(lease.key_hash)
+            payload = dict(payload_template)
+            payload["model"] = model
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                method="POST",
+                headers=headers_factory(lease.key),
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=max(20, int(os.environ.get("VISION_OCR_TIMEOUT_SECONDS", "60")))) as response:
+                    raw_payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            except urllib.error.HTTPError as error:
+                body = error.read().decode("utf-8", errors="replace")[:1000]
+                last_error = f"HTTP {error.code}: {body or error.reason}"
+                API_MANAGER.mark_failure(lease, error.code, last_error)
+                if API_MANAGER.is_terminal_quota_error(error.code, last_error) or error.code in {401, 402, 403, 429}:
+                    continue
+                break
+            except Exception as error:
+                last_error = str(error)[:180]
+                API_MANAGER.mark_failure(lease, 0, last_error)
+                break
+            API_MANAGER.mark_success(lease, raw_payload)
+
+            content_parts = []
+            for choice in raw_payload.get("choices", []):
+                message = choice.get("message") if isinstance(choice, dict) else None
+                content = message.get("content") if isinstance(message, dict) else ""
+                if isinstance(content, str):
+                    content_parts.append(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            content_parts.append(str(part.get("text", "")))
+            parsed = _extract_json_array("\n".join(content_parts))
+            final_results = []
+            seen_boxes: list[Box] = []
+            for entry in parsed:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    region_id = int(entry.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if region_id < 0 or region_id >= len(usable_boxes):
+                    continue
+                source_text = str(entry.get("source_text") or entry.get("text") or "").strip()
+                english_text = str(entry.get("english") or entry.get("en_text") or entry.get("translation") or "").strip()
+                if _script_count(source_text, "hangul") + _script_count(source_text, "han") < 2:
+                    continue
+                if not english_text or not any(ch.isalpha() for ch in english_text):
+                    continue
+                red_box = usable_boxes[region_id].expanded(4, img_w, img_h)
+                if any(_boxes_overlap(red_box, existing) > 0.76 for existing in seen_boxes):
+                    continue
+                seen_boxes.append(red_box)
+                green_box = red_box.expanded(max(8, min(24, int(min(red_box.width, red_box.height) * 0.12))), img_w, img_h)
+                final_results.append(
+                    {
+                        "id": len(final_results),
+                        "text": source_text,
+                        "pretranslated_text": english_text,
+                        "ocr_provider": f"{provider}_vision_ocr:{model}",
+                        "ocr_confidence": None,
+                        "box": {k: int(v) for k, v in red_box.to_dict().items()},
+                        "erase_boxes": [{k: int(v) for k, v in red_box.to_dict().items()}],
+                        "green_box": {k: int(v) for k, v in green_box.to_dict().items()},
+                        "green_polygon": [
+                            [green_box.x1, green_box.y1],
+                            [green_box.x2, green_box.y1],
+                            [green_box.x2, green_box.y2],
+                            [green_box.x1, green_box.y2],
+                        ],
+                        "route": "floating_dialogue",
+                        "bubble_idx": -1,
+                        "mask_mode": "stroke",
+                        "fallback_source": f"{provider}_vision_region_ocr",
+                        "force_bubble_cleanup": False,
+                    }
+                )
+            if final_results:
+                print(f"  [vision-ocr] {provider_label} recovered {len(final_results)} regions with {model}")
+                return final_results
+            break
+    if last_error:
+        print(f"  [vision-ocr warn] {provider_label} region OCR failed: {last_error}")
+    return []
+
+
+def _openrouter_vision_region_ocr(
+    image_path: Path,
+    image: np.ndarray,
+    text_boxes: list[Box],
+    language_hint: str,
+    seg_mask: np.ndarray | None = None,
+) -> list[dict]:
+    return _openai_compatible_vision_region_ocr(
+        image_path,
+        image,
+        text_boxes,
+        language_hint,
+        seg_mask,
+        "openrouter",
+        "OpenRouter",
+        "https://openrouter.ai/api/v1/chat/completions",
+        lambda key: {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}",
+            "HTTP-Referer": "http://127.0.0.1",
+            "X-Title": "Free Manga Translator Step 5 Vision OCR",
+        },
+        ("OPENROUTER_VISION_OCR_MODELS", "OPENROUTER_VISION_OCR_MODEL"),
+        ["qwen/qwen2.5-vl-72b-instruct:free", "qwen/qwen2.5-vl-72b-instruct", "google/gemini-2.5-flash"],
+    )
+
+
+def _groq_vision_region_ocr(
+    image_path: Path,
+    image: np.ndarray,
+    text_boxes: list[Box],
+    language_hint: str,
+    seg_mask: np.ndarray | None = None,
+) -> list[dict]:
+    return _openai_compatible_vision_region_ocr(
+        image_path,
+        image,
+        text_boxes,
+        language_hint,
+        seg_mask,
+        "groq",
+        "Groq",
+        "https://api.groq.com/openai/v1/chat/completions",
+        lambda key: {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        ("GROQ_VISION_OCR_MODELS", "GROQ_VISION_OCR_MODEL"),
+        ["meta-llama/llama-4-scout-17b-16e-instruct"],
+        "max_completion_tokens",
+    )
+
+
+def _github_vision_region_ocr(
+    image_path: Path,
+    image: np.ndarray,
+    text_boxes: list[Box],
+    language_hint: str,
+    seg_mask: np.ndarray | None = None,
+) -> list[dict]:
+    return _openai_compatible_vision_region_ocr(
+        image_path,
+        image,
+        text_boxes,
+        language_hint,
+        seg_mask,
+        "github",
+        "GitHub Models",
+        "https://models.github.ai/inference/chat/completions",
+        lambda key: {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        ("GITHUB_VISION_OCR_MODELS", "GITHUB_VISION_OCR_MODEL"),
+        ["openai/gpt-4o-mini", "openai/gpt-4o"],
+    )
+
+
+def _nvidia_vision_region_ocr(
+    image_path: Path,
+    image: np.ndarray,
+    text_boxes: list[Box],
+    language_hint: str,
+    seg_mask: np.ndarray | None = None,
+) -> list[dict]:
+    base_url = os.environ.get("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
+    return _openai_compatible_vision_region_ocr(
+        image_path,
+        image,
+        text_boxes,
+        language_hint,
+        seg_mask,
+        "nvidia",
+        "NVIDIA NIM",
+        f"{base_url}/chat/completions",
+        lambda key: {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        ("NVIDIA_NIM_VISION_OCR_MODELS", "NVIDIA_NIM_VISION_OCR_MODEL", "NVIDIA_VISION_OCR_MODELS", "NVIDIA_VISION_OCR_MODEL"),
+        [
+            "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
+            "meta/llama-3.2-11b-vision-instruct",
+            "meta/llama-3.2-90b-vision-instruct",
+        ],
+    )
+
+
 def _script_count(text: str, script: str) -> int:
     import re
 
@@ -112,11 +649,12 @@ def _script_count(text: str, script: str) -> int:
     return len(re.findall(patterns[script], text or ""))
 
 
-def _combine_easyocr_results(results: list, language: str) -> dict:
+def _combine_easyocr_results(results: list, language: str, min_confidence: float | None = None) -> dict:
     if not results:
         return {"text": "", "confidence": 0.0}
 
-    min_confidence = 0.35 if language == "ch_tra" else 0.55
+    if min_confidence is None:
+        min_confidence = 0.35 if _is_chinese_ocr_language(language) else 0.55
     kept = []
     for polygon, text, confidence in results:
         clean_text = str(text or "").strip()
@@ -124,7 +662,7 @@ def _combine_easyocr_results(results: list, language: str) -> dict:
             continue
         if language == "ko" and _script_count(clean_text, "hangul") == 0:
             continue
-        if language == "ch_tra" and _script_count(clean_text, "han") == 0:
+        if _is_chinese_ocr_language(language) and _script_count(clean_text, "han") == 0:
             continue
         xs = [point[0] for point in polygon]
         ys = [point[1] for point in polygon]
@@ -148,6 +686,117 @@ def _combine_easyocr_results(results: list, language: str) -> dict:
     return {"text": text, "confidence": confidence}
 
 
+def _easyocr_rescue_variants(crop_rgb: np.ndarray) -> list[np.ndarray]:
+    if crop_rgb.size == 0:
+        return []
+    variants = [crop_rgb]
+    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+    variants.append(cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB))
+    for scale in (2, 3):
+        up_gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        variants.append(cv2.cvtColor(up_gray, cv2.COLOR_GRAY2RGB))
+        sharpened = cv2.addWeighted(
+            up_gray,
+            1.45,
+            cv2.GaussianBlur(up_gray, (0, 0), 1.0),
+            -0.45,
+            0,
+        )
+        variants.append(cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB))
+        if min(up_gray.shape[:2]) >= 24:
+            threshold = cv2.adaptiveThreshold(
+                up_gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                31,
+                7,
+            )
+            variants.append(cv2.cvtColor(threshold, cv2.COLOR_GRAY2RGB))
+    return variants
+
+
+def _read_easyocr_rescue(crop_rgb: np.ndarray, language: str) -> dict:
+    script = "han" if _is_chinese_ocr_language(language) else "hangul"
+    min_confidence = 0.18 if _is_chinese_ocr_language(language) else 0.32
+    best = {"text": "", "confidence": 0.0, "script_count": 0}
+    reader = _easyocr_reader(language)
+
+    for variant in _easyocr_rescue_variants(crop_rgb):
+        try:
+            results = reader.readtext(
+                variant,
+                detail=1,
+                paragraph=False,
+                batch_size=4,
+                contrast_ths=0.01,
+                adjust_contrast=1.0,
+                text_threshold=0.25,
+                low_text=0.1,
+                link_threshold=0.2,
+            )
+        except Exception:
+            continue
+        combined = _combine_easyocr_results(results, language, min_confidence=min_confidence)
+        text = str(combined.get("text") or "").strip()
+        script_count = _script_count(text, script)
+        if script_count == 0:
+            continue
+        score = (
+            script_count,
+            float(combined.get("confidence") or 0.0),
+            len(text),
+        )
+        best_score = (
+            int(best.get("script_count") or 0),
+            float(best.get("confidence") or 0.0),
+            len(str(best.get("text") or "")),
+        )
+        if score > best_score:
+            best = {
+                "text": text,
+                "confidence": round(float(combined.get("confidence") or 0.0), 4),
+                "script_count": script_count,
+            }
+
+    if not best["text"]:
+        return {"text": "", "provider": f"easyocr_{language}_rescue", "confidence": 0.0}
+    return {
+        "text": best["text"],
+        "provider": f"easyocr_{language}_rescue",
+        "confidence": best["confidence"],
+    }
+
+
+def _crop_dark_flat_background(crop_bgr: np.ndarray, seg_crop: np.ndarray | None = None) -> bool:
+    """True when a crop's non-glyph background is confidently dark and flat --
+    a solid dark UI panel or reverse-polarity bubble fill, not textured dark
+    art/shading. OCR here is tuned for dark-text-on-light; feeding it a crop
+    like this backwards can produce plausible-looking garbage rather than an
+    outright failure (verified: a dark promo banner with white knockout text
+    OCR'd to fluent-looking nonsense instead of erroring, so a
+    confidence/failure-gated retry can't catch it -- inversion has to be
+    decided from the crop's own pixel statistics before the first attempt).
+    Requires BOTH a dark majority and low variance among the dark pixels, so
+    a real dark textured surface (hair, night sky, screentone) -- which
+    varies a lot tonally even though its average is dark -- does not qualify.
+    """
+    if crop_bgr.size == 0:
+        return False
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    if seg_crop is not None and seg_crop.shape == gray.shape:
+        background = gray[seg_crop <= 0]
+    else:
+        background = gray.reshape(-1)
+    if background.size < 40:
+        return False
+    dark_pixels = background[background < 100]
+    dark_fraction = dark_pixels.size / float(background.size)
+    if dark_fraction < 0.45:
+        return False
+    return float(np.std(dark_pixels)) <= 18.0
+
+
 class LocalCjkOcr:
     def __init__(self, manga_ocr_model, language: str | None):
         self.manga_ocr_model = manga_ocr_model
@@ -156,29 +805,107 @@ class LocalCjkOcr:
     def __call__(self, pil_image):
         return self.read_pil(pil_image)["text"]
 
-    def read_pil(self, pil_image) -> dict:
+    def read_pil(self, pil_image, seg_crop: np.ndarray | None = None) -> dict:
+        from PIL import Image
+
+        global _MANGA_OCR_MODEL
+        crop_rgb = np.array(pil_image.convert("RGB"))
         if not self.language:
+            crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+            if _crop_dark_flat_background(crop_bgr, seg_crop):
+                inverted = Image.fromarray(255 - crop_rgb)
+                text = self.manga_ocr_model(inverted)
+                return {"text": text, "provider": "manga_ocr_inverted", "confidence": None}
             text = self.manga_ocr_model(pil_image)
             return {"text": text, "provider": "manga_ocr", "confidence": None}
 
-        crop_rgb = np.array(pil_image.convert("RGB"))
-        try:
-            results = _easyocr_reader(self.language).readtext(
-                crop_rgb,
-                detail=1,
-                paragraph=False,
-                batch_size=8,
-                contrast_ths=0.05,
-                adjust_contrast=0.7,
-                text_threshold=0.4,
-                low_text=0.2,
-                link_threshold=0.3,
-            )
-        except Exception as error:
-            print(f"  [EasyOCR warn] {self.language}: {str(error)[:100]}")
+        def _run_easyocr(rgb_variant):
+            try:
+                results = _easyocr_reader(self.language).readtext(
+                    rgb_variant,
+                    detail=1,
+                    paragraph=False,
+                    batch_size=8,
+                    contrast_ths=0.05,
+                    adjust_contrast=0.7,
+                    text_threshold=0.4,
+                    low_text=0.2,
+                    link_threshold=0.3,
+                )
+            except Exception as error:
+                print(f"  [EasyOCR warn] {self.language}: {str(error)[:100]}")
+                return None
+            return _combine_easyocr_results(results, self.language)
+
+        combined = _run_easyocr(crop_rgb)
+        crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+        if _crop_dark_flat_background(crop_bgr, seg_crop):
+            inverted_combined = _run_easyocr(255 - crop_rgb)
+            if inverted_combined is not None and (
+                combined is None
+                or float(inverted_combined["confidence"]) > float(combined["confidence"])
+            ):
+                combined = inverted_combined
+        if combined is None:
             return {"text": "", "provider": f"easyocr_{self.language}", "confidence": 0.0}
 
-        combined = _combine_easyocr_results(results, self.language)
+        script = "han" if _is_chinese_ocr_language(self.language) else "hangul"
+        if _script_count(str(combined["text"]), script) == 0:
+            rescued = _read_easyocr_rescue(crop_rgb, self.language)
+            if rescued["text"]:
+                return rescued
+            if _is_chinese_ocr_language(self.language):
+                if _MANGA_OCR_MODEL is None:
+                    _MANGA_OCR_MODEL = load_ocr_model(force_cpu=False)
+                try:
+                    manga_text = str(_MANGA_OCR_MODEL(pil_image) or "").strip()
+                except Exception as error:
+                    print(f"  [MangaOCR warn] Chinese rescue failed: {str(error)[:100]}")
+                    manga_text = ""
+                if _script_count(manga_text, "han") > 0:
+                    return {
+                        "text": manga_text,
+                        "provider": "manga_ocr_ch_rescue",
+                        "confidence": 0.42,
+                    }
+            elif self.language == "ko" and crop_rgb.shape[1] >= crop_rgb.shape[0]:
+                # Landscape crops only (width >= height): a horizontal line
+                # of modern Korean, matching the confirmed target case
+                # (new_sample_14's "썸머스쿨" label, a 207x57 landscape
+                # crop). Tall/narrow PORTRAIT crops belong to the separate
+                # vertical-column Korean pipeline (external_ko_2's archaic-
+                # script columns, e.g. 79x303) which already runs its own
+                # dedicated PaddleOCR pass upstream and groups results by
+                # provider-name uniformity -- verified directly that
+                # rescuing individual sub-segments there with a different
+                # provider string ("_rescue" vs the group's plain
+                # "paddleocr_ko") broke that pass's grouping and produced
+                # WORSE results (A/B tested: disabling this rescue restored
+                # the original "paddleocr_ko_grouped" output exactly).
+                # Landscape-only keeps this fix scoped to the failure mode
+                # it was actually diagnosed against.
+                try:
+                    paddle_reader = _paddleocr_reader("ko")
+                    paddle_results = paddle_reader.predict(crop_rgb[:, :, ::-1]) if paddle_reader is not None else []
+                    paddle_text = ""
+                    paddle_score = 0.0
+                    for payload in paddle_results:
+                        texts = payload.get("rec_texts") or []
+                        scores = payload.get("rec_scores") or []
+                        if texts:
+                            paddle_text = str(texts[0] or "").strip()
+                            paddle_score = float(scores[0]) if scores else 0.0
+                            break
+                except Exception as error:
+                    print(f"  [PaddleOCR warn] Korean rescue failed: {str(error)[:100]}")
+                    paddle_text = ""
+                    paddle_score = 0.0
+                if _script_count(paddle_text, "hangul") > 0 and paddle_score >= 0.55:
+                    return {
+                        "text": paddle_text,
+                        "provider": "paddleocr_ko_rescue",
+                        "confidence": round(paddle_score, 4),
+                    }
         return {
             "text": combined["text"],
             "provider": f"easyocr_{self.language}",
@@ -186,14 +913,14 @@ class LocalCjkOcr:
         }
 
 
-def _read_ocr_crop(ocr_runtime, crop) -> dict:
+def _read_ocr_crop(ocr_runtime, crop, seg_crop=None) -> dict:
     from PIL import Image
 
     if crop.size == 0:
         return {"text": "", "provider": "empty", "confidence": 0.0}
     pil_crop = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
     if hasattr(ocr_runtime, "read_pil"):
-        return ocr_runtime.read_pil(pil_crop)
+        return ocr_runtime.read_pil(pil_crop, seg_crop)
     text = ocr_runtime(pil_crop)
     return {"text": text, "provider": "manga_ocr", "confidence": None}
 
@@ -255,6 +982,67 @@ def _paddle_result_payload(result) -> dict:
     return {}
 
 
+def _axis_tiles(length: int, tile_size: int, overlap: int) -> list[tuple[int, int]]:
+    if length <= tile_size:
+        return [(0, length)]
+    ranges: list[tuple[int, int]] = []
+    stride = max(1, tile_size - overlap)
+    start = 0
+    while start < length:
+        end = min(length, start + tile_size)
+        ranges.append((start, end))
+        if end >= length:
+            break
+        start = max(0, end - overlap)
+        if ranges and start <= ranges[-1][0]:
+            start = ranges[-1][0] + stride
+    return ranges
+
+
+def _paddle_page_payloads(reader, image_path: Path, image, label: str):
+    img_h, img_w = image.shape[:2]
+    try:
+        max_side = max(1200, int(os.environ.get("PADDLE_OCR_MAX_TILE_SIDE", "3600")))
+    except ValueError:
+        max_side = 3600
+    try:
+        overlap = max(64, int(os.environ.get("PADDLE_OCR_TILE_OVERLAP", "180")))
+    except ValueError:
+        overlap = 180
+
+    if max(img_w, img_h) <= max_side:
+        try:
+            for result in reader.predict(str(image_path)):
+                yield _paddle_result_payload(result), 0, 0, img_w, img_h
+        except Exception as error:
+            print(f"  [PaddleOCR warn] {label}: {str(error)[:120]}")
+        return
+
+    x_tiles = _axis_tiles(img_w, max_side, overlap)
+    y_tiles = _axis_tiles(img_h, max_side, overlap)
+    print(f"  [paddle-{label}] tiled native page OCR {len(x_tiles) * len(y_tiles)} tiles max_side={max_side}")
+    for x1, x2 in x_tiles:
+        for y1, y2 in y_tiles:
+            crop = image[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            tmp_name = ""
+            try:
+                with tempfile.NamedTemporaryFile(prefix=f"fmt_paddle_{label}_", suffix=".jpg", delete=False) as tmp:
+                    tmp_name = tmp.name
+                cv2.imwrite(tmp_name, crop)
+                for result in reader.predict(tmp_name):
+                    yield _paddle_result_payload(result), x1, y1, x2 - x1, y2 - y1
+            except Exception as error:
+                print(f"  [PaddleOCR warn] {label} tile {x1},{y1}: {str(error)[:120]}")
+            finally:
+                if tmp_name:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+
+
 def _boxes_overlap(left: Box, right: Box) -> float:
     inter_x1 = max(left.x1, right.x1)
     inter_y1 = max(left.y1, right.y1)
@@ -265,6 +1053,304 @@ def _boxes_overlap(left: Box, right: Box) -> float:
     intersection = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
     smaller = min(max(1, left.width * left.height), max(1, right.width * right.height))
     return intersection / smaller
+
+
+def _box_from_payload(payload: dict) -> Box:
+    return Box(
+        int(payload.get("x1", 0)),
+        int(payload.get("y1", 0)),
+        int(payload.get("x2", 0)),
+        int(payload.get("y2", 0)),
+    )
+
+
+def _usable_cjk_text_count(items: list[dict], language: str | None) -> int:
+    if language == "ko":
+        scripts = ("hangul", "han")
+    elif language in {"ch_tra", "ch_sim"}:
+        scripts = ("han",)
+    else:
+        return sum(1 for item in items if str(item.get("text") or "").strip())
+    count = 0
+    for item in items:
+        text = str(item.get("text") or "").strip()
+        if sum(_script_count(text, script) for script in scripts) >= 2:
+            count += 1
+    return count
+
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _step1_detection_is_stale(image_path: Path, detect_dir: Path) -> bool:
+    image_mtime = _safe_mtime(image_path)
+    if image_mtime <= 0:
+        return False
+    required_outputs = [
+        detect_dir / "detections.json",
+        detect_dir / "seg_mask.png",
+        detect_dir / "semantic_detections.json",
+    ]
+    if any(not output.exists() for output in required_outputs):
+        return True
+    if any(_safe_mtime(output) + 0.01 < image_mtime for output in required_outputs):
+        return True
+    bubble_outputs = sorted(detect_dir.glob("bubble_*.png"))
+    return any(_safe_mtime(output) + 0.01 < image_mtime for output in bubble_outputs)
+
+
+def _clear_stale_step1_outputs(detect_dir: Path) -> None:
+    for pattern in ("bubble_*.png", "detections.json", "seg_mask.png", "semantic_detections.json"):
+        for old_output in detect_dir.glob(pattern):
+            try:
+                old_output.unlink()
+            except OSError:
+                pass
+
+
+def _box_mask_overlap_fraction(mask: np.ndarray, box: Box) -> float:
+    if mask is None:
+        return 0.0
+    img_h, img_w = mask.shape[:2]
+    x1 = max(0, min(img_w, int(box.x1)))
+    y1 = max(0, min(img_h, int(box.y1)))
+    x2 = max(0, min(img_w, int(box.x2)))
+    y2 = max(0, min(img_h, int(box.y2)))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    roi = mask[y1:y2, x1:x2] > 0
+    return float(np.count_nonzero(roi)) / float(max(1, roi.size))
+
+
+def _text_box_supports_bubble(mask_bounds: tuple[int, int, int, int], box: Box, overlap_fraction: float) -> bool:
+    if overlap_fraction < 0.14:
+        return False
+    bx1, by1, bx2, by2 = mask_bounds
+    mask_w = max(1, bx2 - bx1)
+    mask_h = max(1, by2 - by1)
+    mask_area = max(1, mask_w * mask_h)
+    box_w = max(1, int(box.x2) - int(box.x1))
+    box_h = max(1, int(box.y2) - int(box.y1))
+    box_area_ratio = (box_w * box_h) / float(mask_area)
+    box_aspect = box_w / float(box_h)
+    horizontal_dialogue = (
+        box_w >= max(120, int(mask_w * 0.44))
+        and box_h <= max(int(mask_h * 0.78), 42)
+        and box_aspect >= 1.9
+    )
+    vertical_dialogue = (
+        box_h >= max(64, int(mask_h * 0.32))
+        and box_w <= max(int(mask_w * 0.72), 54)
+        and box_aspect <= 0.78
+    )
+    broad_text_block = (
+        box_area_ratio >= 0.32
+        and (box_w >= int(mask_w * 0.40) or box_h >= int(mask_h * 0.40))
+    )
+    return horizontal_dialogue or vertical_dialogue or broad_text_block
+
+
+def _bubble_mask_has_dialogue_text_support(mask: np.ndarray, text_boxes: list[Box]) -> bool:
+    bounds = _mask_bounds(mask)
+    if bounds is None:
+        return False
+    bx1, by1, bx2, by2 = bounds
+    mask_w = max(1, bx2 - bx1)
+    mask_h = max(1, by2 - by1)
+    mask_area = max(1, mask_w * mask_h)
+    if np.count_nonzero(mask > 0) < max(120, int(mask_area * 0.18)):
+        return False
+    if not text_boxes:
+        return True
+    for box in text_boxes:
+        overlap = _box_mask_overlap_fraction(mask, box)
+        if _text_box_supports_bubble(bounds, box, overlap):
+            return True
+    return False
+
+
+def _rewrite_bubble_mask_outputs(detect_dir: Path, bubble_masks: list[np.ndarray]) -> None:
+    for old_output in detect_dir.glob("bubble_*.png"):
+        try:
+            old_output.unlink()
+        except OSError:
+            pass
+    for i, mask in enumerate(bubble_masks):
+        if mask is not None:
+            cv2.imwrite(str(detect_dir / f"bubble_{i}.png"), mask)
+
+
+def _filter_and_save_bubble_masks(
+    detect_dir: Path,
+    bubble_masks: list[np.ndarray],
+    text_boxes: list[Box],
+) -> list[np.ndarray]:
+    if not bubble_masks:
+        _rewrite_bubble_mask_outputs(detect_dir, [])
+        return []
+    kept = [
+        mask
+        for mask in bubble_masks
+        if _bubble_mask_has_dialogue_text_support(mask, text_boxes)
+    ]
+    if text_boxes and kept and len(kept) < len(bubble_masks):
+        print(f"  [bubble-filter] kept {len(kept)}/{len(bubble_masks)} dialogue-supported masks")
+        bubble_masks = kept
+    _rewrite_bubble_mask_outputs(detect_dir, bubble_masks)
+    return bubble_masks
+
+
+def _korean_script_chars(text: str) -> int:
+    return _script_count(text, "hangul") + _script_count(text, "han")
+
+
+def _korean_ocr_quality_score(items: list[dict]) -> float:
+    if not items:
+        return -1000.0
+    score = 0.0
+    usable_count = 0
+    short_count = 0
+    for item in items:
+        text = str(item.get("text") or "").strip()
+        chars = _korean_script_chars(text)
+        if chars <= 0:
+            score -= 1.0
+            continue
+        if chars == 1:
+            short_count += 1
+            score -= 0.35
+            continue
+        usable_count += 1
+        score += min(12, chars) * 0.75
+        score += min(4, len(text.split())) * 0.6
+    score += usable_count * 1.5
+    score -= max(0, len(items) - 12) * 0.35
+    score -= short_count * 0.45
+    return score
+
+
+def _korean_ocr_is_fragmented(items: list[dict]) -> bool:
+    korean_counts = [
+        _korean_script_chars(str(item.get("text") or "").strip())
+        for item in items
+        if _korean_script_chars(str(item.get("text") or "").strip()) > 0
+    ]
+    if len(korean_counts) < 6:
+        return False
+    short_count = sum(1 for count in korean_counts if count <= 1)
+    usable_count = sum(1 for count in korean_counts if count >= 2)
+    short_ratio = short_count / max(1, len(korean_counts))
+    return short_ratio >= 0.30 or (len(korean_counts) >= 10 and usable_count < len(korean_counts) * 0.62)
+
+
+def _korean_paddle_grouping_is_better(current_items: list[dict], paddle_items: list[dict]) -> bool:
+    if not paddle_items or not _korean_ocr_is_fragmented(current_items):
+        return False
+    current_counts = [
+        _korean_script_chars(str(item.get("text") or "").strip())
+        for item in current_items
+        if _korean_script_chars(str(item.get("text") or "").strip()) > 0
+    ]
+    paddle_counts = [
+        _korean_script_chars(str(item.get("text") or "").strip())
+        for item in paddle_items
+        if _korean_script_chars(str(item.get("text") or "").strip()) > 0
+    ]
+    if len(paddle_counts) < 2:
+        return False
+    current_avg = sum(current_counts) / max(1, len(current_counts))
+    paddle_avg = sum(paddle_counts) / max(1, len(paddle_counts))
+    grouped_enough = len(paddle_counts) <= max(4, int(len(current_counts) * 0.55))
+    more_complete_lines = paddle_avg >= max(3.0, current_avg * 1.45)
+    return grouped_enough and more_complete_lines
+
+
+def _preserve_detection_metadata(vision_results: list[dict], detected_results: list[dict]) -> list[dict]:
+    if not vision_results or not detected_results:
+        return vision_results
+    source_items = [
+        item for item in detected_results
+        if isinstance(item, dict) and isinstance(item.get("box"), dict)
+    ]
+    if not source_items:
+        return vision_results
+    preserved = []
+    used_source_indexes: set[int] = set()
+    for index, result in enumerate(vision_results):
+        result_box = _box_from_payload(result.get("box") or {})
+        best_idx = -1
+        best_overlap = 0.0
+        for candidate_idx, source in enumerate(source_items):
+            if candidate_idx in used_source_indexes:
+                continue
+            overlap = _boxes_overlap(result_box, _box_from_payload(source["box"]))
+            if overlap > best_overlap:
+                best_idx = candidate_idx
+                best_overlap = overlap
+        merged = dict(result)
+        if best_idx >= 0 and best_overlap >= 0.20:
+            used_source_indexes.add(best_idx)
+            source = source_items[best_idx]
+            for key in (
+                "box",
+                "green_box",
+                "green_polygon",
+                "route",
+                "bubble_idx",
+                "mask_mode",
+                "overlap_collision",
+                "force_bubble_cleanup",
+            ):
+                if key in source:
+                    merged[key] = source[key]
+            if "erase_boxes" in source:
+                merged["erase_boxes"] = source["erase_boxes"]
+        merged["id"] = index
+        preserved.append(merged)
+    return preserved
+
+
+def _vision_rescue_cjk_ocr(
+    image_path: Path,
+    image: np.ndarray,
+    language: str | None,
+    text_boxes: list[Box],
+    seg_mask: np.ndarray | None,
+    detected_results: list[dict],
+) -> list[dict]:
+    if language not in {"ko", "ch_tra", "ch_sim"}:
+        return []
+    if not text_boxes:
+        return []
+    vision_providers = [
+        item.strip().lower()
+        for item in os.environ.get("VISION_OCR_PROVIDER_ORDER", "openrouter,nvidia,gemini,github,groq").split(",")
+        if item.strip()
+    ]
+    vision_handlers = {
+        "gemini": _gemini_vision_region_ocr,
+        "github": _github_vision_region_ocr,
+        "groq": _groq_vision_region_ocr,
+        "nvidia": _nvidia_vision_region_ocr,
+        "nvidia-nim": _nvidia_vision_region_ocr,
+        "nim": _nvidia_vision_region_ocr,
+        "openrouter": _openrouter_vision_region_ocr,
+    }
+    for provider in vision_providers:
+        handler = vision_handlers.get(provider)
+        if handler is None:
+            continue
+        rescued = handler(image_path, image, text_boxes, language, seg_mask)
+        rescued = _preserve_detection_metadata(rescued, detected_results)
+        for item in rescued:
+            print(f"  [vision] {item['text'][:30]}...")
+        if rescued:
+            return rescued
+    return []
 
 
 def _expanded_xy(box: Box, pad_x: int, pad_y: int, img_w: int, img_h: int) -> Box:
@@ -443,14 +1529,7 @@ def _fallback_korean_from_paddle(image_path: Path, image) -> list[dict]:
         reader = _paddleocr_reader(language)
         if reader is None:
             continue
-        try:
-            results = reader.predict(str(image_path))
-        except Exception as error:
-            print(f"  [PaddleOCR warn] {language}: {str(error)[:120]}")
-            continue
-
-        for result in results:
-            payload = _paddle_result_payload(result)
+        for payload, offset_x, offset_y, source_w, source_h in _paddle_page_payloads(reader, image_path, image, language):
             angle = (payload.get("doc_preprocessor_res") or {}).get("angle", 0)
             texts = payload.get("rec_texts") or []
             scores = payload.get("rec_scores") or []
@@ -472,7 +1551,13 @@ def _fallback_korean_from_paddle(image_path: Path, image) -> list[dict]:
                 if score < min_score and not korean_geometry_hint:
                     continue
 
-                red_box = _map_paddle_box_to_original(box, angle, img_w, img_h).expanded(4, img_w, img_h)
+                local_box = _map_paddle_box_to_original(box, angle, source_w, source_h)
+                red_box = Box(
+                    local_box.x1 + offset_x,
+                    local_box.y1 + offset_y,
+                    local_box.x2 + offset_x,
+                    local_box.y2 + offset_y,
+                ).expanded(4, img_w, img_h)
                 if red_box.width < 8 or red_box.height < 8:
                     continue
                 if any(_boxes_overlap(red_box, Box(item["box"]["x1"], item["box"]["y1"], item["box"]["x2"], item["box"]["y2"])) > 0.72 for item in pass_results):
@@ -559,7 +1644,17 @@ def _sort_horizontal_lines(lines: list[dict]) -> list[dict]:
 def _horizontal_lines_belong_together(previous: Box, current: Box) -> bool:
     max_height = max(previous.height, current.height)
     gap_y = current.y1 - previous.y2
-    if gap_y > max(32, int(max_height * 1.35)):
+    # Same-utterance line wrapping is packed tight (measured across every
+    # ZH sample in the suite, both floating and bubble-assigned clusters:
+    # every legitimate multi-line gap ratio is <= 0.143, most negative/
+    # touching). A real speech-bubble/turn boundary between two lines that
+    # merely happen to sit close together reads far looser -- new_sample_11's
+    # "思賢早-" -> "昨天說的那個" gap ratio is 1.298, ~9x the highest
+    # legitimate ratio observed -- so 1.35 was letting genuine bubble
+    # boundaries bridge as if they were paragraph line-wraps. 0.5 keeps
+    # comfortable margin above every observed legitimate case while clearly
+    # excluding the boundary case.
+    if gap_y > max(32, int(max_height * 0.5)):
         return False
 
     overlap_x = max(0, min(previous.x2, current.x2) - max(previous.x1, current.x1))
@@ -656,21 +1751,34 @@ def _bubble_cluster_zones(cluster_boxes: list[Box], bubble_mask: np.ndarray) -> 
     return zones
 
 
+def _should_merge_chinese_bubble_columns(cluster_boxes: list[Box], img_w: int, img_h: int) -> bool:
+    if len(cluster_boxes) < 2:
+        return False
+    merged = _union_boxes(cluster_boxes, img_w, img_h, pad=0)
+    if merged.width <= 0 or merged.height <= 0:
+        return False
+    vertical_columns = [box for box in cluster_boxes if box.height >= max(24, box.width * 1.6)]
+    if len(vertical_columns) < 2:
+        return False
+    if merged.height < merged.width * 1.20:
+        return False
+    if merged.width > img_w * 0.28:
+        return False
+    ordered = sorted(cluster_boxes, key=lambda box: box.x1)
+    gaps = [max(0, right.x1 - left.x2) for left, right in zip(ordered, ordered[1:])]
+    median_width = float(np.median([box.width for box in cluster_boxes]))
+    max_gap = max(gaps) if gaps else 0
+    return max_gap <= max(72, int(median_width * 1.8))
+
+
 def _paddle_chinese_page_lines(image_path: Path, image, bubble_masks) -> list[dict]:
     reader = _paddleocr_reader("ch")
     if reader is None:
         return []
     img_h, img_w = image.shape[:2]
-    try:
-        results = reader.predict(str(image_path))
-    except Exception as error:
-        print(f"  [PaddleOCR warn] ch page: {str(error)[:120]}")
-        return []
-
     lines = []
     seen = set()
-    for result in results:
-        payload = _paddle_result_payload(result)
+    for payload, offset_x, offset_y, source_w, source_h in _paddle_page_payloads(reader, image_path, image, "ch"):
         angle = (payload.get("doc_preprocessor_res") or {}).get("angle", 0)
         texts = payload.get("rec_texts") or []
         scores = payload.get("rec_scores") or []
@@ -685,7 +1793,13 @@ def _paddle_chinese_page_lines(image_path: Path, image, bubble_masks) -> list[di
             han_count = _script_count(clean_text, "han")
             if han_count == 0:
                 continue
-            red_box = _map_paddle_box_to_original(box, angle, img_w, img_h).expanded(3, img_w, img_h)
+            local_box = _map_paddle_box_to_original(box, angle, source_w, source_h)
+            red_box = Box(
+                local_box.x1 + offset_x,
+                local_box.y1 + offset_y,
+                local_box.x2 + offset_x,
+                local_box.y2 + offset_y,
+            ).expanded(3, img_w, img_h)
             if red_box.width < 6 or red_box.height < 6 or red_box.area < 45:
                 continue
             key = (clean_text, red_box.x1 // 5, red_box.y1 // 5, red_box.x2 // 5, red_box.y2 // 5)
@@ -761,6 +1875,13 @@ def _fallback_chinese_from_paddle(image_path: Path, image, bubble_masks) -> list
     for bubble_idx in sorted(idx for idx in grouped if idx != -1):
         clusters = _cluster_horizontal_cjk_lines(grouped[bubble_idx])
         cluster_boxes = [_union_boxes([line["box"] for line in cluster], img_w, img_h, pad=4) for cluster in clusters]
+        if _should_merge_chinese_bubble_columns(cluster_boxes, img_w, img_h):
+            merged_lines = [line for cluster in clusters for line in cluster]
+            merged_box = _union_boxes(cluster_boxes, img_w, img_h, pad=4)
+            zone = _bubble_cluster_zones([merged_box], bubble_masks[bubble_idx])[0]
+            items.append(_item_from_chinese_cluster(next_id, merged_lines, img_w, img_h, bubble_idx, zone))
+            next_id += 1
+            continue
         zones = _bubble_cluster_zones(cluster_boxes, bubble_masks[bubble_idx])
         for cluster, zone in zip(clusters, zones):
             items.append(_item_from_chinese_cluster(next_id, cluster, img_w, img_h, bubble_idx, zone))
@@ -775,6 +1896,207 @@ def _fallback_chinese_from_paddle(image_path: Path, image, bubble_masks) -> list
     for idx, item in enumerate(items):
         item["id"] = idx
     return items
+
+
+def _glyph_count(text: str) -> int:
+    return len("".join(str(text or "").split()))
+
+
+def _merge_row_run(
+    row_items: list[dict],
+    image: np.ndarray,
+    seg_mask: np.ndarray | None,
+    ocr_runtime,
+    img_w: int,
+    img_h: int,
+) -> list[dict]:
+    # row_items all mutually satisfy the same-line y-overlap test already;
+    # this chains left-to-right within the row on adjacency + scale, so a run
+    # only spans items that are ALSO horizontally contiguous and similarly
+    # sized (an unrelated same-height item far to the right of a real gap
+    # must not be swept in).
+    ordered = sorted(row_items, key=lambda it: it["box"]["x1"])
+    out: list[dict] = []
+    i = 0
+    while i < len(ordered):
+        run = [ordered[i]]
+        j = i + 1
+        while j < len(ordered):
+            a = run[-1]["box"]
+            b = ordered[j]["box"]
+            a_h = a["y2"] - a["y1"]
+            b_h = b["y2"] - b["y1"]
+            shorter_h = min(a_h, b_h)
+            if shorter_h <= 0:
+                break
+            if max(a_h, b_h) / shorter_h > 1.6:
+                break
+            run_heights = [r["box"]["y2"] - r["box"]["y1"] for r in run] + [b_h]
+            median_h = float(np.median(run_heights))
+            gap = max(0, b["x1"] - a["x2"])
+            if gap > 0.8 * max(1, median_h):
+                break
+            run.append(ordered[j])
+            j += 1
+        i = j
+
+        if len(run) < 2:
+            out.append(run[0])
+            continue
+
+        texts = [str(it.get("text") or "") for it in run]
+        glyph_counts = [_glyph_count(t) for t in texts]
+        # A near-empty member (an OCR miss on a bridging glyph, e.g. the
+        # missing "브" in a shattered "몰디브") is the actual fragmentation
+        # signature. "3+ adjacent items all containing CJK text" was tried as
+        # a second trigger but is NOT a reliable signal on its own: a normal
+        # multi-column vertical-script passage (verified: external_ko_2, an
+        # archaic Korean page) satisfies it too even though every fragment is
+        # already complete, legitimate, separately-translatable text --
+        # merging those consolidates them into one box that then gets
+        # rejected whole by step 6's size gate, destroying content that was
+        # fine before. Every fire this pass is meant to catch already carries
+        # a genuine near-empty member (confirmed against both this session's
+        # test cases and the master plan's own worked examples), so that
+        # signal alone is sufficient and does not need this broader one.
+        has_near_empty_fragment = any(gc <= 1 for gc in glyph_counts)
+        if not has_near_empty_fragment:
+            out.extend(run)
+            continue
+
+        boxes = [_box_from_payload(it["box"]) for it in run]
+        merged_box = _union_boxes(boxes, img_w, img_h, pad=4)
+        if merged_box.width > img_w * 0.97:
+            out.extend(run)
+            continue
+
+        crop = image[merged_box.y1:merged_box.y2, merged_box.x1:merged_box.x2]
+        seg_crop = (
+            seg_mask[merged_box.y1:merged_box.y2, merged_box.x1:merged_box.x2]
+            if seg_mask is not None
+            else None
+        )
+        concatenated = " ".join(t.strip() for t in texts if t.strip())
+        concat_glyphs = _glyph_count(concatenated)
+        merged_text = concatenated
+        merged_provider = "same_line_merge_concat"
+        if crop.size > 0:
+            reread = _read_ocr_crop(ocr_runtime, crop, seg_crop)
+            reread_text = str(reread.get("text") or "")
+            if reread_text.strip() and _glyph_count(reread_text) >= concat_glyphs * 0.6:
+                merged_text = reread_text
+                merged_provider = str(reread.get("provider") or "same_line_merge_reocr")
+
+        green_box = merged_box.expanded(
+            max(10, int(min(merged_box.width, merged_box.height) * 0.18)), img_w, img_h
+        )
+        merged_item = dict(run[0])
+        merged_item["text"] = merged_text
+        merged_item["ocr_provider"] = merged_provider
+        merged_item["box"] = {k: int(v) for k, v in merged_box.to_dict().items()}
+        merged_item["erase_boxes"] = [
+            {k: int(v) for k, v in box.to_dict().items()} for box in boxes
+        ]
+        merged_item["green_box"] = {k: int(v) for k, v in green_box.to_dict().items()}
+        merged_item["green_polygon"] = [
+            [green_box.x1, green_box.y1],
+            [green_box.x2, green_box.y1],
+            [green_box.x2, green_box.y2],
+            [green_box.x1, green_box.y2],
+        ]
+        existing_fallback = str(run[0].get("fallback_source") or "")
+        merged_item["fallback_source"] = (
+            f"{existing_fallback}+same_line_merge" if existing_fallback else "same_line_merge"
+        )
+        out.append(merged_item)
+    return out
+
+
+def _merge_same_line_ocr_fragments(
+    final_results: list[dict],
+    image: np.ndarray,
+    seg_mask: np.ndarray | None,
+    ocr_runtime,
+    img_w: int,
+    img_h: int,
+) -> list[dict]:
+    # A shattered CJK line (one empty/near-empty glyph-sized fragment bridging
+    # two real fragments, or several tiny fragments of what is visually one
+    # line) reads unreliably per-fragment but far better as one full-line crop.
+    # Heal this at the source: merge same-line, same-surface runs and re-OCR
+    # the union once. Conservative by design -- every gate below must hold, and
+    # only runs carrying the fragmentation signature (a near-empty member, or
+    # 3+ members forming a shattered CJK line) are merged; two healthy
+    # neighboring text items are left for step 6's own merge pass.
+    if len(final_results) < 2:
+        return final_results
+
+    groups: dict[int, list[dict]] = {}
+    for item in final_results:
+        groups.setdefault(int(item.get("bubble_idx", -1)), []).append(item)
+
+    merged_out: list[dict] = []
+    for bubble_idx, items in groups.items():
+        if len(items) < 2:
+            merged_out.extend(items)
+            continue
+
+        # Cluster into approximate rows by mutual (transitive) y-overlap
+        # BEFORE any x1-based adjacency reasoning -- sorting the whole
+        # bubble_idx group by x1 in one flat pass would interleave unrelated
+        # items from other lines/panels that merely happen to share an x1
+        # range with a real line, breaking adjacency detection for that line.
+        n = len(items)
+        heights = [it["box"]["y2"] - it["box"]["y1"] for it in items]
+        parent = list(range(n))
+
+        def find(a: int) -> int:
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for a in range(n):
+            for b in range(a + 1, n):
+                ay1, ay2 = items[a]["box"]["y1"], items[a]["box"]["y2"]
+                by1, by2 = items[b]["box"]["y1"], items[b]["box"]["y2"]
+                shorter_h = min(heights[a], heights[b])
+                if shorter_h <= 0:
+                    continue
+                # The height-ratio cap must hold here, not just in the later
+                # chaining step: without it, one tall vertical text column
+                # trivially clears 60% shorter-height overlap against every
+                # small mark that falls within its span (a much smaller box
+                # fully contained in a much taller one overlaps it at ~100%
+                # of ITS OWN height almost by construction), transitively
+                # chaining together unrelated small fragments -- verified
+                # concretely on a page with a vertical JA dialogue column
+                # bridging two unrelated single-kana boxes this way.
+                if max(heights[a], heights[b]) / shorter_h > 1.6:
+                    continue
+                overlap = max(0, min(ay2, by2) - max(ay1, by1))
+                if overlap / shorter_h >= 0.60:
+                    union(a, b)
+
+        rows: dict[int, list[int]] = {}
+        for idx in range(n):
+            rows.setdefault(find(idx), []).append(idx)
+
+        for row_indices in rows.values():
+            row_items = [items[k] for k in row_indices]
+            merged_out.extend(
+                _merge_row_run(row_items, image, seg_mask, ocr_runtime, img_w, img_h)
+            )
+
+    merged_out.sort(key=lambda item: (item["box"]["y1"], item["box"]["x1"]))
+    for idx, item in enumerate(merged_out):
+        item["id"] = idx
+    return merged_out
 
 
 def _save_ocr_outputs(sample_path: Path, image: np.ndarray, final_results: list[dict]) -> None:
@@ -811,6 +2133,8 @@ def _best_bubble_for_box(box: Box, bubble_masks) -> int:
 
 
 def _mask_bounds(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    if mask is None:
+        return None
     ys, xs = np.nonzero(mask > 0)
     if len(xs) == 0 or len(ys) == 0:
         return None
@@ -884,7 +2208,7 @@ def _fallback_ocr_from_raw_detections(image, text_boxes, bubble_masks, ocr_model
         "ocr_confidence": ocr_meta.get("confidence"),
     }
 
-def run_step5_ocr():
+def _run_step5_ocr_unlocked(sample_map: dict[str, str] | None = None, samples_dir: Path | None = None):
     global _MANGA_OCR_MODEL, _TEXT_HANDLE, _BUBBLE_MODEL, _BUBBLE_DEVICE, _SEMANTIC_HANDLE
 
     print("=" * 60)
@@ -892,7 +2216,8 @@ def run_step5_ocr():
     print("=" * 60)
 
     cfg = MLConfig()
-    samples_dir = sample_root_from_env(DEFAULT_SAMPLES_ROOT)
+    samples_dir = Path(samples_dir) if samples_dir is not None else sample_root_from_env(DEFAULT_SAMPLES_ROOT)
+    sample_map = sample_map or SAMPLE_MAP
     resume_existing = os.environ.get("PIPELINE_RESUME_EXISTING_OCR", "").strip().lower() in {
         "1",
         "true",
@@ -907,13 +2232,13 @@ def run_step5_ocr():
             _MANGA_OCR_MODEL = load_ocr_model(force_cpu=False)
         return LocalCjkOcr(_MANGA_OCR_MODEL, None)
     
-
+    # Lazy load detection models only if needed
     text_handle = _TEXT_HANDLE
     bubble_model = _BUBBLE_MODEL
     bubble_device = _BUBBLE_DEVICE
     semantic_handle = _SEMANTIC_HANDLE
 
-    for sample_name, img_file in SAMPLE_MAP.items():
+    for sample_name, img_file in sample_map.items():
         sample_path = samples_dir / sample_name
         img_path = sample_path / img_file
         if not img_path.exists(): continue
@@ -928,13 +2253,24 @@ def run_step5_ocr():
         image = cv2.imread(str(img_path))
         h, w = image.shape[:2]
         
-
+        # Check for Step 1-3 results
         detect_dir = sample_path / "step_1_detect"
         step1_res_path = detect_dir / "detections.json"
         seg_mask_path = detect_dir / "seg_mask.png"
+        semantic_path = detect_dir / "semantic_detections.json"
+        needs_step1_detection = (
+            not step1_res_path.exists()
+            or not seg_mask_path.exists()
+            or not semantic_path.exists()
+            or _step1_detection_is_stale(img_path, detect_dir)
+        )
         
-        if not step1_res_path.exists() or not seg_mask_path.exists():
-            print(f"  Step 1 results missing. Running detection models...")
+        if needs_step1_detection:
+            if detect_dir.exists() and _step1_detection_is_stale(img_path, detect_dir):
+                print("  Step 1 results stale for current input. Rerunning detection models...")
+                _clear_stale_step1_outputs(detect_dir)
+            else:
+                print(f"  Step 1 results missing. Running detection models...")
             if text_handle is None:
                 text_handle = load_text_model(cfg.text_model_path)
                 bubble_model, bubble_device = load_bubble_model(cfg.bubble_model_path)
@@ -946,30 +2282,29 @@ def run_step5_ocr():
             
             detect_dir.mkdir(parents=True, exist_ok=True)
             
-
+            # Step 1: Detect
             text_result = detect_text(text_handle, image, cfg)
             cv2.imwrite(str(seg_mask_path), text_result.seg_mask)
             with open(step1_res_path, 'w') as f:
                 json.dump({"boxes": [{k: int(v) for k, v in b.to_dict().items()} for b in text_result.boxes]}, f)
                 
-
+            # Step 2: Bubble & Semantic
             bubble_masks = detect_bubbles(bubble_model, bubble_device, image, cfg)
-            for i, bm in enumerate(bubble_masks):
-                cv2.imwrite(str(detect_dir / f"bubble_{i}.png"), bm)
+            bubble_masks = _filter_and_save_bubble_masks(detect_dir, bubble_masks, text_result.boxes)
             
             semantic_result = detect_semantic_text_regions(semantic_handle, image, cfg)
-            with open(detect_dir / "semantic_detections.json", 'w') as f:
+            with open(semantic_path, 'w') as f:
                 json.dump({"regions": [{"box": {k: int(v) for k, v in r.box.to_dict().items()}, "class_id": int(r.class_id), 
                                      "raw_class_name": str(r.raw_class_name), "semantic_class": str(r.semantic_class),
                                      "action": str(r.action), "confidence": float(r.confidence)} for r in semantic_result.regions]}, f)
         else:
-
+            # Load existing Step 1 results
             from ml_region_lib import TextDetectionResult, SemanticDetectionResult, SemanticTextRegion
             seg_mask = cv2.imread(str(seg_mask_path), cv2.IMREAD_GRAYSCALE)
             with open(step1_res_path, 'r') as f:
                 d1 = json.load(f)
                 text_result = TextDetectionResult(boxes=[Box(b["x1"], b["y1"], b["x2"], b["y2"]) for b in d1["boxes"]], seg_mask=seg_mask)
-            with open(detect_dir / "semantic_detections.json", 'r') as f:
+            with open(semantic_path, 'r') as f:
                 d2 = json.load(f)
                 semantic_result = SemanticDetectionResult(regions=[SemanticTextRegion(box=Box(r["box"]["x1"], r["box"]["y1"], r["box"]["x2"], r["box"]["y2"]), **{k:v for k,v in r.items() if k!="box"}) for r in d2["regions"]])
             bubble_masks = []
@@ -977,6 +2312,7 @@ def run_step5_ocr():
                 bm_p = detect_dir / f"bubble_{i}.png"
                 if bm_p.exists(): bubble_masks.append(cv2.imread(str(bm_p), cv2.IMREAD_GRAYSCALE))
                 else: break
+            bubble_masks = _filter_and_save_bubble_masks(detect_dir, bubble_masks, text_result.boxes)
 
         if sample_ocr_language == "ch_tra":
             final_results = _fallback_chinese_from_paddle(img_path, image, bubble_masks)
@@ -985,22 +2321,23 @@ def run_step5_ocr():
                 _save_ocr_outputs(sample_path, image, final_results)
                 continue
         
-
+        # 1. Routing
         routed = build_step2_routing_state(text_result, semantic_result, bubble_masks, cfg, w, h, ocr_runtime, image)
         
-
+        # 2. CONSOLIDATION (Group-by-Bubble)
         gray_img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         consolidated = consolidate_by_bubble(routed, text_result.seg_mask, bubble_masks, cfg, gray_img)
         
-
+        # 3. OCR on Consolidated Red Boxes
         final_results = []
         for idx, ct in enumerate(consolidated):
             if ct.route_state == "onomatopoeia": continue
             
             crop = image[ct.box.y1:ct.box.y2, ct.box.x1:ct.box.x2]
             if crop.size == 0: continue
-            
-            ocr_meta = _read_ocr_crop(ocr_runtime, crop)
+
+            seg_crop = text_result.seg_mask[ct.box.y1:ct.box.y2, ct.box.x1:ct.box.x2]
+            ocr_meta = _read_ocr_crop(ocr_runtime, crop, seg_crop)
             ocr_text = ocr_meta["text"]
             
             final_results.append({
@@ -1048,7 +2385,56 @@ def run_step5_ocr():
             for item in final_results:
                 print(f"  [paddle] {item['text'][:30]}...")
 
+        if sample_ocr_language == "ko" and _korean_ocr_is_fragmented(final_results):
+            current_score = _korean_ocr_quality_score(final_results)
+            paddle_results = _fallback_korean_from_paddle(img_path, image)
+            paddle_score = _korean_ocr_quality_score(paddle_results)
+            if paddle_results and (
+                paddle_score > current_score + 2.0
+                or _korean_paddle_grouping_is_better(final_results, paddle_results)
+            ):
+                print(
+                    f"  [paddle-ko] replacing fragmented OCR "
+                    f"items={len(final_results)}->{len(paddle_results)} "
+                    f"score={current_score:.1f}->{paddle_score:.1f}"
+                )
+                final_results = paddle_results
+                for item in final_results:
+                    print(f"  [paddle-ko] {item['text'][:30]}...")
+
+        if sample_ocr_language in {"ko", "ch_tra", "ch_sim"} and _usable_cjk_text_count(final_results, sample_ocr_language) == 0:
+            detected_boxes = [
+                _box_from_payload(item["box"])
+                for item in final_results
+                if isinstance(item, dict) and isinstance(item.get("box"), dict)
+            ]
+            rescued = _vision_rescue_cjk_ocr(
+                img_path,
+                image,
+                sample_ocr_language,
+                detected_boxes or text_result.boxes,
+                text_result.seg_mask,
+                final_results,
+            )
+            if rescued:
+                final_results = rescued
+
+        final_results = _merge_same_line_ocr_fragments(
+            final_results, image, text_result.seg_mask, ocr_runtime, w, h
+        )
+
         _save_ocr_outputs(sample_path, image, final_results)
+
+
+def run_step5_ocr(sample_map: dict[str, str] | None = None, samples_dir: Path | None = None):
+    acquired = _STEP5_RUN_LOCK.acquire(blocking=False)
+    if not acquired:
+        print("  [step5-lock] waiting for active OCR/detection pass to finish")
+        _STEP5_RUN_LOCK.acquire()
+    try:
+        return _run_step5_ocr_unlocked(sample_map=sample_map, samples_dir=samples_dir)
+    finally:
+        _STEP5_RUN_LOCK.release()
 
 if __name__ == "__main__":
     import sys

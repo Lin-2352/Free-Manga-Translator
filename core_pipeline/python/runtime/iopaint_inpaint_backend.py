@@ -3,8 +3,8 @@
 Usage through Step 4:
     set MANGA_INPAINT_COMMAND=python python/runtime/iopaint_inpaint_backend.py --input "{input}" --mask "{mask}" --output "{output}" --model migan
 
-Supported models depend on the local IOPaint installation: migan, mat, fcf,
-zits. This adapter is intentionally opt-in because the focused validation
+Supported models depend on the local IOPaint installation: manga, migan, mat,
+fcf, zits. This adapter is intentionally opt-in because the focused validation
 showed that stronger generic models can improve flat paper cleanup but can
 damage dense manga art when used blindly.
 """
@@ -34,6 +34,10 @@ def _load_model_class(name: str):
         from iopaint.model.mi_gan import MIGAN
 
         return MIGAN
+    if normalized == "manga":
+        from iopaint.model.manga import Manga
+
+        return Manga
     if normalized == "mat":
         from iopaint.model.mat import MAT
 
@@ -54,7 +58,7 @@ def main() -> int:
     parser.add_argument("--input", required=True)
     parser.add_argument("--mask", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--model", default="migan", choices=["migan", "mat", "fcf", "zits"])
+    parser.add_argument("--model", default="migan", choices=["manga", "migan", "mat", "fcf", "zits"])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--crop-trigger-size", type=int, default=512)
     parser.add_argument("--crop-margin", type=int, default=64)
