@@ -152,7 +152,7 @@ document.addEventListener('DOMContentLoaded', () => {
       list.appendChild(row);
     });
     hoverHelp.append(strong, list);
-    hoverHelp.hidden = list.childElementCount === 0;
+    hoverHelp.classList.toggle('is-visible', list.childElementCount > 0);
   }
 
   function positionFloatingHelp(element) {
@@ -169,6 +169,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function setupHelpPanels() {
     if (typeof document.querySelectorAll !== 'function') return;
+    // Visibility is now driven entirely by the .is-visible class (see renderFloatingHelp/hide
+    // below) so the panel can fade in/out; the `hidden` attribute from the HTML default only
+    // needs clearing once, up front.
+    if (hoverHelp) hoverHelp.hidden = false;
     document.querySelectorAll('[data-help-panel]').forEach((element) => {
       const show = () => {
         const items = String(element.dataset.help || '')
@@ -179,14 +183,17 @@ document.addEventListener('DOMContentLoaded', () => {
         positionFloatingHelp(element);
       };
       const hide = () => {
-        if (hoverHelp) hoverHelp.hidden = true;
+        if (hoverHelp) hoverHelp.classList.remove('is-visible');
       };
       element.addEventListener('mouseenter', show);
       element.addEventListener('focus', show);
       element.addEventListener('click', show);
       element.addEventListener('mouseleave', hide);
       element.addEventListener('blur', hide);
-      element.title = String(element.dataset.help || '').replaceAll('|', '\n');
+      // No native `title` attribute here on purpose: it used to duplicate this same
+      // description as a second, unstyled browser tooltip stacking on top of this panel
+      // ("double hover"). The panel already covers mouse (mouseenter), keyboard (focus),
+      // and touch (click), so no native fallback is needed.
     });
   }
 
@@ -407,7 +414,9 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function checkServerHealth() {
+    apiStatus.classList.add('checking');
     chrome.runtime.sendMessage({ kind: 'checkPipelineHealth' }, (response) => {
+      apiStatus.classList.remove('checking');
       if (!response) return;
       apiStatus.classList.toggle('active', response.ok === true);
       apiStatus.classList.toggle('error', response.ok !== true);
