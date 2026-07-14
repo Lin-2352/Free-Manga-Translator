@@ -14,6 +14,7 @@ DEFAULT_MAX_PARALLEL = 2
 DEFAULT_RESERVED_FREE_MB = 2048
 DEFAULT_JOB_VRAM_MB = 3072
 DEFAULT_WAIT_LOG_SECONDS = 8.0
+DEFAULT_ADMISSION_GRACE_SECONDS = 8.0
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int | None = None) -> int:
@@ -26,6 +27,15 @@ def _env_int(name: str, default: int, minimum: int, maximum: int | None = None) 
     if maximum is not None:
         parsed = min(maximum, parsed)
     return parsed
+
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    value = os.environ.get(name, "").strip()
+    try:
+        parsed = float(value) if value else default
+    except ValueError:
+        parsed = default
+    return max(minimum, parsed)
 
 
 @dataclass(frozen=True)
@@ -59,6 +69,12 @@ class AdaptiveGpuScheduler:
         self._condition = threading.Condition()
         self._active = 0
         self._last_wait_log = 0.0
+        # Timestamps of recent successful admissions, used only to widen the capacity
+        # estimate's safety margin for a short grace window after each admission (see
+        # admission_grace_seconds) -- a just-admitted job's VRAM usage may not show up in
+        # the next gpu_memory() probe yet, so without this a burst of admissions can
+        # oversubscribe the GPU before the probe catches up.
+        self._admission_times: list[float] = []
 
     @property
     def max_parallel(self) -> int:
@@ -71,6 +87,10 @@ class AdaptiveGpuScheduler:
     @property
     def job_vram_mb(self) -> int:
         return _env_int("FMT_PIPELINE_JOB_VRAM_MB", DEFAULT_JOB_VRAM_MB, 512, 32768)
+
+    @property
+    def admission_grace_seconds(self) -> float:
+        return _env_float("FMT_PIPELINE_ADMISSION_GRACE_SECONDS", DEFAULT_ADMISSION_GRACE_SECONDS, 0.0)
 
     def _nvidia_smi_memory(self) -> GpuMemory | None:
         executable = shutil.which("nvidia-smi")
@@ -114,13 +134,23 @@ class AdaptiveGpuScheduler:
     def gpu_memory(self) -> GpuMemory | None:
         return self._nvidia_smi_memory() or self._torch_memory()
 
+    def _recent_admission_count(self) -> int:
+        grace_seconds = self.admission_grace_seconds
+        if grace_seconds <= 0:
+            return 0
+        now = time.perf_counter()
+        with self._condition:
+            self._admission_times = [t for t in self._admission_times if now - t < grace_seconds]
+            return len(self._admission_times)
+
     def _capacity_for_memory(self, gpu: GpuMemory | None) -> tuple[int, str]:
         max_parallel = self.max_parallel
         if max_parallel <= 1:
             return 1, "forced_sequential"
         if gpu is None:
             return 1, "sequential_no_gpu_memory_probe"
-        usable_free = gpu.free_mb - self.reserved_free_mb
+        recent_admissions = self._recent_admission_count()
+        usable_free = gpu.free_mb - self.reserved_free_mb - recent_admissions * self.job_vram_mb
         if usable_free < self.job_vram_mb:
             return 1, "sequential_low_vram"
         extra_slots = usable_free // self.job_vram_mb
@@ -145,26 +175,40 @@ class AdaptiveGpuScheduler:
     @contextlib.contextmanager
     def acquire(self, request_label: str = "") -> Iterator[PipelineSlot]:
         started = time.perf_counter()
-        with self._condition:
-            while True:
-                gpu = self.gpu_memory()
-                capacity, mode = self._capacity_for_memory(gpu)
+        while True:
+            # gpu_memory() can shell out to nvidia-smi (up to a 2s subprocess timeout) or
+            # touch the torch CUDA context. It must run OUTSIDE the condition lock: probing
+            # while holding the lock serializes every waiter behind each other's probe,
+            # turning concurrent load into a lock convoy.
+            gpu = self.gpu_memory()
+            capacity, mode = self._capacity_for_memory(gpu)
+            with self._condition:
                 if self._active < capacity:
                     self._active += 1
-                    slot = PipelineSlot(
-                        active_at_acquire=self._active,
-                        capacity_at_acquire=capacity,
-                        wait_seconds=time.perf_counter() - started,
-                        gpu=gpu,
-                        mode=mode,
-                    )
-                    print(
-                        (
-                            f"[scheduler] acquired active={self._active}/{capacity} "
-                            f"mode={mode} wait={slot.wait_seconds:.2f}s request={request_label}"
-                        ),
-                        flush=True,
-                    )
+                    try:
+                        slot = PipelineSlot(
+                            active_at_acquire=self._active,
+                            capacity_at_acquire=capacity,
+                            wait_seconds=time.perf_counter() - started,
+                            gpu=gpu,
+                            mode=mode,
+                        )
+                        self._admission_times.append(time.perf_counter())
+                        print(
+                            (
+                                f"[scheduler] acquired active={self._active}/{capacity} "
+                                f"mode={mode} wait={slot.wait_seconds:.2f}s request={request_label}"
+                            ),
+                            flush=True,
+                        )
+                    except Exception:
+                        # Nothing below this point has run yet, so the slot was never
+                        # actually handed out -- release the reservation before propagating,
+                        # or _active permanently overcounts by one (a leaked slot that
+                        # starves the scheduler forever).
+                        self._active = max(0, self._active - 1)
+                        self._condition.notify_all()
+                        raise
                     break
                 now = time.perf_counter()
                 if now - self._last_wait_log >= DEFAULT_WAIT_LOG_SECONDS:

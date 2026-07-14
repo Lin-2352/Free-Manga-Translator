@@ -225,6 +225,7 @@
     try {
       const response = await chrome.runtime.sendMessage({
         kind: 'translateSnapshot',
+        pageUrl: window.location.href,
         dimensions: {
           left, top, width: w, height: h,
           devicePixelRatio: window.devicePixelRatio || 1

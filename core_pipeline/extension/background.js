@@ -22,6 +22,14 @@ const queuedRequests = new Map();
 const requestQueue = [];
 const translationCache = new Map();
 
+// outgoingRequests.size only reflects a dispatch once processTranslation's async body has
+// run past several awaits (getSettings, cache lookups, ...). Two admission checks that read
+// outgoingRequests.size back-to-back within that window both see the pre-dispatch count, so
+// a burst of arrivals (or a queue drain) can admit more than parallelLimit at once. This
+// counter is incremented synchronously at the exact moment a dispatch is decided (before any
+// await), so every admission check sees in-flight-but-not-yet-registered dispatches too.
+let reservedSlots = 0;
+
 let cacheLoaded = false;
 let isPaused = false;
 
@@ -477,7 +485,9 @@ async function getCachedResult(cacheId, settings) {
 
 async function putCachedResult(cacheId, result, settings) {
   await ensureCacheLoaded();
-  if (settings.cacheLimit <= 0 || !result?.translatedImageDataUrl) return;
+  const hasImage = Boolean(result?.translatedImageDataUrl);
+  const hasTranslations = Array.isArray(result?.translations) && result.translations.length > 0;
+  if (settings.cacheLimit <= 0 || !(hasImage || hasTranslations)) return;
   translationCache.set(cacheId, {
     result,
     lastUsed: Date.now(),
@@ -605,6 +615,7 @@ async function processTranslation(message, options = {}) {
 
   const controller = new AbortController();
   activeControllers.set(cacheId, controller);
+  options.onDispatched?.();
 
   const promise = (async () => {
     const startedAt = nowMs();
@@ -618,7 +629,7 @@ async function processTranslation(message, options = {}) {
         cacheId,
         width,
         height,
-        source: message.imageUrl ? 'image-url' : 'canvas',
+        source: message.kind === 'snapshot' ? 'selection-crop' : (message.imageUrl ? 'image-url' : 'canvas'),
         pageUrl: message.pageUrl || '',
         originalImageUrl: message.originalImageUrl || '',
         language: settings.localPipelineLanguage,
@@ -626,7 +637,9 @@ async function processTranslation(message, options = {}) {
       const result = await callLocalPipeline(base64Data, width, height, settings, {
         traceId,
         extensionVersion: APP_VERSION,
-        source: message.imageUrl ? 'extension-image-url' : 'extension-canvas',
+        source: message.kind === 'snapshot'
+          ? 'extension-selection-crop'
+          : (message.imageUrl ? 'extension-image-url' : 'extension-canvas'),
         pageUrl: message.pageUrl || '',
         pageCacheKey: message.pageCacheKey || '',
         cacheKey: message.cacheKey || '',
@@ -669,13 +682,32 @@ async function processTranslation(message, options = {}) {
   return promise;
 }
 
+// The single entry point admission checks must dispatch through: reserves a slot
+// synchronously (before processTranslation's first await), and releases it either the
+// moment processTranslation actually registers in outgoingRequests (onDispatched -- the
+// reservation has become a real entry, so counting both would double-count) or, as a
+// safety net, whenever the returned promise settles (covers every early-return path in
+// processTranslation -- paused/cached/in-flight-dedup -- where no slot was ever consumed).
+function dispatchTranslation(message) {
+  reservedSlots += 1;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    reservedSlots = Math.max(0, reservedSlots - 1);
+  };
+  const result = processTranslation(message, { bypassQueueCheck: true, onDispatched: release });
+  result.then(release, release);
+  return result;
+}
+
 function processQueue() {
   if (isPaused) return;
   getSettings().then((settings) => {
-    while (requestQueue.length > 0 && outgoingRequests.size < settings.parallelLimit) {
+    while (requestQueue.length > 0 && (outgoingRequests.size + reservedSlots) < settings.parallelLimit) {
       const { message, resolve, cacheId } = requestQueue.shift();
       if (cacheId) queuedRequests.delete(cacheId);
-      processTranslation(message, { bypassQueueCheck: true }).then(resolve);
+      dispatchTranslation(message).then(resolve);
     }
   }).catch(() => {});
 }
@@ -715,8 +747,8 @@ async function queueTranslation(message) {
     return queuedRequests.get(cacheId);
   }
 
-  if (outgoingRequests.size < settings.parallelLimit) {
-    return processTranslation(message, { bypassQueueCheck: true });
+  if ((outgoingRequests.size + reservedSlots) < settings.parallelLimit) {
+    return dispatchTranslation(message);
   }
 
   if (requestQueue.length >= settings.queueLimit) {
@@ -857,24 +889,38 @@ async function cropVisibleTab(tabId, dimensions) {
   };
 }
 
-async function captureAndTranslate(tabId, dimensions) {
+// Selection-area (snapshot) translate used to call callLocalPipeline directly: no cache
+// read/write, no queue/parallel accounting, and no AbortController, so pause/stop couldn't
+// cancel it and repeating an identical selection always recomputed. The screen capture
+// itself still happens immediately here (a queued capture would risk shooting the wrong
+// content if the page scrolled/navigated in the meantime), but the pipeline call is routed
+// through the same queueTranslation used by every other translation kind, so it shares
+// caching, dedupe, the parallel budget, and cancellation. The cache identity is the
+// captured pixels themselves (buildCacheId's base64Data fallback), not just the selection's
+// geometry, so a re-selected rect whose underlying content actually changed still misses.
+async function translateSnapshot(tabId, pageUrl, dimensions) {
   if (isPaused) return { error: 'TranslationPaused' };
+  let cropped;
   try {
-    const cropped = await cropVisibleTab(tabId, dimensions);
-    const settings = await getSettings();
-    const result = await callLocalPipeline(cropped.dataUrl, cropped.width, cropped.height, settings, {
-      source: 'extension-selection-crop',
-    });
-    return {
-      ...result,
-      zoomFactor: cropped.zoomFactor,
-      devicePixelRatio: cropped.devicePixelRatio,
-      imageWidth: cropped.width,
-      imageHeight: cropped.height,
-    };
+    cropped = await cropVisibleTab(tabId, dimensions);
   } catch (error) {
     return { error: error.message };
   }
+  const result = await queueTranslation({
+    kind: 'snapshot',
+    base64Data: cropped.dataUrl,
+    width: cropped.width,
+    height: cropped.height,
+    pageUrl: pageUrl || '',
+    pageCacheKey: pageUrl || '',
+  });
+  return {
+    ...result,
+    zoomFactor: cropped.zoomFactor,
+    devicePixelRatio: cropped.devicePixelRatio,
+    imageWidth: cropped.width,
+    imageHeight: cropped.height,
+  };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -898,7 +944,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.kind === 'translateSnapshot') {
-    captureAndTranslate(sender.tab?.id || message.tabId, message.dimensions).then(sendResponse);
+    translateSnapshot(sender.tab?.id || message.tabId, message.pageUrl, message.dimensions).then(sendResponse);
     return true;
   }
   if (message.kind === 'getTranslationStats') {
