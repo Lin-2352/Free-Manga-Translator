@@ -1993,6 +1993,66 @@ def _same_utterance_vertical_columns(
     return True
 
 
+def _rescue_strokes_belong_to_container(
+    image: np.ndarray | None,
+    probe_box: list[int],
+    flood_points: list[list[int]],
+) -> bool:
+    """Reject an enclosed_dialogue_rescue candidate when its own dark strokes are
+    physically connected to the traced container's boundary ring, rather than
+    sitting isolated in the interior.
+
+    A genuinely missed speech bubble's text is drawn INSIDE the bubble, with
+    clearance from the bubble's own ink outline. A character's blank head
+    silhouette (or other plain-enclosed art -- a bandaged limb, a sign panel)
+    can flood-trace as a valid-looking container too, but any "text" OCR finds
+    there is either the container's own boundary stroke (a hair tuft that IS
+    the head outline) or directly fused to it -- there is no real gap between
+    glyph and wall. Checked only at the enclosed_dialogue_rescue call site, not
+    inside _container_flood_outline/_infer_missed_bubble_outline themselves,
+    which also serve already-accepted dialogue where this signal doesn't apply
+    (verified 2026-07-14: 7/7 flips on the full regression suite were confirmed
+    false positives -- bandage wrap, store signage, character skin, speed
+    lines, an SFX tail mark, and the original head-as-bubble case -- while the
+    2 genuine rescues, both real text with interior clearance, were unaffected)."""
+    if image is None or len(flood_points) < 3:
+        return False
+    poly = np.array(flood_points, dtype=np.int32)
+    px1 = max(0, int(poly[:, 0].min()) - 4)
+    py1 = max(0, int(poly[:, 1].min()) - 4)
+    px2 = min(image.shape[1], int(poly[:, 0].max()) + 5)
+    py2 = min(image.shape[0], int(poly[:, 1].max()) + 5)
+    if px2 - px1 < 8 or py2 - py1 < 8:
+        return False
+    window = image[py1:py2, px1:px2]
+    gray = cv2.cvtColor(window, cv2.COLOR_BGR2GRAY)
+    local = poly - np.array([[px1, py1]])
+
+    boundary = np.zeros(gray.shape, dtype=np.uint8)
+    cv2.polylines(boundary, [local], True, 255, 1)
+    boundary_ring = cv2.dilate(
+        boundary, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    ) > 0
+
+    x1, y1, x2, y2 = [int(v) for v in probe_box[:4]]
+    bx1 = max(0, x1 - 2 - px1)
+    by1 = max(0, y1 - 2 - py1)
+    bx2 = min(gray.shape[1], x2 + 2 - px1)
+    by2 = min(gray.shape[0], y2 + 2 - py1)
+    if bx2 <= bx1 or by2 <= by1:
+        return False
+    probe_mask = np.zeros(gray.shape, dtype=bool)
+    probe_mask[by1:by2, bx1:bx2] = True
+
+    dark = (gray < 110).astype(np.uint8)
+    n_labels, labels = cv2.connectedComponents(dark, connectivity=8)
+    for label in range(1, n_labels):
+        comp = labels == label
+        if np.any(comp & probe_mask) and np.any(comp & boundary_ring):
+            return True
+    return False
+
+
 def _container_flood_outline(
     image: np.ndarray | None,
     red_box: list[int],
@@ -2790,14 +2850,16 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
                 and image is not None
             ):
                 probe_box = item["box"]
+                probe_coords = [probe_box["x1"], probe_box["y1"], probe_box["x2"], probe_box["y2"]]
                 # A short OCR fragment covers only a fraction of its bubble,
                 # so the container may legitimately be tens of times larger.
-                enclosed_dialogue_rescue = bool(
-                    _container_flood_outline(
-                        image,
-                        [probe_box["x1"], probe_box["y1"], probe_box["x2"], probe_box["y2"]],
-                        max_area_ratio=45.0,
-                    )
+                flood_points = _container_flood_outline(
+                    image,
+                    probe_coords,
+                    max_area_ratio=45.0,
+                )
+                enclosed_dialogue_rescue = bool(flood_points) and not _rescue_strokes_belong_to_container(
+                    image, probe_coords, flood_points
                 )
             if (
                 cls != "dialogue"

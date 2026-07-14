@@ -60,8 +60,8 @@
         <button id="resumeBtn" class="btn btn-secondary btn-action" data-help-panel="hoverHelp" data-help-title="Resume" data-help="Clears the paused state.|Restarts queued work if auto-translate is enabled.|Does not reload GPU models if they are already warm.">Resume</button>
         <button id="softStopBtn" class="btn btn-warning btn-action" data-help-panel="hoverHelp" data-help-title="Soft Stop" data-help="Stops active and queued translation work.|Keeps the backend process alive.|Keeps models available so the next run starts faster.">Soft Stop</button>
         <button id="hardStopBtn" class="btn btn-danger btn-action" data-help-panel="hoverHelp" data-help-title="Hard Stop" data-help="Stops active and queued translation work.|Requests backend model unload and GPU release.|Does not kill the local server process, so the popup can still control it.">Hard Stop</button>
-        <button id="retranslateBtn" class="btn btn-secondary btn-action" data-help-panel="hoverHelp" data-help-title="Re-translate" data-help="Clears browser cache and backend runtime output cache.|Forces a fresh translation pass.|Use after pipeline fixes or rendering changes.">Re-translate</button>
-        <button id="clearBtn" class="btn btn-secondary btn-action actions-grid-wide" data-help-panel="hoverHelp" data-help-title="Clear Page" data-help="Removes translated overlays from the current tab.|Clears browser cache and backend runtime output cache.|Use this before testing a fixed page again.">Clear Page</button>
+        <button id="retranslateBtn" class="btn btn-secondary btn-action" data-help-panel="hoverHelp" data-help-title="Re-translate" data-help="Resets the current page and re-scans it.|Cached pages restore instantly; only uncached images recompute.|Use Clear Cache first to force a full recompute.">Re-translate</button>
+        <button id="clearBtn" class="btn btn-secondary btn-action actions-grid-wide" data-help-panel="hoverHelp" data-help-title="Clear Page" data-help="Removes translated overlays from the current tab.|Does not clear the browser or backend cache.|Use Clear Cache below to force a full recompute.">Clear Page</button>
       </div>
     </section>
 

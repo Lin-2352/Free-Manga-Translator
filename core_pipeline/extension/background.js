@@ -956,7 +956,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.kind === 'checkPipelineHealth') {
     getSettings().then(async (settings) => {
-      const ok = await checkPipelineHealth(settings, { clearCacheOnFailure: true });
+      // A transiently unreachable backend does not mean cached results are
+      // stale -- clearing here silently wiped the cache on every popup open
+      // that happened to race a slow health check. Only the explicit Clear
+      // Cache action (and a genuine pipeline URL/language change) clears it.
+      const ok = await checkPipelineHealth(settings, { clearCacheOnFailure: false });
       sendResponse({ ok, cacheSize: translationCache.size });
     });
     return true;
