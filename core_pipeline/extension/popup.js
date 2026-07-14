@@ -415,7 +415,7 @@ document.addEventListener('DOMContentLoaded', () => {
         setEngineStatus('Reachable');
       } else {
         setEngineStatus('Offline');
-        statusText.textContent = 'Local server unreachable; browser cache cleared';
+        statusText.textContent = 'Local server unreachable';
       }
       refreshStats();
       refreshQuotaStatus().catch(() => {});
@@ -546,12 +546,13 @@ document.addEventListener('DOMContentLoaded', () => {
   clearBtn.addEventListener('click', async () => {
     try {
       await withButton(clearBtn, async () => {
-        await sendActivePageCommand({ kind: 'clearTranslations' });
-        const response = await runtimeMessage({ kind: 'clearCache' });
-        if (response.success === false) throw new Error(response.error || 'Cache clear failed');
-        statusText.textContent = response.backendCleared === false
-          ? 'Page cleared; backend cache unavailable'
-          : 'Page and runtime caches cleared';
+        // Visual reset only -- must NOT touch translationCache or the backend
+        // runtime cache, or a later Translate Page recomputes everything from
+        // scratch instead of restoring instantly from cache. Use the dedicated
+        // Clear Cache button for that.
+        const response = await sendActivePageCommand({ kind: 'clearTranslations' });
+        if (response?.success === false) throw new Error(response.error || 'Clear page failed');
+        statusText.textContent = 'Page cleared (cache kept)';
       });
       refreshStats();
     } catch (error) {
@@ -586,12 +587,15 @@ document.addEventListener('DOMContentLoaded', () => {
   retranslateBtn.addEventListener('click', async () => {
     try {
       await withButton(retranslateBtn, async () => {
-        const response = await runtimeMessage({ kind: 'clearCache' });
-        if (response.success === false) throw new Error(response.error || 'Cache clear failed');
+        // Re-translate resets the page's visual state and re-scans; it does NOT
+        // clear the cache -- already-cached pages restore instantly, only
+        // genuinely uncached/changed images recompute. Use Clear Cache first if
+        // a forced full recompute is actually wanted.
         await runtimeMessage({ kind: 'setTranslationPaused', paused: false });
-        await sendActivePageCommand({ kind: 'retranslateAll' });
+        const response = await sendActivePageCommand({ kind: 'retranslateAll' });
+        if (response?.success === false) throw new Error(response.error || 'Re-translate failed');
       });
-      statusText.textContent = 'Caches cleared; re-translating current page...';
+      statusText.textContent = 'Re-translating current page...';
       refreshStats();
       window.close();
     } catch (error) {

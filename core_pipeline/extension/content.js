@@ -16,6 +16,8 @@
   const CAPTURE_IMAGE_QUALITY = 0.92;
   const TRANSLATED_ATTR = 'data-fmt-translated';
   const PROCESSING_ATTR = 'data-fmt-processing';
+  const PROCESSING_SINCE_ATTR = 'data-fmt-processing-since';
+  const STALE_PROCESSING_MS = 5 * 60 * 1000; // comfortably longer than any real pipeline run
   const ORIGINAL_SRC_ATTR = 'data-fmt-original-src';
   const ORIGINAL_SRCSET_ATTR = 'data-fmt-original-srcset';
   const ORIGINAL_WIDTH_ATTR = 'data-fmt-original-width';
@@ -34,6 +36,14 @@
   let fontFamily = 'CC Wild Words';
   let fontColor = '#000000';
   let autoQueueLimit = DEFAULT_AUTO_QUEUE_LIMIT;
+  // Bumped by cancelPageWork(). A request captures the current generation
+  // before awaiting its response; if the generation has moved on by the time
+  // it resolves, the request was superseded (e.g. a bfcache-restore recovery
+  // ran while it was in flight) and its result must be discarded rather than
+  // applied -- a newer request may already own the same image's pending/
+  // processing state, and isCurrentImageSource() alone can't detect this
+  // (the image's src hasn't necessarily changed, just which request "owns" it).
+  let pageWorkGeneration = 0;
 
   const translatedSrcs = new Set();
   const pendingSrcs = new Set();
@@ -282,12 +292,40 @@
     });
   }
 
+  // A PROCESSING marker's underlying request can die silently without ever
+  // clearing it: the background message port breaks (MV3 service worker
+  // restart) with no navigation event to react to, or bfcache freezes the
+  // page mid-request and the promise never settles on restore. Either way the
+  // image is stuck showing a spinner forever and never gets rescanned. Called
+  // from the watchdog on every tick (regardless of tab visibility) so a
+  // zombie marker is recovered even on a backgrounded tab the user isn't
+  // currently viewing.
+  function recoverStaleProcessingMarkers() {
+    const now = Date.now();
+    document.querySelectorAll(`img[${PROCESSING_ATTR}]`).forEach((img) => {
+      const originalSrc = getOriginalSrc(img);
+      const cacheKey = originalSrc ? buildImageCacheKey(img, originalSrc) : null;
+      // No live pendingSrcs entry at all means nothing is actually tracking
+      // this request anymore, regardless of age.
+      const orphaned = !cacheKey || !pendingSrcs.has(cacheKey);
+      const since = Number(img.getAttribute(PROCESSING_SINCE_ATTR)) || 0;
+      const tooOld = since > 0 && (now - since) > STALE_PROCESSING_MS;
+      if (!orphaned && !tooOld) return;
+      if (cacheKey) pendingSrcs.delete(cacheKey);
+      img.removeAttribute(PROCESSING_ATTR);
+      img.removeAttribute(PROCESSING_SINCE_ATTR);
+      hideSpinner(img);
+    });
+  }
+
   function cancelPageWork(options = {}) {
     if (options.pause === true) isPaused = true;
+    pageWorkGeneration += 1;
     pendingSrcs.clear();
     retryCountMap.clear();
     document.querySelectorAll(`[${PROCESSING_ATTR}]`).forEach((img) => {
       img.removeAttribute(PROCESSING_ATTR);
+      img.removeAttribute(PROCESSING_SINCE_ATTR);
       hideSpinner(img);
     });
     for (const img of Array.from(spinnerMap.keys())) hideSpinner(img);
@@ -777,7 +815,9 @@
     rememberOriginalImage(img, originalSrc);
     pendingSrcs.add(cacheKey);
     img.setAttribute(PROCESSING_ATTR, 'true');
+    img.setAttribute(PROCESSING_SINCE_ATTR, String(Date.now()));
     showSpinner(img);
+    const requestGeneration = pageWorkGeneration;
 
     try {
       let imageData;
@@ -860,6 +900,15 @@
         height: imageData.height
       });
 
+      if (requestGeneration !== pageWorkGeneration) {
+        // Superseded by cancelPageWork() (e.g. a bfcache-restore recovery)
+        // while this request was in flight. A newer request may already own
+        // this image's pendingSrcs/PROCESSING_ATTR state, so this stale
+        // response must not touch them or apply itself over fresher work.
+        console.log('[MangaTranslator] Discarding superseded translation response for:', String(originalSrc).substring(0, 80));
+        return;
+      }
+
       if (response?.error) {
         console.warn('[MangaTranslator] API error:', response.error);
         emitDiagnostic('content.translate.error_response', traceId, {
@@ -924,7 +973,10 @@
         cacheKey,
         error: error?.message || String(error || ''),
       });
-      cleanupProcessing(img, cacheKey);
+      // A newer request may already own this cacheKey's pending/processing
+      // state if this one was superseded before it failed; only this
+      // request's own state may be cleaned up.
+      if (requestGeneration === pageWorkGeneration) cleanupProcessing(img, cacheKey);
     }
   }
 
@@ -933,7 +985,9 @@
     rememberOriginalImage(img, originalSrc);
     pendingSrcs.add(cacheKey);
     img.setAttribute(PROCESSING_ATTR, 'true');
+    img.setAttribute(PROCESSING_SINCE_ATTR, String(Date.now()));
     showSpinner(img);
+    const requestGeneration = pageWorkGeneration;
     try {
       const response = await chrome.runtime.sendMessage({
         kind: 'translateImage',
@@ -945,6 +999,9 @@
         width: img.naturalWidth || img.width || 0,
         height: img.naturalHeight || img.height || 0
       });
+      // Superseded by cancelPageWork() while this request was in flight -- a
+      // newer request may already own this image's state; see translateImage.
+      if (requestGeneration !== pageWorkGeneration) return;
       if (response?.translatedImageDataUrl) {
         applyTranslatedImage(img, response.translatedImageDataUrl, originalSrc, cacheKey);
       } else if (response?.error && response.error !== 'TranslationPaused') {
@@ -953,9 +1010,11 @@
     } catch (error) {
       console.warn('[MangaTranslator] In-flight attach failed:', error?.message || error);
     } finally {
-      pendingSrcs.delete(cacheKey);
-      img.removeAttribute(PROCESSING_ATTR);
-      hideSpinner(img);
+      if (requestGeneration === pageWorkGeneration) {
+        pendingSrcs.delete(cacheKey);
+        img.removeAttribute(PROCESSING_ATTR);
+        hideSpinner(img);
+      }
     }
   }
 
@@ -1149,6 +1208,10 @@
     if (autoWatchdogTimer !== null) return;
     if (typeof setInterval !== 'function') return;
     autoWatchdogTimer = setInterval(() => {
+      // Runs regardless of tab visibility/pause state -- a zombie marker on a
+      // backgrounded or paused tab still needs to clear so the image isn't
+      // stuck spinning forever whenever the user does return to it.
+      recoverStaleProcessingMarkers();
       if (document.hidden || isPaused) return;
       if (isEnabled) {
         refreshProcessingSpinners();
@@ -1346,7 +1409,22 @@
 
   window.addEventListener('resize', updateSpinners, { passive: true });
   window.addEventListener('scroll', updateSpinners, { passive: true, capture: true });
-  window.addEventListener('pageshow', () => scheduleNavigationScan('pageshow', { delay: 100 }), { passive: true });
+  window.addEventListener('pageshow', (event) => {
+    if (event.persisted) {
+      // A bfcache restore resumes this exact JS heap, including any
+      // PROCESSING markers/pendingSrcs entries from before navigation -- so
+      // recoverStaleProcessingMarkers()'s "orphaned" check would NOT catch
+      // them (pendingSrcs still has the entry; it was frozen, not cleared).
+      // But the message port those in-flight requests were awaiting died
+      // with the old page instance, so their promises are certain to never
+      // settle. cancelPageWork() unconditionally clears every marker before
+      // the scan below runs, so the cache lookup that scan triggers (not a
+      // re-queue) is what applies the now-completed, background-cached
+      // result instead of the image getting stuck on its old, dead marker.
+      cancelPageWork();
+    }
+    scheduleNavigationScan('pageshow', { delay: 100 });
+  }, { passive: true });
   window.addEventListener('popstate', () => scheduleNavigationScan('popstate', { delay: 150 }), { passive: true });
   window.addEventListener('hashchange', () => scheduleNavigationScan('hashchange', { delay: 150 }), { passive: true });
   window.addEventListener('focus', () => scheduleNavigationScan('focus', { delay: 250 }), { passive: true });
