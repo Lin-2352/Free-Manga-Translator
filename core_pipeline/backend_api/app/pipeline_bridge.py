@@ -26,10 +26,11 @@ del _BootstrapPath, _bootstrap_sys, _BOOTSTRAP_FILE, _candidate, _PROJECT_ROOT_F
 # --- End clean-copy path bootstrap ---
 
 from pathlib import Path
+import contextlib
 import hashlib
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 
 import run_extension_pipeline_server as legacy_bridge
 
@@ -37,6 +38,7 @@ from .gpu_scheduler import PIPELINE_SCHEDULER
 
 
 _SAMPLE_LOCKS: dict[str, threading.Lock] = {}
+_SAMPLE_LOCK_REFCOUNTS: dict[str, int] = {}
 _SAMPLE_LOCKS_GUARD = threading.Lock()
 
 
@@ -86,13 +88,31 @@ def _runtime_sample_name(image_bytes: bytes, language: str) -> str:
     return f"runtime_{normalized}_{digest}"
 
 
-def _sample_lock(sample_name: str) -> threading.Lock:
+@contextlib.contextmanager
+def _sample_lock(sample_name: str) -> Iterator[None]:
+    # A plain dict of one Lock per unique image, never evicted, grows without bound across
+    # the server's lifetime (every distinct image ever translated leaks a Lock object
+    # forever). Refcount each lock's outstanding holders/waiters and drop it from the dict
+    # once nobody needs it -- a later request for the same image just creates a fresh Lock,
+    # which is equivalent for mutual exclusion since there is no concurrent user left to race.
     with _SAMPLE_LOCKS_GUARD:
         lock = _SAMPLE_LOCKS.get(sample_name)
         if lock is None:
             lock = threading.Lock()
             _SAMPLE_LOCKS[sample_name] = lock
-        return lock
+        _SAMPLE_LOCK_REFCOUNTS[sample_name] = _SAMPLE_LOCK_REFCOUNTS.get(sample_name, 0) + 1
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _SAMPLE_LOCKS_GUARD:
+            remaining = _SAMPLE_LOCK_REFCOUNTS.get(sample_name, 1) - 1
+            if remaining <= 0:
+                _SAMPLE_LOCK_REFCOUNTS.pop(sample_name, None)
+                _SAMPLE_LOCKS.pop(sample_name, None)
+            else:
+                _SAMPLE_LOCK_REFCOUNTS[sample_name] = remaining
 
 
 def run_pipeline_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -119,52 +139,65 @@ def run_pipeline_payload(payload: dict[str, Any]) -> dict[str, Any]:
     trace_id = metadata.get("traceId") or payload.get("clientRequestId") or "no-trace"
     source = metadata.get("source") or "unknown"
     sample_name = _runtime_sample_name(image_bytes, language)
+    stop_generation = legacy_bridge.current_stop_generation()
     with _sample_lock(sample_name):
-        with PIPELINE_SCHEDULER.acquire(str(cache_id)[:80]) as scheduler_slot:
-            print(
-                (
-                    f"[api] pipeline request start trace={trace_id} sample={sample_name} "
-                    f"language={language} source={source} bytes={len(image_bytes)} cache={str(cache_id)[:80]}"
-                ),
-                flush=True,
-            )
-            sample_name, _ = legacy_bridge._write_runtime_sample(image_bytes, language)
-            try:
-                if legacy_bridge._has_reusable_runtime_output(sample_name, language):
-                    report = legacy_bridge._collect_runtime_report(
-                        sample_name,
-                        language,
-                        stage_timings=[{"stage": "runtime_output_cache", "seconds": 0}],
-                        total_seconds=0,
-                        reused_output=True,
-                    )
-                    legacy_bridge._assert_runtime_report_safe(report)
-                    print(f"[api] runtime output cache hit sample={sample_name}", flush=True)
-                else:
-                    report = legacy_bridge._run_runtime_pipeline(sample_name, language)
-            except Exception as error:
-                diagnostics = _failure_diagnostics(sample_name, language)
+        # A cache hit (and the write/reusability-check preceding it) never went through
+        # _begin_runtime_job/_end_runtime_job, which is what registers a sample in
+        # ACTIVE_RUNTIME_SAMPLES -- so a concurrent /v1/cache/clear could rmtree this
+        # sample's output folders mid-read. Register for the whole span (the miss path's
+        # _run_runtime_pipeline call also registers internally; that's fine, both are now
+        # refcounted so nested registration can't cause an early release).
+        legacy_bridge._mark_sample_active(sample_name)
+        try:
+            with PIPELINE_SCHEDULER.acquire(str(cache_id)[:80]) as scheduler_slot:
                 print(
                     (
-                        f"[api] pipeline request failed trace={trace_id} sample={sample_name} "
-                        f"language={language} error={error} diagnostics={diagnostics}"
+                        f"[api] pipeline request start trace={trace_id} sample={sample_name} "
+                        f"language={language} source={source} bytes={len(image_bytes)} cache={str(cache_id)[:80]}"
                     ),
                     flush=True,
                 )
-                raise PipelineRunError(
-                    f"Pipeline failed for {sample_name}: {error}; diagnostics={diagnostics}"
-                ) from error
-            report["scheduler"] = scheduler_slot.as_report()
-            translated_image = legacy_bridge._read_output_data_url(sample_name)
-            step8 = report.get("step8") if isinstance(report.get("step8"), dict) else {}
-            print(
-                (
-                    f"[api] pipeline request done trace={trace_id} sample={sample_name} "
-                    f"outputSafety={report.get('outputSafety')} rendered={step8.get('regions')} "
-                    f"total={time.perf_counter() - started:.2f}s"
-                ),
-                flush=True,
-            )
+                sample_name, _ = legacy_bridge._write_runtime_sample(image_bytes, language)
+                try:
+                    if legacy_bridge._has_reusable_runtime_output(sample_name, language):
+                        report = legacy_bridge._collect_runtime_report(
+                            sample_name,
+                            language,
+                            stage_timings=[{"stage": "runtime_output_cache", "seconds": 0}],
+                            total_seconds=0,
+                            reused_output=True,
+                        )
+                        legacy_bridge._assert_runtime_report_safe(report)
+                        print(f"[api] runtime output cache hit sample={sample_name}", flush=True)
+                    else:
+                        report = legacy_bridge._run_runtime_pipeline(
+                            sample_name, language, stop_generation=stop_generation
+                        )
+                    report["scheduler"] = scheduler_slot.as_report()
+                    translated_image = legacy_bridge._read_output_data_url(sample_name)
+                except Exception as error:
+                    diagnostics = _failure_diagnostics(sample_name, language)
+                    print(
+                        (
+                            f"[api] pipeline request failed trace={trace_id} sample={sample_name} "
+                            f"language={language} error={error} diagnostics={diagnostics}"
+                        ),
+                        flush=True,
+                    )
+                    raise PipelineRunError(
+                        f"Pipeline failed for {sample_name}: {error}; diagnostics={diagnostics}"
+                    ) from error
+                step8 = report.get("step8") if isinstance(report.get("step8"), dict) else {}
+                print(
+                    (
+                        f"[api] pipeline request done trace={trace_id} sample={sample_name} "
+                        f"outputSafety={report.get('outputSafety')} rendered={step8.get('regions')} "
+                        f"total={time.perf_counter() - started:.2f}s"
+                    ),
+                    flush=True,
+                )
+        finally:
+            legacy_bridge._mark_sample_inactive(sample_name)
 
     return {
         "sampleName": sample_name,

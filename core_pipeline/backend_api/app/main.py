@@ -194,7 +194,13 @@ def _execute_translate(request: TranslateRequest) -> TranslateResponse:
         )
         return response
     except HTTPException:
-        JOBS[job_id]["status"] = "fail"
+        # job_id's JOBS entry can be evicted by _record_job's FIFO cap (concurrent churn from
+        # other requests) between it being recorded above and this handler running -- a bare
+        # subscript mutation would then KeyError here, masking the real HTTPException with an
+        # unrelated crash during its own error handling.
+        with _JOBS_GUARD:
+            if job_id in JOBS:
+                JOBS[job_id]["status"] = "fail"
         write_diagnostic_event(
             "pipeline.request.http_error",
             {"jobId": job_id, "status": "fail"},

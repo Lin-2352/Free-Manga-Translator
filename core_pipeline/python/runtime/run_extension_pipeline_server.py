@@ -80,9 +80,20 @@ IDLE_MONITOR_LOCK = threading.Lock()
 IDLE_MONITOR_THREAD: threading.Thread | None = None
 RUNTIME_ACTIVITY_LOCK = threading.Lock()
 RUNTIME_STOP_EVENT = threading.Event()
+# Bumped on every request_runtime_stop() call. A job captures the current generation when
+# it is SUBMITTED (before it may have to wait on the scheduler) and is expected to abort if
+# the generation has moved on by the time it actually runs a stage -- this makes stop
+# semantics point-in-time instead of a single sticky flag that a later job's own start can
+# silently clear out from under an earlier, still-running/queued job (see _begin_runtime_job).
+RUNTIME_STOP_GENERATION = 0
 RUNTIME_PENDING_RELEASE = False
 RUNTIME_ACTIVE_JOBS = 0
-ACTIVE_RUNTIME_SAMPLES: set[str] = set()
+# sample_name -> refcount. A plain set here would let two overlapping registrations for the
+# same sample (e.g. pipeline_bridge's outer active-marking span plus this module's own
+# _begin_runtime_job/_end_runtime_job around the miss-path pipeline run) have the INNER one's
+# release wipe out the OUTER one's registration early, reopening the exact race this guards
+# against. Refcounting makes nested/overlapping registrations for the same sample safe.
+ACTIVE_RUNTIME_SAMPLES: dict[str, int] = {}
 RUNTIME_LAST_ACTIVITY_MONOTONIC = time.monotonic()
 RUNTIME_LAST_ACTIVITY_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 WARMUP_STATE: dict[str, Any] = {
@@ -122,13 +133,56 @@ def _mark_runtime_activity() -> None:
         RUNTIME_LAST_ACTIVITY_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _begin_runtime_job(sample_name: str | None = None) -> None:
+def _add_active_sample_locked(sample_name: str) -> None:
+    ACTIVE_RUNTIME_SAMPLES[sample_name] = ACTIVE_RUNTIME_SAMPLES.get(sample_name, 0) + 1
+
+
+def _discard_active_sample_locked(sample_name: str) -> None:
+    remaining = ACTIVE_RUNTIME_SAMPLES.get(sample_name, 1) - 1
+    if remaining <= 0:
+        ACTIVE_RUNTIME_SAMPLES.pop(sample_name, None)
+    else:
+        ACTIVE_RUNTIME_SAMPLES[sample_name] = remaining
+
+
+def _mark_sample_active(sample_name: str | None) -> None:
+    if not sample_name:
+        return
+    with RUNTIME_ACTIVITY_LOCK:
+        _add_active_sample_locked(sample_name)
+
+
+def _mark_sample_inactive(sample_name: str | None) -> None:
+    if not sample_name:
+        return
+    with RUNTIME_ACTIVITY_LOCK:
+        _discard_active_sample_locked(sample_name)
+
+
+def current_stop_generation() -> int:
+    with RUNTIME_ACTIVITY_LOCK:
+        return RUNTIME_STOP_GENERATION
+
+
+def _is_stop_current(captured_generation: int) -> bool:
+    """True if a stop has been requested since captured_generation was captured."""
+    with RUNTIME_ACTIVITY_LOCK:
+        return RUNTIME_STOP_GENERATION != captured_generation
+
+
+def _begin_runtime_job(sample_name: str | None = None, stop_generation: int | None = None) -> None:
     global RUNTIME_ACTIVE_JOBS
     with RUNTIME_ACTIVITY_LOCK:
-        RUNTIME_STOP_EVENT.clear()
+        # Only acknowledge (clear) the stop-requested flag for a job that was submitted in
+        # the CURRENT generation -- i.e. one unaffected by any stop that has happened since
+        # it was requested. A job whose captured generation is stale is about to be aborted
+        # by the generation check in run_stage anyway, so it must not clear the flag out from
+        # under a more recent stop that other jobs still need to see.
+        if stop_generation is not None and stop_generation == RUNTIME_STOP_GENERATION:
+            RUNTIME_STOP_EVENT.clear()
         RUNTIME_ACTIVE_JOBS += 1
         if sample_name:
-            ACTIVE_RUNTIME_SAMPLES.add(sample_name)
+            _add_active_sample_locked(sample_name)
     _mark_runtime_activity()
 
 
@@ -138,7 +192,7 @@ def _end_runtime_job(sample_name: str | None = None) -> None:
     with RUNTIME_ACTIVITY_LOCK:
         RUNTIME_ACTIVE_JOBS = max(0, RUNTIME_ACTIVE_JOBS - 1)
         if sample_name:
-            ACTIVE_RUNTIME_SAMPLES.discard(sample_name)
+            _discard_active_sample_locked(sample_name)
         release_after_job = RUNTIME_ACTIVE_JOBS == 0 and RUNTIME_PENDING_RELEASE
     _mark_runtime_activity()
     if release_after_job:
@@ -254,9 +308,10 @@ def release_runtime_models(reason: str = "manual_release") -> dict[str, Any]:
 
 
 def request_runtime_stop(release_gpu: bool = False, reason: str = "manual_stop") -> dict[str, Any]:
-    global RUNTIME_PENDING_RELEASE
+    global RUNTIME_PENDING_RELEASE, RUNTIME_STOP_GENERATION
     RUNTIME_STOP_EVENT.set()
     with RUNTIME_ACTIVITY_LOCK:
+        RUNTIME_STOP_GENERATION += 1
         active_jobs = RUNTIME_ACTIVE_JOBS
         if release_gpu:
             RUNTIME_PENDING_RELEASE = True
@@ -821,7 +876,9 @@ def _assert_runtime_report_safe(report: dict[str, Any]) -> None:
         raise RuntimeError(f"Local pipeline failed before producing a usable output: {summary}")
 
 
-def _run_runtime_pipeline(sample_name: str, language: str) -> dict[str, Any]:
+def _run_runtime_pipeline(
+    sample_name: str, language: str, stop_generation: int | None = None
+) -> dict[str, Any]:
     total_started = time.perf_counter()
     os.environ["LOCAL_NLLB_TRANSLATION"] = "1"
     import run_step4_inpaint
@@ -835,20 +892,26 @@ def _run_runtime_pipeline(sample_name: str, language: str) -> dict[str, Any]:
     _write_runtime_manifest(sample_name, language)
 
     stage_timings: list[dict[str, Any]] = []
+    # Captured once, at (or before) the point this specific job actually started running --
+    # callers that submit work before it runs (e.g. while waiting on the GPU scheduler) pass
+    # their own earlier-captured generation down so a stop requested during that wait still
+    # cancels them. Falls back to "now" for direct callers (e.g. the legacy standalone HTTP
+    # handler) that never captured one.
+    job_generation = stop_generation if stop_generation is not None else current_stop_generation()
 
     def run_stage(label: str, callback: Any) -> None:
-        if RUNTIME_STOP_EVENT.is_set():
+        if _is_stop_current(job_generation):
             raise RuntimeError("Translation stopped by user")
         started = time.perf_counter()
         print(f"[runtime] {sample_name} {label}: start", flush=True)
         callback()
-        if RUNTIME_STOP_EVENT.is_set():
+        if _is_stop_current(job_generation):
             raise RuntimeError("Translation stopped by user")
         elapsed = time.perf_counter() - started
         stage_timings.append({"stage": label, "seconds": round(elapsed, 3)})
         print(f"[runtime] {sample_name} {label}: done in {elapsed:.2f}s", flush=True)
 
-    _begin_runtime_job(sample_name)
+    _begin_runtime_job(sample_name, stop_generation=job_generation)
     try:
         run_stage("step5_ocr", lambda: run_step5_ocr.run_step5_ocr(sample_map=sample_map, samples_dir=SAMPLES_ROOT))
         run_stage("step6_layout", lambda: run_step6_layout.run_step6_layout(sample_map=sample_map, samples_dir=SAMPLES_ROOT))
