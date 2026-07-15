@@ -1278,6 +1278,51 @@ def _merge_adjacent_floating_line_fragments(
         h_gap = max(0, max(gx1, x1) - min(gx2, x2))
         return h_gap <= max(72, int(min(group_height, item_height) * 1.10))
 
+    def intervening_column_between(
+        group_box: tuple[int, int, int, int], candidate_box: tuple[int, int, int, int]
+    ) -> bool:
+        # same_line() only tests the pair being bridged -- it has no notion
+        # of a THIRD box sitting physically between them. For vertical CJK
+        # text that's a real failure mode: two short same-height fragments
+        # from DIFFERENT columns (e.g. the top of column 3 and the top of
+        # column 1) can look like one broken horizontal line while a genuine
+        # tall column (column 2, already excluded from `eligible()` by its
+        # own height -- see the ratio check above) sits between them. Reuse
+        # that exact "genuine column" shape test here so a real column
+        # blocks the bridge even though it can never join the merge itself
+        # (verified regression: new_sample_6's "ま"/"こ" fragments bridged
+        # straight across "そういう"'s own column and got misread as one
+        # broken SFX-looking line).
+        gx1, gy1, gx2, gy2 = group_box
+        cx1, cy1, cx2, cy2 = candidate_box
+        gap_lo = min(gx2, cx2)
+        gap_hi = max(gx1, cx1)
+        if gap_hi <= gap_lo:
+            return False
+        band_lo = min(gy1, cy1)
+        band_hi = max(gy2, cy2)
+        for probe in ocr_data:
+            if not isinstance(probe, dict):
+                continue
+            pbox = probe.get("box")
+            if not isinstance(pbox, dict):
+                continue
+            px1 = int(pbox.get("x1", 0))
+            py1 = int(pbox.get("y1", 0))
+            px2 = int(pbox.get("x2", px1))
+            py2 = int(pbox.get("y2", py1))
+            p_width = max(1, px2 - px1)
+            p_height = max(1, py2 - py1)
+            if p_height <= max(96, int(p_width * 1.35)):
+                continue
+            if px1 < gap_lo - 2 or px2 > gap_hi + 2:
+                continue
+            v_overlap = max(0, min(band_hi, py2) - max(band_lo, py1))
+            if v_overlap <= 0:
+                continue
+            return True
+        return False
+
     indexed = [
         (index, item)
         for index, item in enumerate(ocr_data)
@@ -1317,6 +1362,8 @@ def _merge_adjacent_floating_line_fragments(
                     continue
                 ox1, oy1, ox2, oy2 = bounds(other)
                 if not same_line((gx1, gy1, gx2, gy2), (ox1, oy1, ox2, oy2)):
+                    continue
+                if intervening_column_between((gx1, gy1, gx2, gy2), (ox1, oy1, ox2, oy2)):
                     continue
                 candidate_width = max(gx2, ox2) - min(gx1, ox1)
                 # A generous ceiling, not a routine blocker: with membership
@@ -1672,6 +1719,53 @@ def _floating_roi_has_dominant_sfx_art(item: dict, image: np.ndarray | None) -> 
     return dark_fraction >= 0.055 and has_short_dialogue_fragment
 
 
+def _touches_accepted_floating_dialogue(
+    x1: int, y1: int, x2: int, y2: int, constraints: list[dict], max_gap: int = 20
+) -> bool:
+    for constraint in constraints:
+        if constraint.get("bubble_idx", -1) != -1 or constraint.get("semantic_role") != "dialogue":
+            continue
+        rb = constraint.get("red_box", [0, 0, 0, 0])
+        rx1, ry1, rx2, ry2 = [int(v) for v in rb]
+        h_gap = max(0, max(x1, rx1) - min(x2, rx2))
+        v_gap = max(0, max(y1, ry1) - min(y2, ry2))
+        if h_gap <= max_gap and v_gap <= max_gap:
+            return True
+    return False
+
+
+def _orphaned_dialogue_shard(item: dict, constraints: list[dict]) -> bool:
+    # A lone 1-5 char hiragana shard (no kanji, no katakana) sitting within
+    # 20px of an already-accepted floating dialogue constraint is almost
+    # always a column/line split of that SAME utterance that OCR reported as
+    # its own item, not independent SFX -- classify_text_by_content has no
+    # geometric context, so a bare "った"/"こ"/"ま" reads exactly like an
+    # onomatopoeia mark to it; only proximity to a confirmed dialogue
+    # neighbor tells them apart. Katakana is excluded because that IS the
+    # classic onomatopoeia shape. Verified regression: new_sample_6's
+    # utterance "まそういうこった" split by OCR into 4 fragments across 3
+    # columns -- one survives on its own merit, but the other three were
+    # being dropped as classification_sfx and left as raw unerased glyphs
+    # behind the English translation in the final render.
+    text = str(item.get("text", "")).strip()
+    if not text:
+        return False
+    counts = _script_counts(text)
+    compact_len = len("".join(c for c in text if c.isalnum()))
+    box = item.get("box", {})
+    x1 = int(box.get("x1", 0))
+    y1 = int(box.get("y1", 0))
+    x2 = int(box.get("x2", x1))
+    y2 = int(box.get("y2", y1))
+    return bool(
+        1 <= compact_len <= 5
+        and counts["han"] == 0
+        and not re.search(r"[゠-ヿ]", text)
+        and re.search(r"[぀-ゟ]", text)
+        and _touches_accepted_floating_dialogue(x1, y1, x2, y2, constraints)
+    )
+
+
 def _recoverable_adjacent_fragment(item: dict, constraints: list[dict], image: np.ndarray | None) -> bool:
     text = str(item.get("text", "")).strip()
     if not text:
@@ -1679,15 +1773,20 @@ def _recoverable_adjacent_fragment(item: dict, constraints: list[dict], image: n
     counts = _script_counts(text)
     cjk_total = counts["hangul"] + counts["kana"] + counts["han"]
     compact_len = len("".join(c for c in text if c.isalnum()))
-    if cjk_total < 2 or compact_len < 2:
-        return False
-    has_dialogue_script = counts["han"] >= 1 or re.search(r"[぀-ゟ]", text) or compact_len >= 5
 
     box = item.get("box", {})
     x1 = int(box.get("x1", 0))
     y1 = int(box.get("y1", 0))
     x2 = int(box.get("x2", x1))
     y2 = int(box.get("y2", y1))
+
+    if _orphaned_dialogue_shard(item, constraints):
+        return True
+
+    if cjk_total < 2 or compact_len < 2:
+        return False
+    has_dialogue_script = counts["han"] >= 1 or re.search(r"[぀-ゟ]", text) or compact_len >= 5
+
     width = max(1, x2 - x1)
     height = max(1, y2 - y1)
     image_shape = image.shape if image is not None else None
@@ -1821,7 +1920,8 @@ def _needs_inferred_bubble_cleanup(
     height = max(1, y2 - y1)
     if korean_paddle and y1 <= int(img_h * 0.20):
         return False
-    if height > max(180, int(img_h * 0.22)):
+    height_cap = max(180, int(img_h * 0.22))
+    if height > height_cap:
         return False
     pale_fraction = _pale_region_fraction(image, (x1, y1, x2, y2))
     dark_fraction = _dark_region_fraction(image, (x1, y1, x2, y2))
@@ -1865,14 +1965,19 @@ def _needs_inferred_bubble_cleanup(
     # a debug-overlay/classification-accuracy gap, not a page defect --
     # revisit only alongside a deliberate barrier-thickness change to
     # _container_flood_outline, verified full-suite, if ever.
-    if width < max(120, int(img_w * 0.10)) and not (short_pale_dialogue or narrow_dark_column):
-        return False
-    if (pale_fraction >= 0.58 and dark_fraction <= 0.22) or short_pale_dialogue:
-        return True
-    # Reversed-polarity container: light glyphs on a dark/black bubble fill
-    # (e.g. new_sample_5's black speech bubbles). Mirrors the light-bubble
-    # gate above with the fractions swapped.
-    return (dark_fraction >= 0.58 and pale_fraction <= 0.22) or narrow_dark_column
+    width_floor = max(120, int(img_w * 0.10))
+    width_floor_pass = width >= width_floor or short_pale_dialogue or narrow_dark_column
+    verdict = None
+    if not width_floor_pass:
+        verdict = False
+    elif (pale_fraction >= 0.58 and dark_fraction <= 0.22) or short_pale_dialogue:
+        verdict = True
+    else:
+        # Reversed-polarity container: light glyphs on a dark/black bubble fill
+        # (e.g. new_sample_5's black speech bubbles). Mirrors the light-bubble
+        # gate above with the fractions swapped.
+        verdict = (dark_fraction >= 0.58 and pale_fraction <= 0.22) or narrow_dark_column
+    return verdict
 
 
 def _refine_constraint_geometry(
@@ -2995,6 +3100,19 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
             f_height = max(1, fy2 - fy1)
             f_center_y = (fy1 + fy2) / 2.0
             erase_only_fragment = _erase_only_adjacent_fragment(item, image)
+            if _orphaned_dialogue_shard(item, constraints):
+                # Force the erase-boxes-only donation path (never expand the
+                # neighbor's red_box/green_box) for this rescue specifically.
+                # Expanding those feeds _apply_art_aware_floating_routes'
+                # container/flood-fill tracing below, which is safe when the
+                # neighbor really sits inside a drawn bubble (verified good:
+                # new_sample_6) but escapes through open, sparsely-inked art
+                # into a large false-positive erasure when it doesn't
+                # (verified regression: new_sample_2's "う．．．" donation blew
+                # a small flag/pennant line-art shape into a solid black
+                # wedge). Erasing the shard's own small box is always safe on
+                # its own merits; only the box-expansion side effect isn't.
+                erase_only_fragment = True
 
             if _short_spoken_dialogue_fragment(item, image):
                 gb = item.get("green_box", box)

@@ -9,12 +9,18 @@ $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 $env:PYTHONIOENCODING = "utf-8"
 
-$LocalPython = Join-Path $ProjectRoot "..\.venv\Scripts\python.exe"
+$LocalPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+# The project's real venv lives two levels up (alongside the repo root), not inside
+# core_pipeline itself -- checked here so this fallback chain can't silently land on a
+# mismatched system Python (see DEVELOPMENT_NOTES.md, 2026-07-14, for the crash that caused).
+$RepoRootPython = Join-Path $ProjectRoot "..\..\.venv\Scripts\python.exe"
 
 if ($Python) {
     $PythonExe = $Python
 } elseif (Test-Path $LocalPython) {
     $PythonExe = $LocalPython
+} elseif (Test-Path $RepoRootPython) {
+    $PythonExe = $RepoRootPython
 } elseif ($env:FMT_PYTHON) {
     $PythonExe = $env:FMT_PYTHON
 } else {

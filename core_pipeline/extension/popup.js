@@ -43,14 +43,53 @@ document.addEventListener('DOMContentLoaded', () => {
   const engineStatusText = document.getElementById('engineStatusText');
   const hoverHelp = document.getElementById('hoverHelp');
   const versionBadge = document.getElementById('versionBadge');
+  const themeToggleBtn = document.getElementById('themeToggleBtn');
 
   const DEFAULT_LOCAL_PIPELINE_URL = 'http://127.0.0.1:8766/v1/translate-image';
   const DEFAULT_CACHE_LIMIT = 12;
   const DEFAULT_QUEUE_LIMIT = 20;
   const DEFAULT_PARALLEL_LIMIT = 2;
+  const THEME_STORAGE_KEY = 'uiTheme';
 
   const manifestVersion = chrome.runtime.getManifest?.().version || '1.1.14';
   if (versionBadge) versionBadge.textContent = `v${manifestVersion}`;
+
+  function systemPrefersDark() {
+    return Boolean(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+
+  // forced is the persisted override ('light'/'dark') or null/undefined to follow the OS.
+  function effectiveTheme(forced) {
+    if (forced === 'light' || forced === 'dark') return forced;
+    return systemPrefersDark() ? 'dark' : 'light';
+  }
+
+  function applyTheme(forced) {
+    if (forced === 'light' || forced === 'dark') {
+      document.documentElement.setAttribute('data-theme', forced);
+    } else {
+      document.documentElement.removeAttribute('data-theme');
+    }
+    const active = effectiveTheme(forced);
+    if (themeToggleBtn) {
+      themeToggleBtn.classList.toggle('is-dark', active === 'dark');
+      themeToggleBtn.setAttribute('aria-pressed', active === 'dark' ? 'true' : 'false');
+      themeToggleBtn.setAttribute('aria-label', active === 'dark' ? 'Switch to light theme' : 'Switch to dark theme');
+    }
+  }
+
+  async function initTheme() {
+    const result = await chrome.storage.local.get([THEME_STORAGE_KEY]);
+    applyTheme(result[THEME_STORAGE_KEY] || null);
+  }
+
+  if (themeToggleBtn) {
+    themeToggleBtn.addEventListener('click', async () => {
+      const next = effectiveTheme(document.documentElement.getAttribute('data-theme')) === 'dark' ? 'light' : 'dark';
+      applyTheme(next);
+      await chrome.storage.local.set({ [THEME_STORAGE_KEY]: next });
+    });
+  }
 
   async function loadSettings() {
     const result = await chrome.storage.local.get([
@@ -729,10 +768,17 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.storage.local.set({ mangaFontColor: fontColorInput.value });
   });
 
+  initTheme();
   loadSettings();
   setupHelpPanels();
   refreshStats();
   refreshQuotaStatus().catch(() => {});
   checkServerHealth();
+
+  // Keeps Active/Queued/Cache numbers current while the popup stays open --
+  // there is no push channel from the background service worker, so this is
+  // a simple poll. The interval dies with the popup's JS context on close,
+  // no teardown needed.
+  setInterval(refreshStats, 2000);
 });
 

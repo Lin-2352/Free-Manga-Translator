@@ -294,6 +294,73 @@ def _split_word_to_fit(
     return [word]
 
 
+def _multipiece_split_word(
+    word: str,
+    font: ImageFont.FreeTypeFont,
+    draw: ImageDraw.ImageDraw,
+    target_width: float,
+    max_pieces: int = 6,
+) -> list[str]:
+    """Last-resort greedy multi-piece hyphenation for a single word that still
+    doesn't fit target_width after _split_word_to_fit's normal (at most
+    2-piece) split -- e.g. a long compound proper noun in a very narrow
+    bubble. Only ever called from the fallback_clipped retry path in
+    _find_mask_aware_layout, at the one font size that already minimized
+    clipping; returns [word] unsplit on any failure so the caller can safely
+    compare the result against its current best candidate and discard it.
+    """
+    if _text_width(word, font, draw) <= target_width:
+        return [word]
+
+    trailing = ""
+    core = word
+    while core and core[-1] in ".,!?;:…":
+        trailing = core[-1] + trailing
+        core = core[:-1]
+    if not core:
+        return [word]
+
+    # Candidate internal break points: dictionary syllable boundaries when
+    # available, else every character position -- either way each is just a
+    # place a hyphen is ALLOWED, not a forced cut. Reusing _HYPHEN_DICT keeps
+    # this consistent with _split_word_to_fit's own preference for real
+    # hyphenation points over blind character counting.
+    if _HYPHEN_DICT is not None:
+        breaks = sorted(set(_HYPHEN_DICT.positions(core)))
+    else:
+        breaks = list(range(1, len(core)))
+    if not breaks:
+        return [word]
+
+    pieces: list[str] = []
+    start = 0
+    while start < len(core):
+        tail_candidate = core[start:] + trailing
+        if _text_width(tail_candidate, font, draw) <= target_width:
+            pieces.append(tail_candidate)
+            start = len(core)
+            break
+        best_end = None
+        for brk in breaks:
+            if brk <= start:
+                continue
+            candidate = core[start:brk] + "-"
+            if _text_width(candidate, font, draw) <= target_width:
+                best_end = brk
+            else:
+                break
+        if best_end is None:
+            return [word]
+        pieces.append(core[start:best_end] + "-")
+        start = best_end
+        if len(pieces) >= max_pieces:
+            return [word]
+
+    if len(pieces) < 3:
+        return [word]
+    return pieces
+
+
 def _wrap_standard(
     words: list[str],
     font: ImageFont.FreeTypeFont,
@@ -301,6 +368,7 @@ def _wrap_standard(
     target_width: float,
     allow_word_split: bool = False,
     min_split_length: int = 8,
+    allow_multipiece: bool = False,
 ) -> list[str]:
     """
     Standard left-to-right greedy word wrap. Long words are split only when
@@ -312,7 +380,14 @@ def _wrap_standard(
     wrapped_words = []
     for word in words:
         if allow_word_split:
-            wrapped_words.extend(_split_word_to_fit(word, font, draw, target_width, min_split_length))
+            split_pieces = _split_word_to_fit(word, font, draw, target_width, min_split_length)
+            if (
+                allow_multipiece
+                and len(split_pieces) == 1
+                and _text_width(split_pieces[0], font, draw) > target_width
+            ):
+                split_pieces = _multipiece_split_word(split_pieces[0], font, draw, target_width)
+            wrapped_words.extend(split_pieces)
         else:
             wrapped_words.append(word)
 
@@ -2813,6 +2888,47 @@ def _find_mask_aware_layout(
             fallback_alpha = try_alpha
             fallback_metrics = try_metrics
             fallback_position = try_pos
+
+    # Last resort: every tested size still clipped even with the normal
+    # (at most 2-piece) word split. Retry ONLY the single best-scoring size
+    # found above, this time allowing a long word to break into more than 2
+    # pieces (_multipiece_split_word) -- a very narrow bubble with a long
+    # compound proper noun is exactly the case a 2-piece split can't rescue.
+    # Only replaces the candidate on a strict improvement, so this can never
+    # make an already-fitting or already-minimal-clipping render worse.
+    used_multisplit_fallback = False
+    if best_fallback_clipped is not None and best_fallback_clipped > 0:
+        retry_stroke = (
+            text_style.get("floating_stroke_color", text_style["stroke_color"])
+            if is_floating and not text_style.get("source_cover")
+            else text_style["stroke_color"]
+        )
+        retry_lines = _wrap_standard(
+            words, fallback_font, measure_draw, max(8.0, bounds_width * 0.9),
+            allow_word_split=True, min_split_length=6, allow_multipiece=True,
+        )
+        if retry_lines and retry_lines != fallback_lines:
+            retry_block, retry_alpha, retry_metrics = _render_text_block(
+                retry_lines, fallback_font, best_fallback_size, fallback_outline,
+                text_style["fill_color"], retry_stroke,
+            )
+            retry_pos = _clamp_top_left(green_center, (retry_block.width, retry_block.height), mask_bounds) or (mask_bounds[0], mask_bounds[1])
+            retry_clipped = _count_clipped_pixels(retry_alpha, allowed_np, retry_pos)
+            if retry_clipped < best_fallback_clipped:
+                fallback_font_size = best_fallback_size
+                fallback_lines = retry_lines
+                fallback_block = retry_block
+                fallback_alpha = retry_alpha
+                fallback_metrics = retry_metrics
+                fallback_position = retry_pos
+                best_fallback_clipped = retry_clipped
+                # Only the quality gate's BAD_STEP8_STATUSES-escaping status
+                # is reserved for a FULL fit -- a merely-smaller clip count
+                # still needs the same "fallback_clipped" flag it always had
+                # so the gate keeps surfacing it (clipped_pixels below is
+                # still the improved, smaller count either way).
+                used_multisplit_fallback = retry_clipped == 0
+
     # If no size was tried (max_size < MIN_FONT_SIZE), use MIN_FONT_SIZE
     if best_fallback_clipped is None:
         fallback_font_size = MIN_FONT_SIZE
@@ -2850,7 +2966,7 @@ def _find_mask_aware_layout(
         "alpha": fallback_alpha,
         "position": fallback_position,
         "metrics": fallback_metrics,
-        "status": "fallback_clipped",
+        "status": "fallback_fit_multisplit" if used_multisplit_fallback else "fallback_clipped",
         "clipped_pixels": _count_clipped_pixels(fallback_alpha, allowed_np, fallback_position),
     }
 
