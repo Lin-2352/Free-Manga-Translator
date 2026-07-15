@@ -305,16 +305,23 @@ def _provider_order() -> list[str]:
         for provider in os.environ.get("TRANSLATION_PROVIDER_ORDER", "").split(",")
         if provider.strip()
     ]
+    # Ordered by translation quality among the models actually configured per
+    # provider below, strongest-healthy-first: mistral-large and the
+    # non-reasoning 70B-class chat models outperform small/reasoning models
+    # (qwen3-32b, gpt-oss) on grammar and register for short manga dialogue
+    # lines. Providers with revoked/locked credentials are kept at the tail
+    # rather than removed -- reserve_key() skips them for free and they
+    # resume automatically the moment keys are rotated.
     defaults = [
-        "groq",
+        "mistral",
         "cerebras",
+        "fireworks",
+        "groq",
         "nvidia",
         "github",
         "openrouter",
         "gemini",
         "cloudflare",
-        "fireworks",
-        "mistral",
     ]
     ordered = []
     for provider in [preferred, *explicit, *defaults]:
@@ -338,6 +345,33 @@ def _provider_order() -> list[str]:
         if normalized and normalized not in ordered:
             ordered.append(normalized)
     return ordered
+
+
+def _page_context_enabled() -> bool:
+    return os.environ.get("TRANSLATION_PAGE_CONTEXT", "1").strip().lower() not in {"0", "false", "off"}
+
+
+def _load_page_context(sample_dir: Path, max_chars: int = 600) -> str:
+    # Written by the live runtime server (run_extension_pipeline_server.py)
+    # before this step runs, from a rolling per-site ring of the last couple
+    # pages' accepted translations -- purely so names/tone stay consistent
+    # across pages of the same manga read in sequence. Never present for the
+    # offline validation suite (nothing writes this file there), so this is
+    # a no-op / dead code path when running that suite.
+    if not _page_context_enabled():
+        return ""
+    context_path = sample_dir / "page_context.json"
+    if not context_path.exists():
+        return ""
+    try:
+        data = json.loads(context_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    lines = data.get("lines") if isinstance(data, dict) else None
+    if not isinstance(lines, list) or not lines:
+        return ""
+    text = " / ".join(str(line).strip() for line in lines if str(line).strip())
+    return text[:max_chars]
 
 
 def _rotated_provider_keys(provider: str, keys: list[str]) -> list[tuple[int, str]]:
@@ -696,7 +730,7 @@ def _pretranslated_text(item: dict[str, object]) -> str:
     return ""
 
 
-def _translation_prompt(items: list[dict[str, object]], sample_name: str) -> str:
+def _translation_prompt(items: list[dict[str, object]], sample_name: str, page_context: str = "") -> str:
     compact_items = []
     for item in items:
         source_text = str(item.get("text", "")).strip()
@@ -740,7 +774,12 @@ def _translation_prompt(items: list[dict[str, object]], sample_name: str) -> str
         "names intentionally romanized.\n"
         "Keep each translation concise enough for manga typesetting while preserving meaning.\n"
         "Return JSON only, exactly this shape: [{\"id\": 0, \"en_text\": \"...\"}].\n"
-        f"Sample: {sample_name}\n"
+        + (
+            f"Prior page context, for name/tone consistency ONLY -- do not re-translate these, "
+            f"they are already rendered: {page_context}\n"
+            if page_context else ""
+        )
+        + f"Sample: {sample_name}\n"
         f"Items: {json.dumps(compact_items, ensure_ascii=False)}"
     )
 
@@ -951,7 +990,10 @@ def _call_openrouter(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
 def _call_groq(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
     models = _model_candidates(
         ("GROQ_TRANSLATION_MODELS", "GROQ_TRANSLATION_MODEL"),
-        ["qwen/qwen3-32b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b", "llama-3.1-8b-instant"],
+        # llama-3.3-70b-versatile first: a plain chat model beats qwen3-32b's
+        # reasoning-model output (think-tag risk, worse register match) on
+        # short manga dialogue lines.
+        ["llama-3.3-70b-versatile", "openai/gpt-oss-20b", "qwen/qwen3-32b", "llama-3.1-8b-instant"],
     )
     return _call_openai_compatible(
         "groq",
@@ -966,7 +1008,8 @@ def _call_cerebras(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
     base_url = os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1").rstrip("/")
     models = _model_candidates(
         ("CEREBRAS_TRANSLATION_MODELS", "CEREBRAS_TRANSLATION_MODEL"),
-        ["qwen-3-32b", "llama-3.3-70b", "gpt-oss-120b"],
+        # Non-reasoning chat models first; qwen-3-32b (reasoning) demoted to last.
+        ["gpt-oss-120b", "llama-3.3-70b", "qwen-3-32b"],
     )
     return _call_openai_compatible(
         "cerebras",
@@ -981,7 +1024,10 @@ def _call_nvidia(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
     base_url = os.environ.get("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
     models = _model_candidates(
         ("NVIDIA_NIM_TRANSLATION_MODELS", "NVIDIA_NIM_TRANSLATION_MODEL"),
-        ["qwen/qwen3-5-122b-a10b", "qwen/qwen3.5-397b-a17b", "meta/llama-3.1-70b-instruct", "mistralai/mistral-7b-instruct-v0.3", "meta/llama-3.1-8b-instruct"],
+        # A verified, well-established 70B chat model first; the qwen3.5 IDs
+        # below don't match any published Qwen release naming and are kept
+        # only as unverified fallbacks.
+        ["meta/llama-3.1-70b-instruct", "qwen/qwen3-5-122b-a10b", "qwen/qwen3.5-397b-a17b", "mistralai/mistral-7b-instruct-v0.3", "meta/llama-3.1-8b-instruct"],
     )
     return _call_openai_compatible(
         "nvidia",
@@ -996,9 +1042,11 @@ def _call_fireworks(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
     models = _model_candidates(
         ("FIREWORKS_TRANSLATION_MODELS", "FIREWORKS_TRANSLATION_MODEL"),
         [
-            "accounts/fireworks/models/qwen3p235b-a22b",
+            # A plain 72B chat model first; the 235B qwen3 entry is a
+            # hybrid-thinking model (think-tag risk) demoted below it.
             "accounts/fireworks/models/qwen2p5-72b-instruct",
             "accounts/fireworks/models/llama-v3p1-70b-instruct",
+            "accounts/fireworks/models/qwen3p235b-a22b",
             "accounts/fireworks/models/llama-v3p1-8b-instruct",
         ],
     )
@@ -1070,7 +1118,9 @@ PROVIDER_CALLS = {
 }
 
 
-def _api_translate_items(items: list[dict[str, object]], sample_name: str) -> tuple[dict[int, str], dict[str, object]]:
+def _api_translate_items(
+    items: list[dict[str, object]], sample_name: str, page_context: str = ""
+) -> tuple[dict[int, str], dict[str, object]]:
     if not _api_translation_enabled():
         return {}, {"enabled": False, "reason": "API translation disabled or no provider keys configured"}
     skipped_ids = [
@@ -1118,7 +1168,7 @@ def _api_translate_items(items: list[dict[str, object]], sample_name: str) -> tu
             }
         raise ApiQuotaExhausted(DAILY_LIMIT_MESSAGE)
 
-    prompt = _translation_prompt(translatable_items, sample_name)
+    prompt = _translation_prompt(translatable_items, sample_name, page_context)
 
     for provider in provider_order:
         if not pending_ids:
@@ -1286,7 +1336,8 @@ def run_step7_translate(sample_map: dict[str, str] | None = None, samples_dir: P
                 reused_ids.add(int(item["id"]))
 
         items_for_api = [item for item in ocr_results if int(item.get("id", -1)) not in reused_ids]
-        api_translations, api_report = _api_translate_items(items_for_api, sample_name)
+        page_context = _load_page_context(samples_dir / sample_name)
+        api_translations, api_report = _api_translate_items(items_for_api, sample_name, page_context)
         api_report["reused_from_prior_run"] = sorted(reused_ids)
 
         translated_texts = []

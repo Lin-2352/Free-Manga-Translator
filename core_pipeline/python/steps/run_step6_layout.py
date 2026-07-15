@@ -2633,7 +2633,7 @@ def _semantic_role_for_item(item: dict, image_shape, sample_name: str = "", imag
         and (ocr_confidence is None or float(ocr_confidence) >= 0.70)
     )
     vision_ocr_provider = ocr_provider.startswith(
-        ("gemini_vision_ocr", "openrouter_vision_ocr", "groq_vision_ocr", "github_vision_ocr")
+        ("gemini_vision_ocr", "openrouter_vision_ocr", "groq_vision_ocr", "github_vision_ocr", "nvidia_vision_ocr")
     )
     external_ko_vertical_paddle = (
         sample_name.startswith("external_ko")
@@ -2647,6 +2647,19 @@ def _semantic_role_for_item(item: dict, image_shape, sample_name: str = "", imag
         and vision_ocr_provider
         and (counts["hangul"] >= 2 or counts["han"] >= 2)
     )
+    # Generalizes the external_ko-only exemption above to ANY item a vision
+    # rescue (region or full-page, run_step5_ocr.py's _vision_rescue_cjk_ocr
+    # / _vision_full_page_rescue) asserted -- notably Japanese, which has no
+    # sample-name-scoped exemption of its own. A vision model that read real
+    # dialogue text off the page is strong positive evidence the region is
+    # genuine, translatable content; it must not then be re-rejected by the
+    # geometric/anatomy gates below that exist to catch FALSE positives from
+    # local detection (which vision rescue only ever runs after local
+    # detection already produced nothing usable).
+    vision_rescue_asserted = bool(item.get("vision_rescue")) and (
+        counts["hangul"] >= 2 or counts["han"] >= 2 or counts["kana"] >= 2
+    )
+    trusted_vision_region = external_ko_vision_region or vision_rescue_asserted
 
     if _external_local_mode():
         if sample_name.startswith("external_ko"):
@@ -2656,7 +2669,7 @@ def _semantic_role_for_item(item: dict, image_shape, sample_name: str = "", imag
             ):
                 return "ocr_language_mismatch"
             min_korean_confidence = 0.65 if ocr_provider.startswith("paddleocr_ch_mixed") else 0.45 if ocr_provider.startswith("paddleocr_ko") else 0.55
-            if ocr_confidence is not None and not external_ko_vision_region and float(ocr_confidence) < min_korean_confidence:
+            if ocr_confidence is not None and not trusted_vision_region and float(ocr_confidence) < min_korean_confidence:
                 return "ocr_low_confidence"
         if sample_name.startswith("external_zh"):
             min_han = 2 if bubble_idx != -1 else 3
@@ -2672,7 +2685,7 @@ def _semantic_role_for_item(item: dict, image_shape, sample_name: str = "", imag
                 y1 <= int(img_h * 0.20)
                 and (pale_fraction < 0.65 or dark_fraction > 0.24)
                 and not external_ko_vertical_paddle
-                and not external_ko_vision_region
+                and not trusted_vision_region
                 and not trusted_korean_paddle_group
                 and not strong_dialogue
             ):
@@ -2680,7 +2693,7 @@ def _semantic_role_for_item(item: dict, image_shape, sample_name: str = "", imag
             if (
                 y1 <= int(img_h * 0.18)
                 and not external_ko_vertical_paddle
-                and not external_ko_vision_region
+                and not trusted_vision_region
                 and not trusted_korean_paddle_group
                 and not strong_dialogue
             ):
@@ -2688,7 +2701,7 @@ def _semantic_role_for_item(item: dict, image_shape, sample_name: str = "", imag
             if (
                 area_ratio > 0.025
                 and not external_ko_vertical_paddle
-                and not external_ko_vision_region
+                and not trusted_vision_region
                 and not trusted_korean_paddle_group
                 and not recover_large_dialogue
             ):
@@ -2696,7 +2709,7 @@ def _semantic_role_for_item(item: dict, image_shape, sample_name: str = "", imag
             if (
                 width > int(img_w * 0.28)
                 and not external_ko_vertical_paddle
-                and not external_ko_vision_region
+                and not trusted_vision_region
                 and not trusted_korean_paddle_group
                 and not recover_large_dialogue
             ):
@@ -2714,7 +2727,7 @@ def _semantic_role_for_item(item: dict, image_shape, sample_name: str = "", imag
         and y1 <= int(img_h * 0.18)
         and width >= max(int(img_w * 0.34), int(height * 1.55))
         and compact_text_len <= 10
-        and not external_ko_vision_region
+        and not trusted_vision_region
         and not trusted_korean_paddle_group
     ):
         return "title_logo"
@@ -2751,7 +2764,7 @@ def _semantic_role_for_item(item: dict, image_shape, sample_name: str = "", imag
             if _infer_missed_bubble_outline(image, [x1, y1, x2, y2], dark_interior=dark_interior):
                 return "dialogue"
         return "title_logo"
-    if bubble_idx == -1 and img_h and img_w and not external_ko_vision_region:
+    if bubble_idx == -1 and img_h and img_w and not trusted_vision_region:
         area_ratio = (width * height) / max(1, img_h * img_w)
         if width < max(28, int(img_w * 0.025)) and height < max(72, int(img_h * 0.070)) and compact_text_len <= 5:
             return "floating_too_small"
@@ -2906,13 +2919,21 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
             cls = classify_text_by_content(item.get("text", ""))
             item_id = item.get("id")
             is_floating = item.get("bubble_idx", -1) == -1
+            # A vision rescue (run_step5_ocr.py's region or full-page rescue)
+            # only ever runs after local detection/OCR already produced
+            # nothing usable, and the model was explicitly asked to omit SFX
+            # drawn as artwork -- so an item it asserted, with a usable
+            # translation, must not then be discarded by the SFX-anatomy or
+            # lexical-classification gates below, which exist to catch false
+            # positives from LOCAL OCR misreads, not vision transcriptions.
+            keep_vision_rescue = bool(item.get("vision_rescue")) and _has_usable_translation(item.get("text", ""))
             if item_id in sfx_group_tested_ids:
                 is_sfx_artwork = item_id in sfx_artwork_group_ids
             else:
                 is_sfx_artwork = is_floating and _sfx_artwork_signature(
                     image, item.get("box", {}), item.get("text", "")
                 )
-            if is_floating and is_sfx_artwork:
+            if is_floating and is_sfx_artwork and not keep_vision_rescue:
                 # Brush/hollow display lettering is the artist's drawing, not
                 # text: no boxes, no erase, no typeset. Registered so Step 4
                 # shields the region from sweeps and neighboring cleanups.
@@ -2926,6 +2947,7 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
             if (
                 item.get("bubble_idx", -1) == -1
                 and _floating_roi_has_dominant_sfx_art(item, image)
+                and not keep_vision_rescue
             ):
                 rejected.append(_layout_rejection(item, "floating_sfx_art", semantic_role="sfx", classification=cls))
                 rej_box = item.get("box") or {}
@@ -2971,6 +2993,7 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
                 and not keep_short_bubble
                 and not keep_short_floating
                 and not enclosed_dialogue_rescue
+                and not keep_vision_rescue
             ):
                 rejected.append(_layout_rejection(item, f"classification_{cls}", semantic_role=semantic_role, classification=cls))
                 continue
