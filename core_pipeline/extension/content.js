@@ -15,6 +15,7 @@
   const CAPTURE_IMAGE_TYPE = 'image/jpeg';
   const CAPTURE_IMAGE_QUALITY = 0.92;
   const TRANSLATED_ATTR = 'data-fmt-translated';
+  const MANUAL_CLEAR_ATTR = 'data-fmt-manually-cleared';
   const PROCESSING_ATTR = 'data-fmt-processing';
   const PROCESSING_SINCE_ATTR = 'data-fmt-processing-since';
   const STALE_PROCESSING_MS = 5 * 60 * 1000; // comfortably longer than any real pipeline run
@@ -114,7 +115,10 @@
   chrome.storage.onChanged.addListener((changes) => {
     if (changes.translationEnabled) {
       isEnabled = changes.translationEnabled.newValue;
-      if (isEnabled && !isPaused) scanForImages();
+      if (isEnabled) {
+        clearManualClearMarkers();
+        if (!isPaused) scanForImages();
+      }
     }
     if (changes.translationPaused) {
       isPaused = changes.translationPaused.newValue === true;
@@ -370,6 +374,16 @@
     img.removeAttribute(ORIGINAL_WIDTH_ATTR);
     img.removeAttribute(ORIGINAL_HEIGHT_ATTR);
     hideSpinner(img);
+  }
+
+  // Turning auto-translate on is itself an explicit user request to translate the
+  // page, so it lifts any earlier Clear Page suppression -- otherwise a page
+  // cleared while auto-translate was off would stay stuck untranslated forever
+  // once the user re-enables it.
+  function clearManualClearMarkers() {
+    document.querySelectorAll(`[${MANUAL_CLEAR_ATTR}]`).forEach((img) => {
+      img.removeAttribute(MANUAL_CLEAR_ATTR);
+    });
   }
 
   function getOriginalSrc(img) {
@@ -789,6 +803,7 @@
   // ===== Translate a Single Image =====
   async function translateImage(img, options = {}) {
     if (!shouldTranslate(img, options)) return;
+    img.removeAttribute(MANUAL_CLEAR_ATTR);
 
     const originalSrc = options.originalSrc || getOriginalSrc(img);
     if (!originalSrc) return;
@@ -1029,6 +1044,13 @@
     const allowTranslate = options.force === true || isEnabled;
     const restoreOnly = options.restoreOnly === true || !allowTranslate;
     if (isPaused) return;
+    // A manual Clear Page must stick until the user explicitly asks to translate
+    // again (Translate Page/Re-translate/right-click, or re-enabling auto-translate
+    // -- all of which pass force:true or clear the marker themselves below). Every
+    // OTHER path that reaches processImage (auto-translate scans, the intersection
+    // observer, the watchdog) must not silently resurrect a page the user just
+    // cleared, whether or not it happens to be in restoreOnly mode.
+    if (img.getAttribute(MANUAL_CLEAR_ATTR) && options.force !== true) return;
     const originalSrc = getOriginalSrc(img);
     if (!originalSrc) return;
     const cacheKey = buildImageCacheKey(img, originalSrc);
@@ -1283,6 +1305,7 @@
         if (translatedSrc && newSrc === translatedSrc) continue;
         const originalSrc = getOriginalSrc(img);
         const cacheKey = buildImageCacheKey(img, originalSrc);
+        if (translatedSrcs.has(cacheKey) && !img.getAttribute(TRANSLATED_ATTR)) translatedSrcs.delete(cacheKey);
         if (newSrc && !translatedSrcs.has(cacheKey) && !pendingSrcs.has(cacheKey)) {
           if (img.getAttribute(TRANSLATED_ATTR)) {
             img.removeAttribute(TRANSLATED_ATTR);
@@ -1343,6 +1366,7 @@
     if (message.kind === 'toggleTranslation') {
       isEnabled = message.enabled;
       console.log('[MangaTranslator] Translation', isEnabled ? 'enabled' : 'disabled');
+      if (isEnabled) clearManualClearMarkers();
       if (isEnabled && !isPaused) {
         scanForImages();
         handleStandaloneImage();
@@ -1396,6 +1420,7 @@
       retryCountMap.clear();
       document.querySelectorAll(`[${TRANSLATED_ATTR}]`).forEach(img => {
         restoreOriginalImage(img);
+        img.setAttribute(MANUAL_CLEAR_ATTR, '1');
       });
       sendResponse({ success: true });
       return true;
