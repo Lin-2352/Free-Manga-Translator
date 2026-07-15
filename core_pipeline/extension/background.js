@@ -11,7 +11,12 @@ const FMT_CLIENT_VALUE = 'free-manga-translator-extension';
 const CACHE_VERSION = `local-8-step-v13-quality-performance-hardening-v${APP_VERSION}`;
 const DEFAULT_PARALLEL_LIMIT = 2;
 const MAX_PARALLEL_LIMIT = 3;
-const DEFAULT_CACHE_LIMIT = 12;
+// Must stay >= content.js's DEFAULT_AUTO_QUEUE_LIMIT (20): navigating across
+// several image-heavy pages queues up to that many translations ahead, and a
+// cache smaller than the queue-ahead depth LRU-evicts the page you started
+// on before you've even finished reading it -- the exact "sometimes it's
+// there when I come back, sometimes it isn't" inconsistency this fixes.
+const DEFAULT_CACHE_LIMIT = 24;
 const MAX_CACHE_LIMIT = 40;
 const DEFAULT_QUEUE_LIMIT = 20;
 const MAX_QUEUE_LIMIT = 50;
@@ -86,7 +91,13 @@ function buildQueueStats(settings) {
   const queueLimit = settings?.queueLimit ?? DEFAULT_QUEUE_LIMIT;
   const capacity = Math.max(1, parallelLimit + queueLimit);
   const queuedCount = requestQueue.length;
-  const activeCount = outgoingRequests.size;
+  // reservedSlots covers the exact same dispatch-in-flight-but-not-yet-
+  // registered window documented at dispatchTranslation()/processQueue()'s
+  // own admission checks -- outgoingRequests.size alone under-reports
+  // Active during that window (see reservedSlots' own comment for why
+  // adding both here can't double-count: the reservation releases the
+  // moment the request actually registers in outgoingRequests).
+  const activeCount = outgoingRequests.size + reservedSlots;
   return {
     cacheSize: translationCache.size,
     cacheLimit: settings?.cacheLimit ?? DEFAULT_CACHE_LIMIT,
@@ -483,7 +494,15 @@ async function getCachedResult(cacheId, settings) {
   return entry.result;
 }
 
-async function putCachedResult(cacheId, result, settings) {
+function pageHostFromUrl(pageUrl) {
+  try {
+    return new URL(String(pageUrl || '')).hostname || '';
+  } catch {
+    return '';
+  }
+}
+
+async function putCachedResult(cacheId, result, settings, pageUrl = '') {
   await ensureCacheLoaded();
   const hasImage = Boolean(result?.translatedImageDataUrl);
   const hasTranslations = Array.isArray(result?.translations) && result.translations.length > 0;
@@ -491,6 +510,7 @@ async function putCachedResult(cacheId, result, settings) {
   translationCache.set(cacheId, {
     result,
     lastUsed: Date.now(),
+    pageHost: pageHostFromUrl(pageUrl),
   });
   await trimCache(settings.cacheLimit);
 }
@@ -647,8 +667,13 @@ async function processTranslation(message, options = {}) {
         cacheId,
       }, controller.signal);
       if (isPaused) throw new Error('TranslationPaused');
-      await putCachedResult(cacheId, result, settings);
+      await putCachedResult(cacheId, result, settings, message.pageUrl);
       console.log(`[FMT] local pipeline done trace=${traceId} ${cacheId} in ${Math.round(nowMs() - startedAt)}ms`);
+      const servingProviders = result.pipelineReport?.translationServingProviders;
+      const sourceCounts = result.pipelineReport?.translationSourceCounts;
+      if ((servingProviders && servingProviders.length) || (sourceCounts && Object.keys(sourceCounts).length)) {
+        console.log(`[FMT] translation served by [${(servingProviders || []).join(', ')}] sources=${JSON.stringify(sourceCounts || {})}`);
+      }
       await sendDiagnosticLog('background.translate.done', {
         traceId,
         cacheId,
@@ -951,6 +976,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     ensureCacheLoaded().then(async () => {
       const settings = await getSettings();
       sendResponse(buildQueueStats(settings));
+    });
+    return true;
+  }
+  if (message.kind === 'getRecentTranslations') {
+    ensureCacheLoaded().then(() => {
+      const limit = Math.max(1, Math.min(12, Number(message.limit) || 6));
+      const entries = Array.from(translationCache.values())
+        .filter((entry) => entry?.result?.translatedImageDataUrl)
+        .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0))
+        .slice(0, limit)
+        .map((entry) => ({
+          thumbnail: entry.result.translatedImageDataUrl,
+          pageHost: entry.pageHost || '',
+          lastUsed: entry.lastUsed || 0,
+        }));
+      sendResponse({ entries });
     });
     return true;
   }

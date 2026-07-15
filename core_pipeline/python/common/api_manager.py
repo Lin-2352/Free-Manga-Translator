@@ -659,7 +659,26 @@ class ApiManager:
                 key_state["status"] = lock_status
                 key_state["softLocked"] = True
                 key_state["softLockReason"] = lock_reason
+                provider_wide = False
                 if self._limit_scope(lease.provider) == "provider":
+                    if terminal:
+                        # A token/request budget under limit_scope="provider" is a
+                        # genuinely shared pool -- one key hitting its cap means
+                        # the pool itself is exhausted for every key, so locking
+                        # the whole provider immediately is correct here.
+                        provider_wide = True
+                    else:
+                        # auth_block (401/403) is a fact about ONE credential, not
+                        # about the shared pool -- a single revoked/bad key must
+                        # not lock siblings that are still valid. Only escalate to
+                        # a provider-wide lock once every configured key for this
+                        # provider is individually locked.
+                        all_keys = self.provider_keys(lease.provider)
+                        provider_wide = bool(all_keys) and all(
+                            self._is_locked(self._ensure_key_state(provider_state, self._key_hash(k), idx))
+                            for idx, k in enumerate(all_keys, start=1)
+                        )
+                if provider_wide:
                     provider_state["lockedUntil"] = key_state["lockedUntil"]
                     provider_state["status"] = lock_status
                     provider_state["softLocked"] = True
@@ -870,7 +889,11 @@ class ApiManager:
     def all_configured_providers_exhausted(self, providers: list[str]) -> bool:
         statuses = [self.provider_status(provider) for provider in providers if provider in self.providers]
         configured = [status for status in statuses if status["configured"]]
-        return bool(configured) and all(status["health"] == "exhausted" for status in configured)
+        # A provider stuck at auth_locked (revoked/bad credentials) is just as
+        # unavailable to the caller as one that's quota-exhausted -- treat both
+        # as "unavailable" so the local NLLB fallback still engages instead of
+        # step 7 returning untranslated items when every provider is blocked.
+        return bool(configured) and all(status["health"] in {"exhausted", "auth_locked"} for status in configured)
 
     def reset_state(self) -> None:
         with self._lock:

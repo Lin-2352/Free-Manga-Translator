@@ -957,6 +957,55 @@
         return;
       }
 
+      // The backend always returns SOME image data URL even when it found no
+      // renderable text (the untouched original page, per
+      // run_extension_pipeline_server.py) -- so response.translatedImageDataUrl
+      // being present is NOT proof text was actually found. The real signal is
+      // pipelineReport.noRenderableText. Without this check the branch below
+      // would silently "apply" the unchanged original as if translation
+      // succeeded and permanently mark the image done via translatedSrcs.add
+      // a few lines down, exactly like the legacy no-text branch further down
+      // this function -- both would otherwise mark a page permanently
+      // untranslated after a single detection miss, with no retry and no
+      // visible failure indicator.
+      if (response?.pipelineReport?.noRenderableText) {
+        const rescueAttempted = response.pipelineReport.rescueAttempted === true;
+        const rescueSucceeded = response.pipelineReport.rescueSucceeded === true;
+        emitDiagnostic('content.translate.no_text_result', traceId, { cacheKey, rescueAttempted, rescueSucceeded });
+        if (rescueAttempted && !rescueSucceeded) {
+          // A vision rescue was attempted and it ALSO found nothing readable
+          // -- that's a confirmed negative, not just a local-detection miss.
+          console.log('[MangaTranslator] No text found in image (vision rescue confirmed blank)');
+          retryCountMap.delete(cacheKey);
+          translatedSrcs.add(cacheKey);
+          img.setAttribute(TRANSLATED_ATTR, 'no-text');
+          cleanupProcessing(img, cacheKey);
+          return;
+        }
+        // No rescue ran (disabled, no keys, budget exhausted) -- this may
+        // just be a transient local-detection miss. Let the normal
+        // exponential-backoff retry path (shared with FullQueue/RATE_LIMITED
+        // above) give it a few more tries before giving up permanently.
+        const retryCount = (retryCountMap.get(cacheKey) || 0) + 1;
+        retryCountMap.set(cacheKey, retryCount);
+        if (retryCount <= MAX_RETRIES) {
+          console.log(`[MangaTranslator] No text found (retry ${retryCount}/${MAX_RETRIES})`);
+          const delay = BASE_RETRY_DELAY * Math.pow(2, retryCount - 1) + Math.random() * 1000;
+          setTimeout(() => {
+            img.removeAttribute(PROCESSING_ATTR);
+            pendingSrcs.delete(cacheKey);
+            translateImage(img, { force: options.force === true, originalSrc, cacheKey });
+          }, delay);
+          return; // spinner stays during retry
+        }
+        console.log('[MangaTranslator] No text found in image (retries exhausted)');
+        retryCountMap.delete(cacheKey);
+        translatedSrcs.add(cacheKey);
+        img.setAttribute(TRANSLATED_ATTR, 'no-text');
+        cleanupProcessing(img, cacheKey);
+        return;
+      }
+
       retryCountMap.delete(cacheKey);
       translatedSrcs.add(cacheKey);
       cleanupProcessing(img, cacheKey);
@@ -1214,6 +1263,20 @@
       if (navigationKey !== lastNavigationKey) {
         lastNavigationKey = navigationKey;
         cacheMissSrcs.clear();
+        // translatedSrcs/pendingSrcs dedupe purely by src|WxH, with no page
+        // identity -- fine for a normal full page load (a fresh navigation
+        // means a fresh JS heap and empty Sets anyway) but wrong for an SPA
+        // reader that reuses generic/repeated image URLs across chapters:
+        // the second page's image gets silently skipped as "already
+        // translated" even though it's a different page's content and
+        // isn't actually cached under this page's own cache key. Each
+        // element's own TRANSLATED_ATTR (checked by shouldTranslate/
+        // processImage) remains the real per-element truth, so clearing
+        // these dedupe Sets on a genuine navigation is safe -- it only
+        // lets already-rendered elements be reconsidered, it doesn't erase
+        // any translation actually applied to the DOM.
+        translatedSrcs.clear();
+        pendingSrcs.clear();
         console.log('[MangaTranslator] Navigation scan:', reason, navigationKey);
       }
       if (isEnabled || options.force) {
@@ -1447,6 +1510,16 @@
       // re-queue) is what applies the now-completed, background-cached
       // result instead of the image getting stuck on its old, dead marker.
       cancelPageWork();
+      // scheduleNavigationScan only clears the negative cache when
+      // getNavigationKey() differs from lastNavigationKey -- but a bfcache
+      // restore resumes the SAME frozen JS heap, so lastNavigationKey is
+      // already set to this exact page's key and that check is always
+      // false here. A stale cacheMissSrcs entry (up to its own 1500ms TTL,
+      // itself possibly frozen mid-countdown by the freeze) would then
+      // short-circuit the cache lookup the scan above is specifically
+      // relying on to restore the translation. Always clear it on a
+      // persisted restore, regardless of navigation-key comparison.
+      cacheMissSrcs.clear();
     }
     scheduleNavigationScan('pageshow', { delay: 100 });
   }, { passive: true });

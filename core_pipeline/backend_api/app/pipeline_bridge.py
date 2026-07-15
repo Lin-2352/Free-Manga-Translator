@@ -138,6 +138,7 @@ def run_pipeline_payload(payload: dict[str, Any]) -> dict[str, Any]:
     cache_id = metadata.get("cacheId") or metadata.get("cacheKey") or "no-cache-id"
     trace_id = metadata.get("traceId") or payload.get("clientRequestId") or "no-trace"
     source = metadata.get("source") or "unknown"
+    page_key = str(metadata.get("pageCacheKey") or metadata.get("pageUrl") or "")
     sample_name = _runtime_sample_name(image_bytes, language)
     stop_generation = legacy_bridge.current_stop_generation()
     with _sample_lock(sample_name):
@@ -171,7 +172,7 @@ def run_pipeline_payload(payload: dict[str, Any]) -> dict[str, Any]:
                         print(f"[api] runtime output cache hit sample={sample_name}", flush=True)
                     else:
                         report = legacy_bridge._run_runtime_pipeline(
-                            sample_name, language, stop_generation=stop_generation
+                            sample_name, language, stop_generation=stop_generation, page_key=page_key
                         )
                     report["scheduler"] = scheduler_slot.as_report()
                     translated_image = legacy_bridge._read_output_data_url(sample_name)

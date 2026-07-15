@@ -42,9 +42,11 @@ import shutil
 import sys
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from PIL import Image
 
@@ -53,7 +55,7 @@ from pipeline_paths import EXTENSION_RUNTIME_ROOT, PROJECT_ROOT
 
 SAMPLES_ROOT = EXTENSION_RUNTIME_ROOT
 RUNTIME_MANIFEST_ROOT = PROJECT_ROOT / "quality_reports" / "extension_runtime"
-RUNTIME_CACHE_VERSION = "extension-runtime-cache-v9-manga-cleaner-device-overlay"
+RUNTIME_CACHE_VERSION = "extension-runtime-cache-v10-ja-vision-rescue"
 RUNTIME_CACHE_META = "runtime_cache_meta.json"
 OUTPUT_FOLDERS = [
     "step_1_detect",
@@ -94,6 +96,16 @@ RUNTIME_ACTIVE_JOBS = 0
 # release wipe out the OUTER one's registration early, reopening the exact race this guards
 # against. Refcounting makes nested/overlapping registrations for the same sample safe.
 ACTIVE_RUNTIME_SAMPLES: dict[str, int] = {}
+# Rolling per-site translation context so names/tone stay consistent across a
+# few pages read in sequence -- keyed by page domain (not full URL, so every
+# page/chapter of the same manga site shares one ring), each entry is the list
+# of accepted English lines from one page. Process-lifetime only (an in-memory
+# ring, not persisted) -- a service restart just starts a fresh ring, which is
+# fine since this is a soft quality nicety, not correctness-critical state.
+PAGE_CONTEXT_LOCK = threading.Lock()
+PAGE_CONTEXT_RINGS: dict[str, deque] = {}
+PAGE_CONTEXT_RING_MAXLEN = 2
+PAGE_CONTEXT_MAX_LINES_PER_PAGE = 8
 RUNTIME_LAST_ACTIVITY_MONOTONIC = time.monotonic()
 RUNTIME_LAST_ACTIVITY_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 WARMUP_STATE: dict[str, Any] = {
@@ -602,12 +614,19 @@ def _has_reusable_runtime_output(sample_name: str, language: str) -> bool:
 
 
 def _write_runtime_cache_meta(sample_name: str, language: str, report: dict[str, Any]) -> None:
+    # A blank/no-text outcome must NEVER be reused from cache: _has_reusable_
+    # runtime_output already requires status=="pass" above, so writing
+    # anything else here is sufficient -- the next request for the same
+    # image bytes re-runs the full pipeline (picking up the vision rescue,
+    # rotated keys, or any other fix) instead of being served the same blank
+    # page forever.
+    status = "no_renderable_text" if report.get("noRenderableText") else "pass"
     _runtime_cache_meta_path(sample_name).write_text(
         json.dumps(
             {
                 "cacheVersion": RUNTIME_CACHE_VERSION,
                 "language": _normalize_language_hint(language),
-                "status": "pass",
+                "status": status,
                 "layoutConstraints": report.get("layoutConstraints"),
                 "translations": report.get("translations"),
                 "renderedRegions": report.get("renderedRegions"),
@@ -661,6 +680,95 @@ def _write_runtime_manifest(sample_name: str, language: str) -> Path:
     return manifest_path
 
 
+def _vision_rescue_report_fields(meta_path: Path) -> dict[str, Any]:
+    # run_step5_ocr.py writes this file whenever the zero-usable-text
+    # condition was checked, whether or not a rescue actually fired --
+    # letting the extension distinguish "genuinely no readable text (vision
+    # also tried and found none)" from "the pipeline never got that far" and
+    # from "there IS text, just not renderable for some other reason", which
+    # a bare noRenderableText:true collapses into one undifferentiated case.
+    defaults = {
+        "rescueAttempted": False,
+        "rescueMode": None,
+        "rescueSucceeded": False,
+        "rescueRegions": 0,
+    }
+    if not meta_path.exists():
+        return defaults
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return defaults
+    if not isinstance(meta, dict):
+        return defaults
+    return {
+        "rescueAttempted": bool(meta.get("attempted")),
+        "rescueMode": meta.get("mode"),
+        "rescueSucceeded": bool(meta.get("succeeded")),
+        "rescueRegions": int(meta.get("regions") or 0),
+    }
+
+
+def _page_context_domain(page_key: str) -> str:
+    if not page_key:
+        return ""
+    try:
+        parsed = urlparse(page_key)
+    except ValueError:
+        return ""
+    return (parsed.netloc or "").lower()
+
+
+def _write_page_context_file(sample_path: Path, domain: str) -> None:
+    # Called BEFORE step 7 runs, so the ring only ever contains PRIOR pages'
+    # accepted lines -- this page's own translations are recorded afterward.
+    context_path = sample_path / "page_context.json"
+    if not domain:
+        context_path.unlink(missing_ok=True)
+        return
+    with PAGE_CONTEXT_LOCK:
+        ring = PAGE_CONTEXT_RINGS.get(domain)
+        lines = [line for page_lines in (ring or ()) for line in page_lines]
+    if not lines:
+        context_path.unlink(missing_ok=True)
+        return
+    context_path.write_text(
+        json.dumps({"domain": domain, "lines": lines}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _accepted_translation_lines(sample_path: Path) -> list[str]:
+    results_path = sample_path / "step_7_translate" / "translation_results.json"
+    try:
+        data = json.loads(results_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    entries = data if isinstance(data, list) else []
+    # Excludes "fallback" (local NLLB, no page context, lower quality) so a
+    # poor fragment-by-fragment guess never seeds a bad name spelling for the
+    # NEXT page's prompt -- only API-sourced or vision-pretranslated text
+    # feeds the rolling context forward.
+    return [
+        str(entry.get("en_text", "")).strip()
+        for entry in entries
+        if isinstance(entry, dict)
+        and entry.get("translation_source") != "fallback"
+        and str(entry.get("en_text", "")).strip()
+    ]
+
+
+def _record_page_context(domain: str, translated_lines: list[str]) -> None:
+    if not domain:
+        return
+    trimmed = [str(line).strip() for line in translated_lines if str(line).strip()]
+    if not trimmed:
+        return
+    with PAGE_CONTEXT_LOCK:
+        ring = PAGE_CONTEXT_RINGS.setdefault(domain, deque(maxlen=PAGE_CONTEXT_RING_MAXLEN))
+        ring.append(trimmed[:PAGE_CONTEXT_MAX_LINES_PER_PAGE])
+
+
 def _patch_sample_maps(sample_map: dict[str, str]) -> None:
     import ml_region_lib
     import run_step4_inpaint
@@ -701,7 +809,9 @@ def _collect_runtime_report(
     rejected_layout_path = sample_path / "step_6_layout" / "rejected_layout_items.json"
     ocr_path = sample_path / "step_5_ocr" / "ocr_results.json"
     translation_path = sample_path / "step_7_translate" / "translation_results.json"
+    provider_report_path = sample_path / "step_7_translate" / "translation_provider_report.json"
     typeset_report_path = sample_path / "step_8_typeset" / "typeset_report.json"
+    vision_rescue_meta_path = sample_path / "step_5_ocr" / "vision_rescue_meta.json"
 
     ocr_items = json.loads(ocr_path.read_text(encoding="utf-8")) if ocr_path.exists() else []
     layout = json.loads(layout_path.read_text(encoding="utf-8")) if layout_path.exists() else []
@@ -721,6 +831,19 @@ def _collect_runtime_report(
         1 for item in renderable_translations
         if str(item.get("en_text", "")).strip().startswith("[TL:")
     )
+    translation_source_counts: dict[str, int] = {}
+    serving_providers: list[str] = []
+    if provider_report_path.exists():
+        try:
+            provider_report = json.loads(provider_report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            provider_report = {}
+        translation_source_counts = provider_report.get("translation_source_counts") or {}
+        for attempt in (provider_report.get("api_report") or {}).get("attempts", []):
+            if isinstance(attempt, dict) and attempt.get("status") == "pass" and attempt.get("accepted"):
+                label = str(attempt.get("provider") or "")
+                model = str(attempt.get("model") or "")
+                serving_providers.append(f"{label}:{model}" if model else label)
     return {
         "sampleName": sample_name,
         "sourceLanguage": _normalize_language_hint(language),
@@ -739,6 +862,14 @@ def _collect_runtime_report(
         "stageTimings": stage_timings or [],
         "totalSeconds": round(total_seconds or 0, 3),
         "runtimeOutputCache": "hit" if reused_output else "miss",
+        # Which provider(s)/model(s) actually served this request's translations,
+        # and the api/vision/fallback/skipped breakdown -- lets a console log
+        # attribute "translation quality is bad" to e.g. the local NLLB fallback
+        # engaging instead of an API provider, without opening the sample's own
+        # translation_provider_report.json by hand.
+        "translationServingProviders": sorted(set(serving_providers)),
+        "translationSourceCounts": translation_source_counts,
+        **_vision_rescue_report_fields(vision_rescue_meta_path),
     }
 
 
@@ -877,9 +1008,10 @@ def _assert_runtime_report_safe(report: dict[str, Any]) -> None:
 
 
 def _run_runtime_pipeline(
-    sample_name: str, language: str, stop_generation: int | None = None
+    sample_name: str, language: str, stop_generation: int | None = None, page_key: str = ""
 ) -> dict[str, Any]:
     total_started = time.perf_counter()
+    page_domain = _page_context_domain(page_key)
     os.environ["LOCAL_NLLB_TRANSLATION"] = "1"
     import run_step4_inpaint
     import run_step5_ocr
@@ -915,7 +1047,9 @@ def _run_runtime_pipeline(
     try:
         run_stage("step5_ocr", lambda: run_step5_ocr.run_step5_ocr(sample_map=sample_map, samples_dir=SAMPLES_ROOT))
         run_stage("step6_layout", lambda: run_step6_layout.run_step6_layout(sample_map=sample_map, samples_dir=SAMPLES_ROOT))
+        _write_page_context_file(SAMPLES_ROOT / sample_name, page_domain)
         run_stage("step7_translate", lambda: run_step7_translate.run_step7_translate(sample_map=sample_map, samples_dir=SAMPLES_ROOT))
+        _record_page_context(page_domain, _accepted_translation_lines(SAMPLES_ROOT / sample_name))
         run_stage("step4_inpaint", lambda: run_step4_inpaint.run_step4_inpaint(sample_map=sample_map, samples_dir=SAMPLES_ROOT))
         run_stage("step8_typeset", lambda: run_step8_typeset.run_step8_typeset(sample_map=sample_map, samples_dir=SAMPLES_ROOT))
 

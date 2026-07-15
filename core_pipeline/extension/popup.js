@@ -17,6 +17,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const statusText = document.getElementById('statusText');
   const statsText = document.getElementById('statsText');
   const cacheStatusText = document.getElementById('cacheStatusText');
+  const recentTranslations = document.getElementById('recentTranslations');
   const localPipelineUrl = document.getElementById('localPipelineUrl');
   const localPipelineLanguage = document.getElementById('localPipelineLanguage');
   const translationCachePages = document.getElementById('translationCachePages');
@@ -278,6 +279,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function refreshStats() {
+    refreshRecentTranslations();
     chrome.runtime.sendMessage({ kind: 'getTranslationStats' }, (response) => {
       if (!response) return;
       const cacheSize = response.cacheSize || 0;
@@ -289,8 +291,10 @@ document.addEventListener('DOMContentLoaded', () => {
       const pressurePercent = Number.isFinite(response.pressurePercent)
         ? Math.max(0, Math.min(100, response.pressurePercent))
         : Math.min(100, Math.round(((activeRequests + queueLength) / Math.max(1, parallelLimit + queueLimit)) * 100));
+      // "entries", not "images" -- a cache entry is keyed per page+source, so
+      // the same image translated on two different pages counts as 2 here.
       cacheStatusText.textContent = cacheLimit > 0
-        ? `${cacheSize}/${cacheLimit} images cached`
+        ? `${cacheSize}/${cacheLimit} entries cached`
         : 'Cache disabled';
       if (activeJobsText) activeJobsText.textContent = String(activeRequests);
       if (queuedJobsText) queuedJobsText.textContent = `${queueLength}/${queueLimit}`;
@@ -305,6 +309,49 @@ document.addEventListener('DOMContentLoaded', () => {
       statsText.textContent = parts.length ? parts.join(' Â· ') : 'ready';
     });
   }
+
+  function timeAgoLabel(timestampMs) {
+    const seconds = Math.max(0, Math.round((Date.now() - Number(timestampMs || 0)) / 1000));
+    if (seconds < 60) return 'just now';
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.round(minutes / 60);
+    return `${hours}h ago`;
+  }
+
+  function refreshRecentTranslations() {
+    if (!recentTranslations) return;
+    chrome.runtime.sendMessage({ kind: 'getRecentTranslations', limit: 6 }, (response) => {
+      const entries = Array.isArray(response?.entries) ? response.entries : [];
+      if (!entries.length) {
+        recentTranslations.hidden = true;
+        recentTranslations.innerHTML = '';
+        return;
+      }
+      recentTranslations.hidden = false;
+      recentTranslations.innerHTML = entries.map((entry) => {
+        const title = `${entry.pageHost || 'unknown page'} - ${timeAgoLabel(entry.lastUsed)}`;
+        return `
+          <div class="recent-translation-thumb" title="${escapeHtml(title)}">
+            <img src="${entry.thumbnail}" alt="${escapeHtml(entry.pageHost || 'Recent translation')}" loading="lazy" />
+            <span class="recent-translation-time">${escapeHtml(timeAgoLabel(entry.lastUsed))}</span>
+          </div>
+        `;
+      }).join('');
+    });
+  }
+
+  const QUOTA_ROTATE_HINTS = {
+    gemini: 'rotate at aistudio.google.com/apikey',
+    github: 'rotate at github.com/settings/tokens',
+    openrouter: 'rotate at openrouter.ai/keys',
+    cloudflare: 'rotate at dash.cloudflare.com (API Tokens)',
+    mistral: 'rotate at console.mistral.ai/api-keys',
+    groq: 'rotate at console.groq.com/keys',
+    cerebras: 'rotate at cloud.cerebras.ai',
+    nvidia: 'rotate at build.nvidia.com',
+    fireworks: 'rotate at fireworks.ai/account/api-keys',
+  };
 
   function quotaHealthClass(provider) {
     if (!provider?.configured) return 'quota-muted';
@@ -363,12 +410,13 @@ document.addEventListener('DOMContentLoaded', () => {
       const healthClass = quotaHealthClass(provider);
       const active = Number(provider.activeKeys || 0);
       const total = Number(provider.keyCount || 0);
+      const rotateHint = QUOTA_ROTATE_HINTS[String(provider.provider || '').toLowerCase()];
       const detail = provider.configured
         ? (
           provider.health === 'exhausted' && provider.reason
             ? `${active}/${total} keys active - locked: ${provider.reason}`
             : provider.health === 'auth_locked' && provider.reason
-              ? `${active}/${total} keys active - access blocked: ${provider.reason}`
+              ? `${active}/${total} keys active - access blocked: ${provider.reason}${rotateHint ? ` (${rotateHint})` : ''}`
               : provider.health === 'rate_limited'
                 ? `${active}/${total} keys active - rate-limited until ${provider.rateLimitedUntil || 'next minute'}`
                 : `${active}/${total} keys active - ${Math.round(percent)}% safe quota`

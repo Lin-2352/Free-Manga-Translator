@@ -44,6 +44,7 @@ import os
 import base64
 import tempfile
 import threading
+import time
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -224,11 +225,16 @@ def _gemini_vision_region_ocr(
         {"id": index, "box": [box.x1, box.y1, box.x2, box.y2]}
         for index, box in enumerate(usable_boxes)
     ]
-    language_name = "Korean" if language_hint == "ko" else "Chinese"
+    language_name = {"ko": "Korean", "ja": "Japanese"}.get(language_hint, "Chinese")
+    ja_note = (
+        " The Japanese may be hand-lettered and printed vertically; read each column "
+        "top-to-bottom, columns right-to-left."
+        if language_hint == "ja" else ""
+    )
     prompt = (
         f"Image size is exactly {img_w}x{img_h} pixels. "
         f"OCR and translate only the boxed {language_name}/CJK text regions listed here: "
-        f"{json.dumps(region_payload, ensure_ascii=False)}. "
+        f"{json.dumps(region_payload, ensure_ascii=False)}.{ja_note} "
         "Return valid JSON only in this exact shape: "
         "[{\"id\":0,\"source_text\":\"...\",\"english\":\"...\"}]. "
         "Omit regions that are not readable text. Do not add coordinates."
@@ -318,7 +324,7 @@ def _gemini_vision_region_ocr(
                     continue
                 source_text = str(entry.get("source_text") or entry.get("text") or "").strip()
                 english_text = str(entry.get("english") or entry.get("en_text") or entry.get("translation") or "").strip()
-                if _script_count(source_text, "hangul") + _script_count(source_text, "han") < 2:
+                if not _vision_source_script_ok(source_text, language_hint):
                     continue
                 if not english_text or not any(ch.isalpha() for ch in english_text):
                     continue
@@ -348,6 +354,7 @@ def _gemini_vision_region_ocr(
                         "mask_mode": "stroke",
                         "fallback_source": "gemini_vision_region_ocr",
                         "force_bubble_cleanup": False,
+                        "vision_rescue": True,
                     }
                 )
             if final_results:
@@ -396,14 +403,20 @@ def _openai_compatible_vision_region_ocr(
         {"id": index, "box": [box.x1, box.y1, box.x2, box.y2]}
         for index, box in enumerate(usable_boxes)
     ]
-    language_name = "Korean" if language_hint == "ko" else "Chinese"
+    language_name = {"ko": "Korean", "ja": "Japanese"}.get(language_hint, "Chinese")
+    script_note = (
+        "For hand-lettered or vertical Japanese text, read each column top-to-bottom, "
+        "columns right-to-left, and preserve the source_text as read,"
+        if language_hint == "ja" else
+        "For mixed Hangul/Hanja or historical vertical Korean text, preserve the source_text as read,"
+    )
     prompt = (
         f"Image size is exactly {img_w}x{img_h} pixels. "
         f"OCR and translate only the boxed {language_name}/CJK text regions listed here: "
         f"{json.dumps(region_payload, ensure_ascii=False)}. "
         "Return valid JSON only in this exact shape: "
         "[{\"id\":0,\"source_text\":\"...\",\"english\":\"...\"}]. "
-        "For mixed Hangul/Hanja or historical vertical Korean text, preserve the source_text as read, "
+        f"{script_note} "
         "then provide concise natural English. Omit unreadable text, SFX, logos, and artwork. "
         "Do not add coordinates."
     )
@@ -493,7 +506,7 @@ def _openai_compatible_vision_region_ocr(
                     continue
                 source_text = str(entry.get("source_text") or entry.get("text") or "").strip()
                 english_text = str(entry.get("english") or entry.get("en_text") or entry.get("translation") or "").strip()
-                if _script_count(source_text, "hangul") + _script_count(source_text, "han") < 2:
+                if not _vision_source_script_ok(source_text, language_hint):
                     continue
                 if not english_text or not any(ch.isalpha() for ch in english_text):
                     continue
@@ -523,6 +536,7 @@ def _openai_compatible_vision_region_ocr(
                         "mask_mode": "stroke",
                         "fallback_source": f"{provider}_vision_region_ocr",
                         "force_bubble_cleanup": False,
+                        "vision_rescue": True,
                     }
                 )
             if final_results:
@@ -647,6 +661,17 @@ def _script_count(text: str, script: str) -> int:
         "kana": r"[\u3040-\u30ff]",
     }
     return len(re.findall(patterns[script], text or ""))
+
+
+def _vision_source_script_ok(text: str, language_hint: str) -> bool:
+    # A vision-model transcription is only trusted as real source text if it
+    # actually contains enough of the expected script -- guards against the
+    # model hallucinating/echoing English or noise into source_text. ja uses
+    # kana+han (a JA line can be almost entirely kanji, or almost entirely
+    # kana); ko/ch keep their existing hangul+han / han-only bars unchanged.
+    if language_hint == "ja":
+        return _script_count(text, "kana") + _script_count(text, "han") >= 2
+    return _script_count(text, "hangul") + _script_count(text, "han") >= 2
 
 
 def _combine_easyocr_results(results: list, language: str, min_confidence: float | None = None) -> dict:
@@ -1069,6 +1094,8 @@ def _usable_cjk_text_count(items: list[dict], language: str | None) -> int:
         scripts = ("hangul", "han")
     elif language in {"ch_tra", "ch_sim"}:
         scripts = ("han",)
+    elif language == "ja":
+        scripts = ("kana", "han")
     else:
         return sum(1 for item in items if str(item.get("text") or "").strip())
     count = 0
@@ -1322,13 +1349,16 @@ def _vision_rescue_cjk_ocr(
     seg_mask: np.ndarray | None,
     detected_results: list[dict],
 ) -> list[dict]:
-    if language not in {"ko", "ch_tra", "ch_sim"}:
+    if language not in {"ko", "ch_tra", "ch_sim", "ja"}:
         return []
     if not text_boxes:
         return []
+    # Ordered strongest-currently-healthy-first; a provider with revoked/
+    # locked credentials just gets skipped for free at reserve_key() and
+    # resumes automatically once keys are rotated (see api_manager.py).
     vision_providers = [
         item.strip().lower()
-        for item in os.environ.get("VISION_OCR_PROVIDER_ORDER", "openrouter,nvidia,gemini,github,groq").split(",")
+        for item in os.environ.get("VISION_OCR_PROVIDER_ORDER", "nvidia,groq,openrouter,gemini,github").split(",")
         if item.strip()
     ]
     vision_handlers = {
@@ -1350,6 +1380,260 @@ def _vision_rescue_cjk_ocr(
             print(f"  [vision] {item['text'][:30]}...")
         if rescued:
             return rescued
+    return []
+
+
+# Process-lifetime hourly attempt budget for the full-page rescue specifically
+# -- it's the most expensive vision call (whole-page image, more output
+# tokens than a handful of boxed regions) and, since Task 3's blank-result
+# cache fix means a page that still fails no longer gets served from cache,
+# a chapter of genuinely undetectable pages re-requested repeatedly needs a
+# hard ceiling independent of any single provider's own quota bookkeeping.
+_VISION_FULL_PAGE_ATTEMPTS: list = []
+_VISION_FULL_PAGE_ATTEMPTS_LOCK = threading.Lock()
+
+
+def _vision_full_page_rescue_budget_ok() -> bool:
+    limit = int(os.environ.get("VISION_RESCUE_MAX_PER_HOUR", "20"))
+    if limit <= 0:
+        return False
+    now = time.monotonic()
+    with _VISION_FULL_PAGE_ATTEMPTS_LOCK:
+        while _VISION_FULL_PAGE_ATTEMPTS and now - _VISION_FULL_PAGE_ATTEMPTS[0] > 3600:
+            _VISION_FULL_PAGE_ATTEMPTS.pop(0)
+        if len(_VISION_FULL_PAGE_ATTEMPTS) >= limit:
+            return False
+        _VISION_FULL_PAGE_ATTEMPTS.append(now)
+    return True
+
+
+def _vision_full_page_image_payload(image: np.ndarray, max_dimension: int = 1344) -> str:
+    h, w = image.shape[:2]
+    scale = min(1.0, max_dimension / float(max(h, w) or 1))
+    resized = (
+        cv2.resize(image, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+        if scale < 1.0
+        else image
+    )
+    ok, buffer = cv2.imencode(".jpg", resized, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        return ""
+    return base64.b64encode(buffer.tobytes()).decode("ascii")
+
+
+def _vision_full_page_rescue_request(
+    provider: str, model: str, image_b64: str, prompt: str, img_w: int, img_h: int
+) -> tuple[list[dict], str]:
+    """Returns (parsed JSON array, error string). Never raises -- callers
+    treat any exception-equivalent as a clean failure (empty list + reason)."""
+    max_tokens = int(os.environ.get("VISION_OCR_MAX_TOKENS", "2048"))
+    timeout = max(20, int(os.environ.get("VISION_OCR_TIMEOUT_SECONDS", "60")))
+    estimated_tokens = API_MANAGER.estimate_tokens(prompt, output_tokens=max_tokens)
+    try:
+        lease = API_MANAGER.reserve_key(provider, estimated_tokens, capability="vision_ocr")
+    except (ApiProviderUnavailable, ApiProviderAuthLocked, ApiQuotaExhausted, ApiRateLimited) as error:
+        return [], str(error)
+
+    if provider == "gemini":
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{urllib.parse.quote(model)}:generateContent?key={urllib.parse.quote(lease.key)}"
+        )
+        payload = {
+            "contents": [{"parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
+            ]}],
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": max_tokens, "responseMimeType": "application/json"},
+        }
+        headers = {"Content-Type": "application/json"}
+    else:
+        endpoints = {
+            "groq": "https://api.groq.com/openai/v1/chat/completions",
+            "nvidia": os.environ.get("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/") + "/chat/completions",
+            "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+            "github": "https://models.github.ai/inference/chat/completions",
+        }
+        url = endpoints.get(provider, "")
+        if not url:
+            API_MANAGER.mark_failure(lease, 0, f"no full-page-rescue endpoint for provider {provider}")
+            return [], f"unsupported provider {provider}"
+        headers = {"Authorization": f"Bearer {lease.key}", "Content-Type": "application/json"}
+        if provider == "github":
+            headers.update({"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
+        elif provider == "openrouter":
+            headers.update({"HTTP-Referer": "http://127.0.0.1", "X-Title": "Free Manga Translator Step 5 Rescue"})
+        payload = {
+            "model": model,
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": "You are a careful manga OCR assistant. You only return strict JSON and never invent unreadable text."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                ]},
+            ],
+        }
+
+    request = urllib.request.Request(
+        url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), method="POST", headers=headers
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw_payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")[:1000]
+        last_error = f"HTTP {error.code}: {body or error.reason}"
+        API_MANAGER.mark_failure(lease, error.code, last_error)
+        return [], last_error
+    except Exception as error:
+        last_error = str(error)[:180]
+        API_MANAGER.mark_failure(lease, 0, last_error)
+        return [], last_error
+    API_MANAGER.mark_success(lease, raw_payload)
+
+    content = ""
+    if provider == "gemini":
+        for candidate in raw_payload.get("candidates", []):
+            parts = (candidate.get("content") or {}).get("parts", [])
+            content += "\n".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
+    else:
+        for choice in raw_payload.get("choices", []):
+            message = choice.get("message") if isinstance(choice, dict) else None
+            piece = message.get("content") if isinstance(message, dict) else ""
+            if isinstance(piece, str):
+                content += piece
+            elif isinstance(piece, list):
+                content += "\n".join(str(part.get("text", "")) for part in piece if isinstance(part, dict))
+    return _extract_json_array(content), ""
+
+
+def _vision_full_page_rescue(image_path: Path, image: np.ndarray, language: str) -> list[dict]:
+    """Last-resort rescue for a CJK page where every existing OCR/consolidation/
+    region-rescue path produced zero usable text -- asks a vision model to find
+    its OWN text regions across the whole page, not just OCR boxes we already
+    (and evidently unsuccessfully) detected. Any failure at any point returns
+    [] so the caller is left with today's blank-page behavior; this can never
+    make a page worse than it already is."""
+    if os.environ.get("USE_API_VISION_OCR", "auto").strip().lower() in {"0", "false", "no", "off"}:
+        return []
+    if os.environ.get("VISION_FULL_PAGE_RESCUE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return []
+    _load_env_file()
+    if not _vision_full_page_rescue_budget_ok():
+        print("  [vision-full-page] skipped: hourly rescue budget exhausted")
+        return []
+
+    img_h, img_w = image.shape[:2]
+    image_b64 = _vision_full_page_image_payload(image)
+    if not image_b64:
+        return []
+
+    language_name = {"ko": "Korean", "ja": "Japanese", "ch_tra": "Chinese", "ch_sim": "Chinese"}.get(language, "Chinese")
+    prompt = (
+        f"This is a {img_w}x{img_h} pixel manga/comic page. Find every distinct {language_name} "
+        "dialogue or narration text block (speech bubbles, captions, hand-written dialogue). "
+        "Exclude sound effects drawn as artwork, page numbers, watermarks, and signatures. "
+        "Return STRICT JSON only, this exact shape: "
+        "[{\"bbox\":[x1,y1,x2,y2],\"source_text\":\"...\",\"english\":\"...\"}], "
+        "with bbox integers normalized to a 0-1000 scale (0,0 = top-left, 1000,1000 = bottom-right), "
+        "x1<x2 and y1<y2. Return at most 12 regions, ordered by natural reading order. "
+        "Return [] if no readable text is present."
+    )
+
+    vision_providers = [
+        item.strip().lower()
+        for item in os.environ.get("VISION_OCR_PROVIDER_ORDER", "nvidia,groq,openrouter,gemini,github").split(",")
+        if item.strip()
+    ]
+    max_providers = max(1, int(os.environ.get("VISION_FULL_PAGE_MAX_PROVIDERS", "2")))
+    model_env_by_provider = {
+        "gemini": ("GEMINI_VISION_OCR_MODELS", "gemini-2.5-flash-lite"),
+        "groq": ("GROQ_VISION_OCR_MODELS", "meta-llama/llama-4-scout-17b-16e-instruct"),
+        "nvidia": ("NVIDIA_NIM_VISION_OCR_MODELS", "nvidia/llama-3.1-nemotron-nano-vl-8b-v1"),
+        "openrouter": ("OPENROUTER_VISION_OCR_MODELS", "qwen/qwen2.5-vl-72b-instruct"),
+        "github": ("GITHUB_VISION_OCR_MODELS", "openai/gpt-4o-mini"),
+    }
+
+    attempts = 0
+    for provider in vision_providers:
+        if provider not in model_env_by_provider:
+            continue
+        if not API_MANAGER.provider_keys(provider):
+            continue
+        if attempts >= max_providers:
+            break
+        attempts += 1
+        env_name, default_model = model_env_by_provider[provider]
+        model = next(
+            (m.strip() for m in os.environ.get(env_name, "").split(",") if m.strip()),
+            default_model,
+        )
+        parsed, error = _vision_full_page_rescue_request(provider, model, image_b64, prompt, img_w, img_h)
+        if error:
+            print(f"  [vision-full-page warn] {provider}: {error}")
+            continue
+
+        final_results: list[dict] = []
+        seen_boxes: list[Box] = []
+        for entry in parsed:
+            if not isinstance(entry, dict):
+                continue
+            bbox = entry.get("bbox")
+            if not (isinstance(bbox, list) and len(bbox) == 4):
+                continue
+            try:
+                nx1, ny1, nx2, ny2 = (float(v) for v in bbox)
+            except (TypeError, ValueError):
+                continue
+            x1 = max(0, min(img_w, int(round(nx1 / 1000.0 * img_w))))
+            y1 = max(0, min(img_h, int(round(ny1 / 1000.0 * img_h))))
+            x2 = max(0, min(img_w, int(round(nx2 / 1000.0 * img_w))))
+            y2 = max(0, min(img_h, int(round(ny2 / 1000.0 * img_h))))
+            width, height = x2 - x1, y2 - y1
+            if width < 12 or height < 12:
+                continue
+            if width * height > 0.35 * img_w * img_h:
+                continue
+            if width > 0.90 * img_w and height > 0.90 * img_h:
+                continue
+            source_text = str(entry.get("source_text") or entry.get("text") or "").strip()
+            english_text = str(entry.get("english") or entry.get("en_text") or "").strip()
+            if not _vision_source_script_ok(source_text, language):
+                continue
+            if not english_text or not any(ch.isalpha() for ch in english_text):
+                continue
+            candidate_box = Box(x1, y1, x2, y2)
+            if any(_boxes_overlap(candidate_box, existing) > 0.65 for existing in seen_boxes):
+                continue
+            seen_boxes.append(candidate_box)
+            if len(seen_boxes) > 12:
+                break
+            green_box = candidate_box.expanded(max(8, min(24, int(min(width, height) * 0.12))), img_w, img_h)
+            final_results.append({
+                "id": len(final_results),
+                "text": source_text,
+                "pretranslated_text": english_text,
+                "ocr_provider": f"{provider}_vision_full_page:{model}",
+                "ocr_confidence": None,
+                "box": {k: int(v) for k, v in candidate_box.to_dict().items()},
+                "erase_boxes": [{k: int(v) for k, v in candidate_box.to_dict().items()}],
+                "green_box": {k: int(v) for k, v in green_box.to_dict().items()},
+                "green_polygon": [
+                    [green_box.x1, green_box.y1], [green_box.x2, green_box.y1],
+                    [green_box.x2, green_box.y2], [green_box.x1, green_box.y2],
+                ],
+                "route": "floating_dialogue",
+                "bubble_idx": -1,
+                "mask_mode": "stroke",
+                "fallback_source": f"{provider}_vision_full_page",
+                "force_bubble_cleanup": False,
+                "vision_rescue": True,
+            })
+        if final_results:
+            print(f"  [vision-full-page] {provider} recovered {len(final_results)} regions with {model}")
+            return final_results
     return []
 
 
@@ -2356,6 +2640,7 @@ def _run_step5_ocr_unlocked(sample_map: dict[str, str] | None = None, samples_di
 
             print(f"  [{idx}] {ocr_text[:30]}...")
 
+        consolidation_produced_zero = not final_results
         if not final_results:
             fallback = _fallback_ocr_from_raw_detections(
                 image, text_result.boxes, bubble_masks, ocr_runtime
@@ -2402,22 +2687,79 @@ def _run_step5_ocr_unlocked(sample_map: dict[str, str] | None = None, samples_di
                 for item in final_results:
                     print(f"  [paddle-ko] {item['text'][:30]}...")
 
-        if sample_ocr_language in {"ko", "ch_tra", "ch_sim"} and _usable_cjk_text_count(final_results, sample_ocr_language) == 0:
+        # A sample with no explicit zh/ko marker in its name defaults to
+        # Japanese -- the pipeline's implicit primary target language (see
+        # _sample_cjk_ocr_language's own docstring-equivalent comment above;
+        # it only ever distinguishes ko/zh from "everything else"). This
+        # covers runtime_ja_* live-server samples the same way ko/zh runtime
+        # samples are already covered, without touching ko/zh resolution at
+        # all. _local_cjk_mode() also being true for the offline validation
+        # suite is harmless: USE_API_VISION_OCR=0 there blocks every vision
+        # handler's own network call regardless of what rescue_language is.
+        rescue_language = sample_ocr_language or ("ja" if _local_cjk_mode() else None)
+        # Manga-ocr garble on the raw-detection-union fallback above can
+        # coincidentally contain >=2 kana characters and pass the plain
+        # usable-count check below even though it's junk, not real dialogue
+        # -- so for ja specifically also trust the upstream signal directly:
+        # no bubble detected AND consolidation itself produced nothing is
+        # the established zero-bubble-detector failure mode (see
+        # DEVELOPMENT_NOTES), and should always get a rescue attempt.
+        ja_degenerate = (
+            rescue_language == "ja" and not bubble_masks and consolidation_produced_zero
+        )
+        if rescue_language and (
+            _usable_cjk_text_count(final_results, rescue_language) == 0 or ja_degenerate
+        ):
             detected_boxes = [
                 _box_from_payload(item["box"])
                 for item in final_results
                 if isinstance(item, dict) and isinstance(item.get("box"), dict)
             ]
+            rescue_boxes = text_result.boxes if ja_degenerate else (detected_boxes or text_result.boxes)
+            # In the degenerate case the only "detected" item is the raw
+            # union fallback's own single garbled entry, whose
+            # force_bubble_cleanup/route metadata would corrupt the first
+            # rescued region if _preserve_detection_metadata matched it --
+            # pass no source items to preserve-from in that case.
+            rescue_sources = [] if ja_degenerate else final_results
             rescued = _vision_rescue_cjk_ocr(
                 img_path,
                 image,
-                sample_ocr_language,
-                detected_boxes or text_result.boxes,
+                rescue_language,
+                rescue_boxes,
                 text_result.seg_mask,
-                final_results,
+                rescue_sources,
             )
             if rescued:
                 final_results = rescued
+
+        # Last resort: every existing path (local OCR, the region-boxed
+        # vision rescue above) still produced zero usable text. Ask a vision
+        # model to find its own text regions across the whole page instead
+        # of relying on boxes we already (and evidently unsuccessfully)
+        # detected -- this is the only path that can rescue a page where
+        # detection itself found nothing at all to hand a box-based rescue.
+        vision_rescue_meta: dict[str, object] = {"attempted": False}
+        if rescue_language and _usable_cjk_text_count(final_results, rescue_language) == 0:
+            full_page_rescued = _vision_full_page_rescue(img_path, image, rescue_language)
+            vision_rescue_meta = {
+                "attempted": True,
+                "mode": "full_page",
+                "language": rescue_language,
+                "succeeded": bool(full_page_rescued),
+                "regions": len(full_page_rescued),
+            }
+            if full_page_rescued:
+                final_results = full_page_rescued
+                vision_rescue_meta["provider"] = full_page_rescued[0].get("ocr_provider", "")
+        try:
+            step5_dir = sample_path / "step_5_ocr"
+            step5_dir.mkdir(parents=True, exist_ok=True)
+            (step5_dir / "vision_rescue_meta.json").write_text(
+                json.dumps(vision_rescue_meta, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            pass
 
         final_results = _merge_same_line_ocr_fragments(
             final_results, image, text_result.seg_mask, ocr_runtime, w, h
