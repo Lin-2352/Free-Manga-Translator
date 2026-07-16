@@ -263,7 +263,11 @@ def _gemini_vision_region_ocr(
         model.strip()
         for model in os.environ.get(
             "GEMINI_VISION_OCR_MODELS",
-            "gemini-2.5-flash-lite,gemini-2.5-flash,gemini-2.0-flash",
+            # gemini-flash-latest first: gemini-2.5-flash/-lite return 404
+            # "no longer available to new users" for newer API keys/projects
+            # (confirmed 2026-07-16); the -latest alias works across old and
+            # new keys alike. See matching note in run_step7_translate.py.
+            "gemini-flash-latest,gemini-2.5-flash-lite,gemini-2.5-flash,gemini-2.0-flash",
         ).split(",")
         if model.strip()
     ]
@@ -1549,7 +1553,7 @@ def _vision_full_page_rescue(image_path: Path, image: np.ndarray, language: str)
     ]
     max_providers = max(1, int(os.environ.get("VISION_FULL_PAGE_MAX_PROVIDERS", "2")))
     model_env_by_provider = {
-        "gemini": ("GEMINI_VISION_OCR_MODELS", "gemini-2.5-flash-lite"),
+        "gemini": ("GEMINI_VISION_OCR_MODELS", "gemini-flash-latest"),
         "groq": ("GROQ_VISION_OCR_MODELS", "meta-llama/llama-4-scout-17b-16e-instruct"),
         "nvidia": ("NVIDIA_NIM_VISION_OCR_MODELS", "nvidia/llama-3.1-nemotron-nano-vl-8b-v1"),
         "openrouter": ("OPENROUTER_VISION_OCR_MODELS", "qwen/qwen2.5-vl-72b-instruct"),

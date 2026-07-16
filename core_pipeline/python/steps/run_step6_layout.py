@@ -42,12 +42,22 @@ import torch  # noqa: F401  (import-order guard, see comment above)
 import json
 import os
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 import cv2
 import numpy as np
 from collections import Counter
 from pathlib import Path
+from api_manager import (
+    API_MANAGER,
+    ApiProviderAuthLocked,
+    ApiProviderUnavailable,
+    ApiQuotaExhausted,
+    ApiRateLimited,
+)
 from diagnostic_logger import write_diagnostic_event
-from ml_region_lib import SAMPLE_MAP, classify_text_by_content
+from ml_region_lib import SAMPLE_MAP, classify_text_by_content, classify_text_is_ambiguous
 from pipeline_paths import DEFAULT_SAMPLES_ROOT, sample_root_from_env
 
 
@@ -1859,6 +1869,170 @@ def _recoverable_adjacent_fragment(item: dict, constraints: list[dict], image: n
     return False
 
 
+# --- Shadow-mode dialogue_classifier arbitration ---------------------------
+# Gathers real accuracy data on the ~1-2% of items where
+# classify_text_by_content's own comment admits low confidence (Rule B, Rule
+# C, or the final noise catch-all -- see classify_text_is_ambiguous) by
+# asking a cheap model the same dialogue-vs-noise question and logging
+# agreement/disagreement. Shadow mode ONLY: the API verdict is never applied
+# to any item's actual classification this round. Any failure (network,
+# parsing, quota) is swallowed silently -- this must never be able to slow
+# down, block, or change step 6's real output.
+_DIALOGUE_CLASSIFIER_PROVIDERS = ["nvidia", "groq", "gemini", "openrouter", "github"]
+_DIALOGUE_CLASSIFIER_MODELS = {
+    "nvidia": "meta/llama-3.1-70b-instruct",
+    "groq": "llama-3.3-70b-versatile",
+    "gemini": "gemini-flash-latest",
+    "openrouter": "tencent/hy3:free",
+    "github": "openai/gpt-4o-mini",
+}
+_DIALOGUE_CLASSIFIER_TIMEOUT_SECONDS = 8
+
+
+def _dialogue_classifier_enabled() -> bool:
+    return os.environ.get("USE_API_DIALOGUE_CLASSIFIER", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dialogue_classifier_request(provider: str, key: str, model: str, prompt: str) -> tuple[int, object]:
+    if provider == "gemini":
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            f"?key={urllib.parse.quote(key)}"
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 8},
+        }
+        headers = {"Content-Type": "application/json"}
+    else:
+        endpoints = {
+            "nvidia": "https://integrate.api.nvidia.com/v1/chat/completions",
+            "groq": "https://api.groq.com/openai/v1/chat/completions",
+            "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+            "github": "https://models.github.ai/inference/chat/completions",
+        }
+        url = endpoints[provider]
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 8,
+            "temperature": 0.0,
+        }
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        if provider == "github":
+            headers["Accept"] = "application/vnd.github+json"
+            headers["X-GitHub-Api-Version"] = "2022-11-28"
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=_DIALOGUE_CLASSIFIER_TIMEOUT_SECONDS) as response:
+            return response.status, json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as error:
+        try:
+            return error.code, json.loads(error.read().decode("utf-8", errors="replace"))
+        except Exception:
+            return error.code, {}
+
+
+def _extract_dialogue_verdict(payload: object) -> str | None:
+    content = ""
+    if isinstance(payload, dict):
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+            content = str(message.get("content", ""))
+        if not content:
+            candidates = payload.get("candidates")
+            if isinstance(candidates, list) and candidates:
+                candidate = candidates[0] if isinstance(candidates[0], dict) else {}
+                parts = candidate.get("content", {}).get("parts", []) if isinstance(candidate.get("content"), dict) else []
+                content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
+    # Strict allow-list -- an off-format or ambiguous reply is discarded, never
+    # fuzzy-interpreted, since this feeds a diagnostic log, not a fallback.
+    normalized = content.strip().strip(".\"'").lower()
+    if normalized == "dialogue":
+        return "dialogue"
+    if normalized == "noise":
+        return "noise"
+    return None
+
+
+def _call_dialogue_classifier_shadow(text: str) -> str | None:
+    prompt = (
+        "You are arbitrating manga OCR text classification. Given this short text "
+        "fragment, answer with EXACTLY one word: \"dialogue\" if it is spoken "
+        "dialogue, narration, or a meaningful short reply/reaction that should be "
+        "translated, or \"noise\" if it is a decorative sound-effect/onomatopoeia, "
+        "artwork, or meaningless fragment that should not be translated. Answer "
+        "with only that single word, nothing else.\n"
+        f"Text: {text}"
+    )
+    for provider in _DIALOGUE_CLASSIFIER_PROVIDERS:
+        model = _DIALOGUE_CLASSIFIER_MODELS.get(provider)
+        if not model:
+            continue
+        try:
+            lease = API_MANAGER.reserve_key(provider, 60, capability="dialogue_classifier")
+        except (ApiProviderAuthLocked, ApiProviderUnavailable, ApiQuotaExhausted, ApiRateLimited):
+            continue
+        except Exception:
+            continue
+        try:
+            status, payload = _dialogue_classifier_request(provider, lease.key, model, prompt)
+        except Exception as error:
+            try:
+                API_MANAGER.mark_failure(lease, 0, str(error)[:200])
+            except Exception:
+                pass
+            continue
+        if status != 200:
+            try:
+                API_MANAGER.mark_failure(lease, status, str(payload)[:200])
+            except Exception:
+                pass
+            continue
+        try:
+            API_MANAGER.mark_success(lease, payload)
+        except Exception:
+            pass
+        verdict = _extract_dialogue_verdict(payload)
+        if verdict is not None:
+            return verdict
+    return None
+
+
+def _dialogue_classifier_shadow_check(text: str, item_id, sample_name: str, heuristic_verdict: str) -> None:
+    if not _dialogue_classifier_enabled():
+        return
+    if not classify_text_is_ambiguous(text):
+        return
+    try:
+        api_verdict = _call_dialogue_classifier_shadow(text)
+    except Exception:
+        return
+    if api_verdict is None:
+        return
+    heuristic_is_dialogue = heuristic_verdict == "dialogue"
+    api_is_dialogue = api_verdict == "dialogue"
+    try:
+        write_diagnostic_event(
+            "layout.dialogue_classifier_shadow",
+            {
+                "sample": sample_name,
+                "item_id": item_id,
+                "text": str(text)[:120],
+                "heuristic_verdict": heuristic_verdict,
+                "api_verdict": api_verdict,
+                "agree": heuristic_is_dialogue == api_is_dialogue,
+            },
+            source="layout",
+            level="info",
+        )
+    except Exception:
+        pass
+# --- End shadow-mode dialogue_classifier arbitration ------------------------
+
+
 def _layout_rejection(item: dict, reason: str, semantic_role: str | None = None, classification: str | None = None) -> dict:
     box = item.get("box", {})
     return {
@@ -2918,6 +3092,7 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
 
             cls = classify_text_by_content(item.get("text", ""))
             item_id = item.get("id")
+            _dialogue_classifier_shadow_check(item.get("text", ""), item_id, sample_name, cls)
             is_floating = item.get("bubble_idx", -1) == -1
             # A vision rescue (run_step5_ocr.py's region or full-page rescue)
             # only ever runs after local detection/OCR already produced

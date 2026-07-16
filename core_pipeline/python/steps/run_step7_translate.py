@@ -69,7 +69,6 @@ ENV_FILE = PROJECT_ROOT / ".env"
 API_PROVIDER_FAILURES: list[dict[str, object]] = []
 API_PROVIDER_USES: list[dict[str, object]] = []
 API_PROVIDER_DISABLED: dict[str, str] = {}
-API_PROVIDER_KEY_CURSOR: dict[str, int] = {}
 API_PROVIDER_KEY_DISABLED: dict[str, dict[int, str]] = {}
 
 
@@ -372,21 +371,6 @@ def _load_page_context(sample_dir: Path, max_chars: int = 600) -> str:
         return ""
     text = " / ".join(str(line).strip() for line in lines if str(line).strip())
     return text[:max_chars]
-
-
-def _rotated_provider_keys(provider: str, keys: list[str]) -> list[tuple[int, str]]:
-    if not keys:
-        return []
-    disabled = API_PROVIDER_KEY_DISABLED.get(provider, {})
-    active_indexes = [index for index in range(len(keys)) if index + 1 not in disabled]
-    if not active_indexes:
-        return []
-    start = API_PROVIDER_KEY_CURSOR.get(provider, 0) % len(keys)
-    ordered_indexes = [index for index in range(start, len(keys))]
-    ordered_indexes.extend(index for index in range(0, start))
-    rotated = [(index + 1, keys[index]) for index in ordered_indexes if index in active_indexes]
-    API_PROVIDER_KEY_CURSOR[provider] = (start + 1) % len(keys)
-    return rotated
 
 
 def _auth_or_network_block(statuses: list[int]) -> bool:
@@ -773,6 +757,8 @@ def _translation_prompt(items: list[dict[str, object]], sample_name: str, page_c
         "Do not include source-language characters in the English output unless they are personal/place/title "
         "names intentionally romanized.\n"
         "Keep each translation concise enough for manga typesetting while preserving meaning.\n"
+        "Write fluent, grammatically correct, natural-sounding English the way a native speaker would "
+        "say it in this situation -- a reader should never be able to tell the line was translated.\n"
         "Return JSON only, exactly this shape: [{\"id\": 0, \"en_text\": \"...\"}].\n"
         + (
             f"Prior page context, for name/tone consistency ONLY -- do not re-translate these, "
@@ -834,7 +820,17 @@ def _parse_translation_response(payload: object) -> dict[int, str]:
     return translations
 
 
-def _openai_payload(model: str, prompt: str) -> dict[str, object]:
+def _translation_temperature(provider: str) -> float:
+    value = os.environ.get(f"{provider.upper()}_TRANSLATION_TEMPERATURE") or os.environ.get(
+        "API_TRANSLATION_TEMPERATURE", "0.3"
+    )
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.3
+
+
+def _openai_payload(model: str, prompt: str, provider: str = "") -> dict[str, object]:
     return {
         "model": model,
         "messages": [
@@ -843,13 +839,22 @@ def _openai_payload(model: str, prompt: str) -> dict[str, object]:
                 "content": (
                     "You are a senior manga/manhwa/manhua translator. Preserve character voice, "
                     "speaker perspective, implied subjects, tone, punctuation rhythm, honorific nuance, "
-                    "and layout-safe concision. Return strict JSON only."
+                    "and layout-safe concision. Write fluent, grammatically correct, natural-sounding "
+                    "English the way a native speaker would say it -- a reader should never be able to "
+                    "tell the line was translated. Return strict JSON only."
                 ),
             },
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.1,
+        "temperature": _translation_temperature(provider) if provider else 0.1,
         "max_tokens": int(os.environ.get("API_TRANSLATION_MAX_TOKENS", "1400")),
+        # NOT response_format:json_object -- verified live (2026-07-16) that it
+        # breaks the array-output contract on multiple providers: mistral
+        # returned a literal "[]", nvidia collapsed the whole batch to a single
+        # "{\"id\":0,\"en_text\":\"\"}" object. The prompt already asks for a
+        # top-level JSON array; json_object mode fights that shape instead of
+        # helping it. The existing regex-fallback parser plus the retry-bug
+        # fix are the real mitigation for malformed output at higher temperature.
     }
 
 
@@ -924,7 +929,7 @@ def _call_openai_compatible(
             "POST",
             endpoint,
             headers=headers_factory(key),
-            payload=_openai_payload(model, prompt),
+            payload=_openai_payload(model, prompt, provider),
         )
 
     return _call_with_quota(provider, prompt, models, request_builder)
@@ -965,13 +970,22 @@ def _call_github(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
 def _call_openrouter(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
     models = _model_candidates(
         ("OPENROUTER_TRANSLATION_MODELS", "OPENROUTER_TRANSLATION_MODEL"),
+        # OpenRouter's free-tier slugs rotate more often than other providers'
+        # catalogs -- as of 2026-07-16 qwen3-235b-a22b:free, qwen-2.5-72b-
+        # instruct:free, and anthropic/claude-3.5-sonnet are all gone (404),
+        # and openai/gpt-4o-mini and google/gemini-2.5-flash 402 on accounts
+        # with no purchased credits (some keys have credits, some don't).
+        # Verified-working free models first, one paid model kept as a bonus
+        # for keys that do have credits, a reasoning-flagged free model
+        # (think-tag risk) demoted last.
         [
-            "qwen/qwen3-235b-a22b:free",
-            "qwen/qwen-2.5-72b-instruct:free",
-            "google/gemini-2.5-flash",
-            "openai/gpt-4o-mini",
-            "anthropic/claude-3.5-sonnet",
+            "tencent/hy3:free",
+            "google/gemma-4-26b-a4b-it:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             "meta-llama/llama-3.3-70b-instruct:free",
+            "cohere/north-mini-code:free",
+            "google/gemini-2.5-flash",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
         ],
     )
     return _call_openai_compatible(
@@ -1008,8 +1022,11 @@ def _call_cerebras(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
     base_url = os.environ.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1").rstrip("/")
     models = _model_candidates(
         ("CEREBRAS_TRANSLATION_MODELS", "CEREBRAS_TRANSLATION_MODEL"),
-        # Non-reasoning chat models first; qwen-3-32b (reasoning) demoted to last.
-        ["gpt-oss-120b", "llama-3.3-70b", "qwen-3-32b"],
+        # Live catalog as of 2026-07-16 is zai-glm-4.7/gpt-oss-120b/gemma-4-31b --
+        # llama-3.3-70b and qwen-3-32b are no longer served on this account and
+        # 404. Non-reasoning chat models first; gpt-oss-120b (reasoning-style,
+        # think-tag risk) demoted to last.
+        ["zai-glm-4.7", "gemma-4-31b", "gpt-oss-120b"],
     )
     return _call_openai_compatible(
         "cerebras",
@@ -1042,12 +1059,16 @@ def _call_fireworks(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
     models = _model_candidates(
         ("FIREWORKS_TRANSLATION_MODELS", "FIREWORKS_TRANSLATION_MODEL"),
         [
-            # A plain 72B chat model first; the 235B qwen3 entry is a
-            # hybrid-thinking model (think-tag risk) demoted below it.
-            "accounts/fireworks/models/qwen2p5-72b-instruct",
-            "accounts/fireworks/models/llama-v3p1-70b-instruct",
-            "accounts/fireworks/models/qwen3p235b-a22b",
-            "accounts/fireworks/models/llama-v3p1-8b-instruct",
+            # Live catalog as of 2026-07-16 -- the old qwen2p5/llama-v3p1
+            # serverless deployments are gone (404) and the account's actual
+            # models are kimi-k2p6/glm-5p1/glm-5p2/deepseek-v4-pro/gpt-oss-120b.
+            # Non-reasoning chat models first; gpt-oss-120b (reasoning-style,
+            # think-tag risk) demoted to last.
+            "accounts/fireworks/models/kimi-k2p6",
+            "accounts/fireworks/models/glm-5p1",
+            "accounts/fireworks/models/deepseek-v4-pro",
+            "accounts/fireworks/models/glm-5p2",
+            "accounts/fireworks/models/gpt-oss-120b",
         ],
     )
     return _call_openai_compatible(
@@ -1076,7 +1097,7 @@ def _call_cloudflare(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
             "POST",
             f"https://api.cloudflare.com/client/v4/accounts/{urllib.parse.quote(account_id)}/ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            payload=_openai_payload(model, prompt),
+            payload=_openai_payload(model, prompt, "cloudflare"),
         )
 
     return _call_with_quota("cloudflare", prompt, models, request_builder)
@@ -1085,7 +1106,14 @@ def _call_cloudflare(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
 def _call_gemini(prompt: str) -> tuple[dict[int, str], dict[str, object]]:
     models = _model_candidates(
         ("GEMINI_TRANSLATION_MODELS", "GEMINI_TRANSLATION_MODEL"),
-        ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
+        # gemini-flash-latest first: confirmed live (2026-07-16) that Google
+        # now blocks gemini-2.5-flash/-lite with 404 "no longer available to
+        # new users" for newer API keys/projects -- only older, grandfathered
+        # projects can still reach the pinned models. The -latest alias
+        # always resolves to Google's current flash-tier model and works
+        # across both old and new keys, so it must be tried before the
+        # pinned versions rather than after.
+        ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
     )
 
     def request_builder(key: str, model: str):
@@ -1205,8 +1233,14 @@ def _api_translate_items(
                 provider_attempts.append(attempt_meta)
                 API_PROVIDER_USES.append({"sample": sample_name, **attempt_meta})
                 print(f"  [api-translate] {provider} attempt {attempt}: accepted {accepted}, remaining {len(pending_ids)}")
-                if accepted:
-                    break
+                # A successful HTTP call (no exception) already means
+                # _call_with_quota's own model/key waterfall settled on a
+                # result -- retrying here would just re-hit the exact same
+                # top-priority model/key again, which is unlikely to produce
+                # a different outcome and wastes a call that could instead
+                # try the next provider immediately. Only genuine transient
+                # failures (the Exception branch below) retry same-provider.
+                break
             except ApiProviderAuthLocked as error:
                 failure = {
                     "sample": sample_name,

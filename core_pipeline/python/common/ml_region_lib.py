@@ -268,19 +268,41 @@ def classify_text_by_content(text: str) -> str:
     Returns 'dialogue' for definite multi-character Japanese, Korean, or Chinese
     text while still treating short emphatic glyph runs as SFX/noise.
     """
+    verdict, _ = _classify_text_by_content_detailed(text)
+    return verdict
+
+
+def classify_text_is_ambiguous(text: str) -> bool:
+    """
+    True only when classify_text_by_content's verdict for this text came from
+    one of its documented low-confidence rules (Rule B, Rule C, or the final
+    noise catch-all) rather than a confident script/structure match. Used to
+    gate optional API arbitration onto only the ambiguous minority of calls
+    -- never changes classify_text_by_content's own return value.
+    """
+    _, ambiguous = _classify_text_by_content_detailed(text)
+    return ambiguous
+
+
+def _classify_text_by_content_detailed(text: str) -> tuple[str, bool]:
+    # Mechanical extraction of classify_text_by_content's original body --
+    # every `return 'x'` below became `return 'x', True/False` with the
+    # ambiguity flag set only on Rule B, Rule C, and the final catch-all.
+    # No condition logic was changed; classify_text_by_content's own return
+    # value must stay byte-identical to before this split.
     if not text or not text.strip():
-        return 'noise'
+        return 'noise', False
 
     text_clean = text.strip()
 
     # 1. Strip to alphanumeric only for script analysis
     script_text = "".join(c for c in text_clean if c.isalnum())
     if not script_text:
-        return 'noise'
+        return 'noise', False
 
     # 2. Pure digit strings are always noise (page numbers, chapter numbers, standalone counts)
     if script_text.isdigit():
-        return 'noise'
+        return 'noise', False
 
     # 3. CJK script composition
     katakana = sum(1 for c in script_text if '\u30A0' <= c <= '\u30FF' or c == 'ー')
@@ -296,7 +318,7 @@ def classify_text_by_content(text: str) -> str:
 
     if cjk_total == 0:
         # No CJK text at all — noise
-        return 'noise'
+        return 'noise', False
 
     # 4. English/ASCII signage filter.
     # Mixed CJK dialogue can contain terms such as "build" or "G". Do not let
@@ -305,7 +327,7 @@ def classify_text_by_content(text: str) -> str:
     if letters and cjk_total < 2:
         ascii_letters = [c for c in letters if c.isascii()]
         if len(ascii_letters) / len(letters) > 0.20:
-            return 'english'
+            return 'english', False
 
     # 4b. Digit + CJK-unit/counter expressions (e.g. "7일"/"7日" = "7 days",
     # "3年"/"3년" = "3 years", "5개" = "5 items") are meaningful short
@@ -314,7 +336,7 @@ def classify_text_by_content(text: str) -> str:
     # SFX rules below purely because it's short, regardless of language.
     has_digit = any(c.isdigit() for c in script_text)
     if has_digit and cjk_total >= 1:
-        return 'dialogue'
+        return 'dialogue', False
 
     katakana_ratio = katakana / cjk_total
 
@@ -322,18 +344,18 @@ def classify_text_by_content(text: str) -> str:
     # Hangul syllables are not handled by manga-ocr perfectly, but if a CJK OCR
     # provider is swapped in later this prevents Step 6 from discarding them.
     if hangul >= 3:
-        return 'dialogue'
+        return 'dialogue', False
     if hangul >= 2 and len(script_text) >= 3:
-        return 'dialogue'
+        return 'dialogue', False
     if hangul > 0 and len(script_text) <= 2:
-        return 'sfx'
+        return 'sfx', False
 
     # Chinese-only text is usually dialogue/caption when it has multiple Han
     # characters. Keep single/short Han glyph runs conservative to avoid SFX.
     if kanji >= 2 and hiragana == 0 and katakana == 0:
-        return 'dialogue'
+        return 'dialogue', False
     if kanji == 1 and hiragana == 0 and katakana == 0:
-        return 'sfx'
+        return 'sfx', False
 
     # 6. SFX heuristics — be very aggressive here
     # Mixed hiragana+katakana is a grammatically structured sentence (the
@@ -344,10 +366,10 @@ def classify_text_by_content(text: str) -> str:
     # (verified regression: modern_ja_2/ko_2/zh_2 panel-1 bubble never
     # translated because its text hit this exact case).
     if hiragana >= 2 and katakana >= 1 and cjk_total >= 4:
-        return 'dialogue'
+        return 'dialogue', False
     # Rule A: Predominantly katakana and short → SFX
     if katakana_ratio >= 0.65 and len(script_text) <= 10:
-        return 'sfx'
+        return 'sfx', False
     # A hiragana-bearing fragment ending in a real question/exclamation mark
     # reads as a reaction word ("あれ？" = "huh?", "えっ！？" = "eh!?", "まさか！"
     # = "no way!") rather than a breath/gasp SFX ("はぁ", "ふぅ") -- gasp SFX are
@@ -362,24 +384,24 @@ def classify_text_by_content(text: str) -> str:
     # earlier by an unrelated geometry check either way.
     ends_with_terminal_punct = text_clean.rstrip().endswith(("？", "！", "?", "!"))
     if ends_with_terminal_punct and hiragana >= 1 and katakana == 0:
-        return 'dialogue'
+        return 'dialogue', False
     # Rule B: Very short string (≤4 chars) with NO kanji → SFX/exclamation
     if len(script_text) <= 4 and kanji == 0:
-        return 'sfx'
+        return 'sfx', True
     # Rule C: All hiragana and very short → SFX breath/gasp (e.g. "はぁ", "ふぅ")
     if hiragana == cjk_total and len(script_text) <= 5:
-        return 'sfx'
+        return 'sfx', True
 
     # 7. Confirmed Japanese dialogue: must have Kanji OR ≥2 hiragana mixed with something
     if kanji >= 1:
-        return 'dialogue'
+        return 'dialogue', False
     if hiragana >= 3:
-        return 'dialogue'
+        return 'dialogue', False
     if hiragana >= 2 and katakana >= 1:
-        return 'dialogue'
+        return 'dialogue', False
 
     # Everything else is ambiguous — treat as noise to avoid false positives
-    return 'noise'
+    return 'noise', True
 
 
 

@@ -477,6 +477,19 @@ class ApiManager:
         key_state["keyIndex"] = index
         return key_state
 
+    def _rotation_start_index_locked(self, provider_state: dict[str, Any], key_count: int) -> int:
+        if key_count <= 0:
+            return 1
+        start = int(provider_state.get("nextKeyStartIndex", 1) or 1)
+        if start < 1 or start > key_count:
+            start = 1
+        return start
+
+    def _rotated_key_order(self, start_index: int, key_count: int) -> list[int]:
+        if key_count <= 0:
+            return []
+        return [((start_index - 1 + offset) % key_count) + 1 for offset in range(key_count)]
+
     def _provider_ready_reason(self, provider: str) -> str:
         config = self.providers.get(provider)
         if not config:
@@ -524,7 +537,10 @@ class ApiManager:
             locked_count = 0
             auth_locked_count = 0
             first_auth_lock_reason = ""
-            for index, key in enumerate(keys, start=1):
+            key_count = len(keys)
+            start_index = self._rotation_start_index_locked(provider_state, key_count)
+            for index in self._rotated_key_order(start_index, key_count):
+                key = keys[index - 1]
                 key_hash = self._key_hash(key)
                 key_state = self._ensure_key_state(provider_state, key_hash, index)
                 if self._is_locked(key_state):
@@ -550,6 +566,7 @@ class ApiManager:
                 key_state["requestsUsed"] = next_requests
                 key_state["status"] = "reserved"
                 key_state["lastReservedAt"] = now
+                provider_state["nextKeyStartIndex"] = (index % key_count) + 1
                 self._write_state_locked()
                 return ApiKeyLease(provider, index, key_hash, key, estimated_tokens, capability)
             self._write_state_locked()
