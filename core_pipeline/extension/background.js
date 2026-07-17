@@ -32,6 +32,45 @@ const queuedRequests = new Map();
 const requestQueue = [];
 const translationCache = new Map();
 
+// MV3 service workers can be torn down by Chrome's own idle/lifetime limits WHILE a translate
+// request is still awaiting the local pipeline fetch (observed: requests still pending past
+// ~5-10 minutes under a deep queue backlog). A held chrome.runtime.onMessage sendResponse from
+// before the teardown is unrecoverable once that happens -- the caller sees "the message channel
+// closed before a response was received" and the work has to be retried from content.js. This
+// alarm-based heartbeat does not prevent that outright (Chrome can still terminate a worker for
+// reasons unrelated to idle time), but a periodic alarm event is itself an activity signal that
+// measurably extends how long Chrome keeps a worker alive with in-flight work, and unlike a bare
+// fetch() it is not dependent on any particular Chrome version's fetch-keepalive behavior. It only
+// runs while there is real outstanding work (in-flight or queued), and is cleared the moment there
+// is none, so it costs nothing at idle.
+const KEEP_ALIVE_ALARM_NAME = 'fmt-translation-keep-alive';
+const KEEP_ALIVE_PERIOD_MINUTES = 0.4; // ~24s -- under Chrome's ~30s SW idle-kill window
+let keepAliveAlarmActive = false;
+
+function ensureKeepAliveAlarm() {
+  if (keepAliveAlarmActive || !chrome.alarms?.create) return;
+  keepAliveAlarmActive = true;
+  chrome.alarms.create(KEEP_ALIVE_ALARM_NAME, { periodInMinutes: KEEP_ALIVE_PERIOD_MINUTES });
+}
+
+function maybeClearKeepAliveAlarm() {
+  if (!keepAliveAlarmActive) return;
+  if (outgoingRequests.size > 0 || requestQueue.length > 0) return;
+  keepAliveAlarmActive = false;
+  chrome.alarms.clear(KEEP_ALIVE_ALARM_NAME).catch(() => {});
+}
+
+chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm.name !== KEEP_ALIVE_ALARM_NAME) return;
+  // The alarm firing is the actual keep-alive mechanism; touching storage here is only to give
+  // the handler a real async op instead of an empty no-op, in case that matters to any given
+  // Chrome version's activity accounting.
+  chrome.storage.session?.get?.([]).catch(() => {});
+  if (outgoingRequests.size === 0 && requestQueue.length === 0) {
+    maybeClearKeepAliveAlarm();
+  }
+});
+
 // outgoingRequests.size only reflects a dispatch once processTranslation's async body has
 // run past several awaits (getSettings, cache lookups, ...). Two admission checks that read
 // outgoingRequests.size back-to-back within that window both see the pre-dispatch count, so
@@ -793,11 +832,13 @@ async function processTranslation(message, options = {}) {
       clearTimeout(timeoutTimer);
       outgoingRequests.delete(cacheId);
       activeControllers.delete(cacheId);
+      maybeClearKeepAliveAlarm();
       scheduleQueueDrain();
     }
   })();
 
   outgoingRequests.set(cacheId, promise);
+  ensureKeepAliveAlarm();
   return promise;
 }
 
@@ -865,6 +906,7 @@ function clearQueuedTranslations(reason = 'QueueCleared') {
   if (dropped.length > 0) persistQueueDescriptors();
   restartLost = 0;
   queueActivitySinceBoot = true;
+  maybeClearKeepAliveAlarm();
   return dropped.length;
 }
 
@@ -918,6 +960,7 @@ async function queueTranslation(message) {
   });
   queuedRequests.set(cacheId, queuedPromise);
   queuedPromise.finally(() => queuedRequests.delete(cacheId));
+  ensureKeepAliveAlarm();
   persistQueueDescriptors();
   console.log(`[FMT] queued translation ${requestQueue.length}/${settings.queueLimit} ${cacheId}`);
   // A slot may have freed up during the awaits above (getSettings/getCachedResult/
@@ -1229,6 +1272,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // This is a capacity-limit rejection, not a queue-clearing acknowledgement, so it must
         // NOT touch restartLost.
         if (shed) persistQueueDescriptors();
+        maybeClearKeepAliveAlarm();
         sendResponse({ success: true, ...buildQueueStats({ ...settings, queueLimit: limit }) });
       })
       .catch((error) => sendResponse({ success: false, error: error.message }));

@@ -1292,18 +1292,43 @@
         img.removeAttribute(PROCESSING_ATTR);
       }
     } catch (error) {
+      const errorMessage = error?.message || String(error || '');
       console.error('[MangaTranslator] Error:', error);
-      emitDiagnostic('content.translate.exception', traceId, {
-        cacheKey,
-        error: error?.message || String(error || ''),
-      });
-      // A newer request may already own this cacheKey's pending/processing
-      // state if this one was superseded before it failed; only this
-      // request's own state may be cleaned up.
-      if (requestGeneration === pageWorkGeneration) {
-        showErrorBadge(img, error?.message || String(error || 'unknown error'));
-        cleanupProcessing(img, cacheKey);
+      emitDiagnostic('content.translate.exception', traceId, { cacheKey, error: errorMessage });
+      if (requestGeneration !== pageWorkGeneration) {
+        // A newer request may already own this cacheKey's pending/processing state.
+        return;
       }
+      // Chrome throws this exact message when the background service worker was
+      // terminated (its own idle/lifetime limits, independent of whether our fetch
+      // was still in flight) before it could deliver a response. Treat it as
+      // retryable like a timeout, not a terminal failure: an image that hit this is
+      // otherwise stuck forever with no visible progress. If the backend had
+      // already finished and background.js cached the result to
+      // chrome.storage.session before dying, the retry is a free cache hit; if the
+      // service worker died mid-fetch (the case we've actually observed, under a
+      // deep backlog), the backend has no server-side dedup by image content, so
+      // the retry genuinely re-issues a fresh translate call -- bounded to
+      // MAX_RETRIES extra real API calls for that one image, not unbounded. Any
+      // other exception (a genuine local/script error) stays terminal.
+      const isChannelClosed = errorMessage.includes('message channel closed');
+      if (isChannelClosed) {
+        const retryCount = (retryCountMap.get(cacheKey) || 0) + 1;
+        retryCountMap.set(cacheKey, retryCount);
+        if (retryCount <= MAX_RETRIES) {
+          const delay = BASE_RETRY_DELAY * Math.pow(2, retryCount - 1) + Math.random() * 1000;
+          console.log(`[MangaTranslator] Service worker restarted mid-request, retry ${retryCount}/${MAX_RETRIES} in ${Math.round(delay)}ms`);
+          setTimeout(() => {
+            img.removeAttribute(PROCESSING_ATTR);
+            pendingSrcs.delete(cacheKey);
+            translateImage(img, { force: options.force === true, originalSrc, cacheKey });
+          }, delay);
+          return; // spinner stays during retry
+        }
+        retryCountMap.delete(cacheKey);
+      }
+      showErrorBadge(img, errorMessage || 'unknown error');
+      cleanupProcessing(img, cacheKey);
     }
   }
 
