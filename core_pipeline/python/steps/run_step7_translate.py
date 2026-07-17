@@ -714,7 +714,12 @@ def _pretranslated_text(item: dict[str, object]) -> str:
     return ""
 
 
+def _prompt_length_budgets_enabled() -> bool:
+    return os.environ.get("STEP7_PROMPT_LENGTH_BUDGET", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _translation_prompt(items: list[dict[str, object]], sample_name: str, page_context: str = "") -> str:
+    include_budgets = _prompt_length_budgets_enabled()
     compact_items = []
     for item in items:
         source_text = str(item.get("text", "")).strip()
@@ -725,6 +730,8 @@ def _translation_prompt(items: list[dict[str, object]], sample_name: str, page_c
             payload["role"] = "sfx"
         elif item.get("short_fragment"):
             payload["role"] = "brief"
+        if include_budgets:
+            payload["max_chars"] = _translation_box_budget(item)
         compact_items.append(payload)
     return (
         "You are a professional manga, manhwa, and manhua translator/typesetter assistant.\n"
@@ -757,7 +764,14 @@ def _translation_prompt(items: list[dict[str, object]], sample_name: str, page_c
         "Do not include source-language characters in the English output unless they are personal/place/title "
         "names intentionally romanized.\n"
         "Keep each translation concise enough for manga typesetting while preserving meaning.\n"
-        "Write fluent, grammatically correct, natural-sounding English the way a native speaker would "
+        + (
+            "Each item may include \"max_chars\": an approximate character budget for that item's speech "
+            "bubble, based on its size. Try to phrase your translation to fit within roughly that many "
+            "characters, but never at the cost of a broken sentence or lost meaning -- a natural translation "
+            "that runs a bit long is better than an unnatural one that fits exactly.\n"
+            if include_budgets else ""
+        )
+        + "Write fluent, grammatically correct, natural-sounding English the way a native speaker would "
         "say it in this situation -- a reader should never be able to tell the line was translated.\n"
         "Return JSON only, exactly this shape: [{\"id\": 0, \"en_text\": \"...\"}].\n"
         + (
