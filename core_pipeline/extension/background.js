@@ -53,6 +53,12 @@ chrome.storage.local.get(['translationPaused']).then((result) => {
 // on their behalf with no way to know if they still want it); we just persist enough to tell
 // them truthfully that it happened, once, on the next SW instantiation.
 let restartLost = 0;
+// A real translate request can wake a freshly-instantiated SW before the async
+// chrome.storage.session.get below resolves -- without this flag, queueTranslation's own
+// restartLost = 0 (the "user already re-ran Translate Page" clear) can run and then be
+// overwritten moments later when that read resolves and sets restartLost again, resurrecting a
+// warning the user already acted on.
+let queueActivitySinceBoot = false;
 const QUEUE_DESCRIPTOR_KEY = 'fmtQueueDescriptorsV1';
 
 function persistQueueDescriptors() {
@@ -67,7 +73,11 @@ function persistQueueDescriptors() {
 
 chrome.storage.session?.get?.([QUEUE_DESCRIPTOR_KEY]).then((result) => {
   const lost = result?.[QUEUE_DESCRIPTOR_KEY];
-  if (Array.isArray(lost) && lost.length > 0) {
+  // If real queue activity already happened this boot, that activity already reset restartLost
+  // (queueTranslation) as the honest "re-run happened" signal -- this stale read must not
+  // override it. The descriptor key is still always removed either way so it can't resurface
+  // on a later boot.
+  if (Array.isArray(lost) && lost.length > 0 && !queueActivitySinceBoot) {
     restartLost = lost.length;
     console.warn(`[FMT] ${lost.length} queued translation(s) lost in a service worker restart`);
   }
@@ -854,6 +864,7 @@ function clearQueuedTranslations(reason = 'QueueCleared') {
   });
   if (dropped.length > 0) persistQueueDescriptors();
   restartLost = 0;
+  queueActivitySinceBoot = true;
   return dropped.length;
 }
 
@@ -864,6 +875,7 @@ async function queueTranslation(message) {
   // on an explicit Clear Queue. Otherwise the message keeps showing a truthful-when-written but
   // now-stale claim even after the user did exactly what it asked, which is its own honesty bug.
   restartLost = 0;
+  queueActivitySinceBoot = true;
 
   const settings = await getSettings();
   const cacheId = buildCacheId(message, settings);
@@ -1204,11 +1216,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .then(async (settings) => {
         const limit = Math.max(0, Math.min(MAX_QUEUE_LIMIT, Number(message.limit ?? settings.queueLimit) || 0));
         await chrome.storage.local.set({ translationQueuePages: limit });
+        let shed = false;
         while (requestQueue.length > limit) {
           const dropped = requestQueue.pop();
           if (dropped?.cacheId) queuedRequests.delete(dropped.cacheId);
           dropped?.resolve?.({ error: 'QueueFull', queueLength: requestQueue.length, queueLimit: limit });
+          shed = true;
         }
+        // Every other requestQueue mutation (push/shift/splice) persists its descriptors --
+        // this shed loop must too, or a later SW restart reports leftover pre-shed cacheIds as
+        // "lost" even though the user's own dropdown change is what removed them, not a crash.
+        // This is a capacity-limit rejection, not a queue-clearing acknowledgement, so it must
+        // NOT touch restartLost.
+        if (shed) persistQueueDescriptors();
         sendResponse({ success: true, ...buildQueueStats({ ...settings, queueLimit: limit }) });
       })
       .catch((error) => sendResponse({ success: false, error: error.message }));

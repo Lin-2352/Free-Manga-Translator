@@ -28,6 +28,10 @@ let errorTriggerUrl = null;
 const documentListeners = new Map();
 let fakePanelOverlayPresent = false;
 let elementsFromPointStack = [];
+let storageChangeListener;
+function setAutoQueueLimit(value) {
+  storageChangeListener({ translationQueuePages: { newValue: value } });
+}
 
 const fakeImage = {
   nodeName: 'IMG',
@@ -260,7 +264,7 @@ const sandbox = {
           translationQueuePages: 1,
         }),
       },
-      onChanged: { addListener: () => {} },
+      onChanged: { addListener: (listener) => { storageChangeListener = listener; } },
     },
   },
 };
@@ -943,5 +947,72 @@ assert.equal(documentElement_isPicking(), true, 'picker active before pausing');
 contentListener({ kind: 'setTranslationPaused', paused: true }, {}, () => {});
 assert.equal(documentElement_isPicking(), false, 'pausing translation stops an active picker');
 contentListener({ kind: 'setTranslationPaused', paused: false }, {}, () => {});
+
+// ===== Queue-ahead pacing: every value the popup dropdown offers actually gates how many
+// images get sent, and always the nearest-to-viewport ones first =====
+lookupHit = false;
+function makeSpacedImage(tag, n, topOffset) {
+  return makeQueueImage(
+    `https://example.test/${tag}/page-${n}.jpg`,
+    { left: 10, top: topOffset, right: 910, bottom: topOffset + 1300, width: 900, height: 1300 },
+    900,
+    1300,
+  );
+}
+
+// queue-ahead 0 ("Current only") sends exactly the single nearest candidate.
+setAutoQueueLimit(0);
+fakeImages = [makeSpacedImage('qa0', 0, 0), makeSpacedImage('qa0', 1, 1000), makeSpacedImage('qa0', 2, 2000)];
+let beforeCount = translateRequests.length;
+contentListener({ kind: 'toggleTranslation', enabled: true }, {}, () => {});
+await new Promise((resolve) => setTimeout(resolve, 10));
+let sent = translateRequests.slice(beforeCount);
+assert.equal(sent.length, 1, 'queue-ahead 0 ("Current only") sends exactly 1 image, not 0 and not more');
+assert.equal(sent[0].originalImageUrl, 'https://example.test/qa0/page-0.jpg', 'queue-ahead 0 sends the single NEAREST image');
+contentListener({ kind: 'toggleTranslation', enabled: false }, {}, () => {});
+
+// queue-ahead 3 sends exactly the 3 nearest, skipping the 2 farthest.
+setAutoQueueLimit(3);
+fakeImages = [0, 1, 2, 3, 4].map((n) => makeSpacedImage('qa3', n, n * 1000));
+beforeCount = translateRequests.length;
+contentListener({ kind: 'toggleTranslation', enabled: true }, {}, () => {});
+await new Promise((resolve) => setTimeout(resolve, 10));
+sent = translateRequests.slice(beforeCount);
+assert.equal(sent.length, 3, 'queue-ahead 3 sends exactly 3 images');
+assert.deepEqual(
+  sent.map((r) => r.originalImageUrl).sort(),
+  ['https://example.test/qa3/page-0.jpg', 'https://example.test/qa3/page-1.jpg', 'https://example.test/qa3/page-2.jpg'].sort(),
+  'queue-ahead 3 sends the 3 NEAREST images, not the 2 farthest',
+);
+contentListener({ kind: 'toggleTranslation', enabled: false }, {}, () => {});
+
+// queue-ahead 50 sends every candidate when fewer than 50 exist -- not artificially capped
+// below what's actually available on the page.
+setAutoQueueLimit(50);
+fakeImages = [0, 1, 2, 3, 4, 5].map((n) => makeSpacedImage('qa50', n, n * 1000));
+beforeCount = translateRequests.length;
+contentListener({ kind: 'toggleTranslation', enabled: true }, {}, () => {});
+await new Promise((resolve) => setTimeout(resolve, 10));
+sent = translateRequests.slice(beforeCount);
+assert.equal(sent.length, 6, 'queue-ahead 50 sends every one of the 6 available candidates');
+contentListener({ kind: 'toggleTranslation', enabled: false }, {}, () => {});
+
+// A live queue-ahead change while auto-translate is already on immediately rescans with the new
+// limit (storage.onChanged, matching a live popup dropdown edit) -- not just on the next toggle.
+fakeImages = [0, 1, 2].map((n) => makeSpacedImage('live', n, n * 1000));
+setAutoQueueLimit(0);
+contentListener({ kind: 'toggleTranslation', enabled: true }, {}, () => {});
+await new Promise((resolve) => setTimeout(resolve, 10));
+let liveSent = translateRequests.filter((r) => r.originalImageUrl.includes('/live/'));
+assert.equal(liveSent.length, 1, 'live pacing setup: only the nearest sent at queue-ahead 0');
+setAutoQueueLimit(3);
+await new Promise((resolve) => setTimeout(resolve, 10));
+liveSent = translateRequests.filter((r) => r.originalImageUrl.includes('/live/'));
+assert.equal(
+  liveSent.length,
+  3,
+  'raising queue-ahead live immediately rescans and sends the newly-eligible images, without needing another toggle',
+);
+contentListener({ kind: 'toggleTranslation', enabled: false }, {}, () => {});
 
 console.log('extension_content_contract=pass');
