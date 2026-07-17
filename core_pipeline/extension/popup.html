@@ -12,7 +12,7 @@
       <img src="icons/48x48.png" alt="Manga Translator" class="logo">
       <div class="title-block">
         <h1>Manga Translator</h1>
-          <span>Local 8-stage pipeline <b id="versionBadge" class="version-badge">v1.1.13</b></span>
+          <span>Local 8-stage pipeline <b id="versionBadge" class="version-badge">v1.1.15</b></span>
       </div>
       <span class="badge">LOCAL</span>
       <button id="themeToggleBtn" class="theme-toggle" type="button" aria-label="Switch to dark theme" aria-pressed="false">
@@ -60,6 +60,7 @@
         <button id="startEngineBtn" class="btn btn-primary btn-action actions-grid-wide" data-help-panel="hoverHelp" data-help-title="Start Engine" data-help="Checks whether the local backend is reachable.|If reachable, requests model warmup through /v1/warmup.|If unreachable, shows the local launcher command because Chrome cannot spawn Python directly without a native host.">Start Engine</button>
         <button id="translatePageBtn" class="btn btn-primary btn-action" data-help-panel="hoverHelp" data-help-title="Translate Page" data-help="Scans the current reader page for manga images.|Uses cached translations first.|Sends untranslated images to the local 8-stage pipeline.">Translate Page</button>
         <button id="translationPanelBtn" class="btn btn-secondary btn-action" data-help-panel="hoverHelp" data-help-title="Selection Panel" data-help="Opens manual area translation mode.|Use it for a single panel or cropped region.|Keeps the normal page queue untouched.">Selection Panel</button>
+        <button id="pickPanelBtn" class="btn btn-secondary btn-action" data-help-panel="hoverHelp" data-help-title="Pick Panel" data-help="Lightly highlights images as you hover, like inspect element.|Click one to force-translate it, bypassing normal detection.|Use it when a page image is not detected automatically.">Pick Panel</button>
         <button id="pauseBtn" class="btn btn-warning btn-action" data-help-panel="hoverHelp" data-help-title="Pause" data-help="Immediately pauses page translation.|Cancels queued browser work and stops image spinners.|Keeps already translated images and backend models untouched.">Pause</button>
         <button id="resumeBtn" class="btn btn-secondary btn-action" data-help-panel="hoverHelp" data-help-title="Resume" data-help="Clears the paused state.|Restarts queued work if auto-translate is enabled.|Does not reload GPU models if they are already warm.">Resume</button>
         <button id="softStopBtn" class="btn btn-warning btn-action" data-help-panel="hoverHelp" data-help-title="Soft Stop" data-help="Stops active and queued translation work.|Keeps the backend process alive.|Keeps models available so the next run starts faster.">Soft Stop</button>
@@ -183,6 +184,7 @@
           <option value="5">5 images</option>
           <option value="12">12 images</option>
           <option value="20">20 images</option>
+          <option value="24">24 images</option>
           <option value="40">40 images</option>
         </select>
       </div>

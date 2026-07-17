@@ -10,6 +10,10 @@
     return;
   }
 
+  // content.js's panel picker listens for clicks at the page level too; both open at once would
+  // fight over the same clicks, and the Selection Panel opening is the more deliberate action.
+  window.__fmtStopPanelPicker?.();
+
   // ===== Inject panel styles =====
   const styleId = 'fmt-panel-styles';
   if (!document.getElementById(styleId)) {

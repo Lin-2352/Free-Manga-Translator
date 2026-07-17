@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const startEngineBtn = document.getElementById('startEngineBtn');
   const translatePageBtn = document.getElementById('translatePageBtn');
   const translationPanelBtn = document.getElementById('translationPanelBtn');
+  const pickPanelBtn = document.getElementById('pickPanelBtn');
   const pauseBtn = document.getElementById('pauseBtn');
   const softStopBtn = document.getElementById('softStopBtn');
   const hardStopBtn = document.getElementById('hardStopBtn');
@@ -47,12 +48,17 @@ document.addEventListener('DOMContentLoaded', () => {
   const themeToggleBtn = document.getElementById('themeToggleBtn');
 
   const DEFAULT_LOCAL_PIPELINE_URL = 'http://127.0.0.1:8766/v1/translate-image';
-  const DEFAULT_CACHE_LIMIT = 12;
+  // Must match background.js's own DEFAULT_CACHE_LIMIT: a cache smaller than the
+  // queue-ahead depth LRU-evicts the page you started reading before you're done
+  // with it. A prior mismatch here (12 vs background's 24, and 24 wasn't even a
+  // selectable dropdown option) meant a fresh profile showed "N/24 entries cached"
+  // while this dropdown displayed 12 -- a real, user-visible false number.
+  const DEFAULT_CACHE_LIMIT = 24;
   const DEFAULT_QUEUE_LIMIT = 20;
   const DEFAULT_PARALLEL_LIMIT = 2;
   const THEME_STORAGE_KEY = 'uiTheme';
 
-  const manifestVersion = chrome.runtime.getManifest?.().version || '1.1.14';
+  const manifestVersion = chrome.runtime.getManifest?.().version || '1.1.15';
   if (versionBadge) versionBadge.textContent = `v${manifestVersion}`;
 
   function systemPrefersDark() {
@@ -213,8 +219,20 @@ document.addEventListener('DOMContentLoaded', () => {
     // below) so the panel can fade in/out; the `hidden` attribute from the HTML default only
     // needs clearing once, up front.
     if (hoverHelp) hoverHelp.hidden = false;
+    // 400ms mirrors the OS-default hover-tooltip delay -- an instant popup on every stray
+    // mouseenter while scanning the toolbar felt like noise, not help. Keyboard focus and click
+    // stay instant: those are deliberate, not incidental, so there's nothing to debounce.
+    const HELP_HOVER_DELAY_MS = 400;
     document.querySelectorAll('[data-help-panel]').forEach((element) => {
+      let showTimer = null;
+      const clearShowTimer = () => {
+        if (showTimer !== null) {
+          clearTimeout(showTimer);
+          showTimer = null;
+        }
+      };
       const show = () => {
+        clearShowTimer();
         const items = String(element.dataset.help || '')
           .split('|')
           .map((item) => item.trim())
@@ -222,10 +240,15 @@ document.addEventListener('DOMContentLoaded', () => {
         renderFloatingHelp(element.dataset.helpTitle || element.textContent, items);
         positionFloatingHelp(element);
       };
+      const showAfterDelay = () => {
+        clearShowTimer();
+        showTimer = setTimeout(show, HELP_HOVER_DELAY_MS);
+      };
       const hide = () => {
+        clearShowTimer();
         if (hoverHelp) hoverHelp.classList.remove('is-visible');
       };
-      element.addEventListener('mouseenter', show);
+      element.addEventListener('mouseenter', showAfterDelay);
       element.addEventListener('focus', show);
       element.addEventListener('click', show);
       element.addEventListener('mouseleave', hide);
@@ -301,11 +324,13 @@ document.addEventListener('DOMContentLoaded', () => {
       if (parallelJobsText) parallelJobsText.textContent = String(parallelLimit);
       if (queueMeterFill) queueMeterFill.style.width = `${pressurePercent}%`;
 
+      const restartLost = Number(response.restartLost || 0);
       const parts = [];
       if (response.isPaused) parts.push('paused');
       if (activeRequests > 0) parts.push(`${activeRequests} active`);
       if (parallelLimit > 1) parts.push(`parallel ${parallelLimit}`);
       if (queueLength > 0) parts.push(`${queueLength}/${queueLimit} queued`);
+      if (restartLost > 0) parts.push(`${restartLost} lost in restart - re-run Translate Page`);
       statsText.textContent = parts.length ? parts.join(' Â· ') : 'ready';
     });
   }
@@ -597,6 +622,25 @@ document.addEventListener('DOMContentLoaded', () => {
         await runtimeMessage({ kind: 'setTranslationPaused', paused: false });
         const response = await runtimeMessage({ kind: 'startTranslationPanel', tabId: tab.id });
         if (response.success === false) throw new Error(response.error || 'Selection panel failed');
+      });
+      window.close();
+    } catch (error) {
+      reportPopupError(error);
+    }
+  });
+
+  pickPanelBtn.addEventListener('click', async () => {
+    try {
+      await withButton(pickPanelBtn, async () => {
+        const response = await sendActivePageCommand({ kind: 'togglePanelPicker' });
+        if (response?.success === false) throw new Error(response.error || 'Panel picker failed');
+        // The outer wrapper only reports whether the message was delivered; content.js's own
+        // reply (response.response) reports whether the picker actually started -- it refuses to
+        // while the Selection Panel is already open, and that's the one failure mode worth
+        // surfacing to the user instead of silently doing nothing.
+        if (response?.response?.success === false) {
+          throw new Error(response.response.error || 'Panel picker failed');
+        }
       });
       window.close();
     } catch (error) {

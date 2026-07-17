@@ -2,7 +2,7 @@
 // All image translation goes through the local Python 8-step pipeline bridge.
 
 const DEFAULT_LOCAL_PIPELINE_URL = 'http://127.0.0.1:8766/v1/translate-image';
-const APP_VERSION = '1.1.14';
+const APP_VERSION = '1.1.15';
 // Every backend route except /health now requires this header (backend_api/app/main.py). It is
 // not a secret -- it forces the browser to CORS-preflight requests to the local pipeline server,
 // closing an unpreflighted "simple request" CSRF gap against a companion API with no other auth.
@@ -20,6 +20,11 @@ const DEFAULT_CACHE_LIMIT = 24;
 const MAX_CACHE_LIMIT = 40;
 const DEFAULT_QUEUE_LIMIT = 20;
 const MAX_QUEUE_LIMIT = 50;
+// A cold-GPU pipeline run has been observed taking 1-3+ minutes; 360s leaves real margin
+// while still guaranteeing a hung request can't hold a parallel slot for an entire session.
+const DEFAULT_FETCH_TIMEOUT_MS = 360_000;
+const MIN_FETCH_TIMEOUT_MS = 30_000;
+const MAX_FETCH_TIMEOUT_MS = 900_000;
 
 const outgoingRequests = new Map();
 const activeControllers = new Map();
@@ -40,6 +45,33 @@ let isPaused = false;
 
 chrome.storage.local.get(['translationPaused']).then((result) => {
   isPaused = result.translationPaused === true;
+}).catch(() => {});
+
+// requestQueue is in-memory only -- a service-worker idle-kill wipes it silently, leaving the
+// popup polling a queue that no longer exists. We don't attempt to recover the lost work (that
+// would mean re-fetching pages the user may have already left, spending real backend/API quota
+// on their behalf with no way to know if they still want it); we just persist enough to tell
+// them truthfully that it happened, once, on the next SW instantiation.
+let restartLost = 0;
+const QUEUE_DESCRIPTOR_KEY = 'fmtQueueDescriptorsV1';
+
+function persistQueueDescriptors() {
+  if (!chrome.storage.session?.set) return;
+  const cacheIds = requestQueue.map((item) => item.cacheId).filter(Boolean);
+  if (cacheIds.length === 0) {
+    chrome.storage.session.remove?.([QUEUE_DESCRIPTOR_KEY]).catch(() => {});
+    return;
+  }
+  chrome.storage.session.set({ [QUEUE_DESCRIPTOR_KEY]: cacheIds }).catch(() => {});
+}
+
+chrome.storage.session?.get?.([QUEUE_DESCRIPTOR_KEY]).then((result) => {
+  const lost = result?.[QUEUE_DESCRIPTOR_KEY];
+  if (Array.isArray(lost) && lost.length > 0) {
+    restartLost = lost.length;
+    console.warn(`[FMT] ${lost.length} queued translation(s) lost in a service worker restart`);
+  }
+  return chrome.storage.session?.remove?.([QUEUE_DESCRIPTOR_KEY]);
 }).catch(() => {});
 
 function fastHash(str) {
@@ -67,10 +99,12 @@ async function getSettings() {
     'translationCachePages',
     'translationQueuePages',
     'translationParallelPages',
+    'translationFetchTimeoutMs',
   ]);
   const cacheLimit = Number.parseInt(result.translationCachePages, 10);
   const queueLimit = Number.parseInt(result.translationQueuePages, 10);
   const parallelLimit = Number.parseInt(result.translationParallelPages, 10);
+  const fetchTimeoutMs = Number.parseInt(result.translationFetchTimeoutMs, 10);
   return {
     localPipelineUrl: String(result.localPipelineUrl || DEFAULT_LOCAL_PIPELINE_URL).trim() || DEFAULT_LOCAL_PIPELINE_URL,
     localPipelineLanguage: String(result.localPipelineLanguage || 'ja').trim() || 'ja',
@@ -83,6 +117,9 @@ async function getSettings() {
     parallelLimit: Number.isFinite(parallelLimit)
       ? Math.max(1, Math.min(MAX_PARALLEL_LIMIT, parallelLimit))
       : DEFAULT_PARALLEL_LIMIT,
+    fetchTimeoutMs: Number.isFinite(fetchTimeoutMs)
+      ? Math.max(MIN_FETCH_TIMEOUT_MS, Math.min(MAX_FETCH_TIMEOUT_MS, fetchTimeoutMs))
+      : DEFAULT_FETCH_TIMEOUT_MS,
   };
 }
 
@@ -107,6 +144,7 @@ function buildQueueStats(settings) {
     parallelLimit,
     queuedUnique: queuedRequests.size,
     isPaused,
+    restartLost,
     pressurePercent: Math.min(100, Math.round(((activeCount + queuedCount) / capacity) * 100)),
   };
 }
@@ -425,7 +463,18 @@ async function ensureCacheLoaded() {
       .sort((a, b) => (entries[a].lastUsed || 0) - (entries[b].lastUsed || 0))
       .forEach((key) => {
         const entry = entries[key];
-        if (entry?.result?.translatedImageDataUrl) translationCache.set(key, entry);
+        // Mirrors putCachedResult's own storage criteria (hasImage OR non-empty
+        // translations) -- rehydrating only image entries silently dropped every
+        // overlay-only (translations-only) entry from the displayed count on every
+        // service-worker restart. The CACHE_VERSION prefix check discards entries from
+        // a previous extension version so a version bump can't inflate the count with
+        // entries nothing can actually serve (buildCacheId always embeds CACHE_VERSION,
+        // so a stale-version key could never be looked up again anyway).
+        const hasImage = Boolean(entry?.result?.translatedImageDataUrl);
+        const hasTranslations = Array.isArray(entry?.result?.translations) && entry.result.translations.length > 0;
+        if ((hasImage || hasTranslations) && key.startsWith(`${CACHE_VERSION}:`)) {
+          translationCache.set(key, entry);
+        }
       });
   } catch {
     translationCache.clear();
@@ -434,12 +483,33 @@ async function ensureCacheLoaded() {
 
 async function persistCache() {
   if (!chrome.storage.session?.set) return;
-  const entries = {};
-  for (const [key, entry] of translationCache.entries()) entries[key] = entry;
+  const orderedKeys = Array.from(translationCache.keys());
+  let survivorKeys = orderedKeys;
+  // Large translated pages are data-URLs; a handful can exceed the session-storage
+  // quota. Previously a set() failure here just silently gave up, leaving the
+  // persisted store frozen at whatever it last held -- so after a service-worker
+  // restart the displayed count would inexplicably diverge from the truth. Retrying
+  // with progressively less of the (serialized copy only -- the real in-memory
+  // translationCache is never touched) oldest-first content means the persisted
+  // store always reflects an honest subset of what's actually cached, even under
+  // quota pressure.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const entries = {};
+    for (const key of survivorKeys) entries[key] = translationCache.get(key);
+    try {
+      await chrome.storage.session.set({ translationCacheEntries: entries });
+      return;
+    } catch {
+      if (survivorKeys.length === 0) break;
+      survivorKeys = survivorKeys.slice(Math.ceil(survivorKeys.length / 2));
+    }
+  }
+  if (!chrome.storage.session?.remove) return;
   try {
-    await chrome.storage.session.set({ translationCacheEntries: entries });
+    await chrome.storage.session.remove(['translationCacheEntries']);
   } catch {
-    // Large pages can exceed browser session-storage quota. Memory cache remains active.
+    // Nothing more can be done; the in-memory cache remains the source of truth
+    // for the rest of this service-worker's lifetime.
   }
 }
 
@@ -637,6 +707,17 @@ async function processTranslation(message, options = {}) {
   activeControllers.set(cacheId, controller);
   options.onDispatched?.();
 
+  // Without a timeout, a hung backend request holds this slot for the rest of the browser
+  // session -- with only 1-3 parallel slots total, one stuck request can quietly stall the
+  // whole queue behind it. timedOut is separate from a pause-abort so the catch block below
+  // can tell the two apart and report a distinct, retryable error instead of reusing
+  // 'TranslationPaused' for a failure that has nothing to do with the user pausing.
+  let timedOut = false;
+  const timeoutTimer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, settings.fetchTimeoutMs);
+
   const promise = (async () => {
     const startedAt = nowMs();
     try {
@@ -687,7 +768,9 @@ async function processTranslation(message, options = {}) {
       }, settings);
       return result;
     } catch (error) {
-      const messageText = error.name === 'AbortError' ? 'TranslationPaused' : error.message;
+      const messageText = error.name === 'AbortError'
+        ? (timedOut ? 'PIPELINE_TIMEOUT' : 'TranslationPaused')
+        : error.message;
       if (messageText !== 'TranslationPaused') console.error('[FMT] Local pipeline error:', messageText);
       await sendDiagnosticLog('background.translate.error', {
         traceId,
@@ -697,14 +780,32 @@ async function processTranslation(message, options = {}) {
       }, settings);
       return { error: messageText };
     } finally {
+      clearTimeout(timeoutTimer);
       outgoingRequests.delete(cacheId);
       activeControllers.delete(cacheId);
-      processQueue();
+      scheduleQueueDrain();
     }
   })();
 
   outgoingRequests.set(cacheId, promise);
   return promise;
+}
+
+// processQueue() is the only thing that promotes a queued item. Every path that frees up
+// admission room (a real dispatch finishing, an early-return in processTranslation settling
+// its reservation, a fresh item being queued while slots are free) must be able to trigger a
+// drain, or queued items past that point can stall forever with free slots sitting idle. This
+// coalesces every trigger into at most one processQueue() per tick: a flag prevents piling up
+// redundant passes, and the setTimeout(0) defers past the current synchronous release chain so
+// a drain never re-enters processQueue() while another one is still walking the queue.
+let drainScheduled = false;
+function scheduleQueueDrain() {
+  if (drainScheduled) return;
+  drainScheduled = true;
+  setTimeout(() => {
+    drainScheduled = false;
+    processQueue();
+  }, 0);
 }
 
 // The single entry point admission checks must dispatch through: reserves a slot
@@ -713,6 +814,10 @@ async function processTranslation(message, options = {}) {
 // reservation has become a real entry, so counting both would double-count) or, as a
 // safety net, whenever the returned promise settles (covers every early-return path in
 // processTranslation -- paused/cached/in-flight-dedup -- where no slot was ever consumed).
+// Every one of those early-return settles here too, which is why release() must itself
+// trigger a drain: a queued item dispatched into a cache-hit or in-flight-join releases its
+// slot without ever entering processTranslation's own finally, and without this the rest of
+// the queue would stall behind it even though the slot is free again.
 function dispatchTranslation(message) {
   reservedSlots += 1;
   let released = false;
@@ -720,6 +825,7 @@ function dispatchTranslation(message) {
     if (released) return;
     released = true;
     reservedSlots = Math.max(0, reservedSlots - 1);
+    scheduleQueueDrain();
   };
   const result = processTranslation(message, { bypassQueueCheck: true, onDispatched: release });
   result.then(release, release);
@@ -729,11 +835,14 @@ function dispatchTranslation(message) {
 function processQueue() {
   if (isPaused) return;
   getSettings().then((settings) => {
+    let shifted = false;
     while (requestQueue.length > 0 && (outgoingRequests.size + reservedSlots) < settings.parallelLimit) {
       const { message, resolve, cacheId } = requestQueue.shift();
       if (cacheId) queuedRequests.delete(cacheId);
       dispatchTranslation(message).then(resolve);
+      shifted = true;
     }
+    if (shifted) persistQueueDescriptors();
   }).catch(() => {});
 }
 
@@ -743,11 +852,18 @@ function clearQueuedTranslations(reason = 'QueueCleared') {
     if (cacheId) queuedRequests.delete(cacheId);
     resolve?.({ error: reason, queueLength: 0 });
   });
+  if (dropped.length > 0) persistQueueDescriptors();
+  restartLost = 0;
   return dropped.length;
 }
 
 async function queueTranslation(message) {
   if (isPaused) return { error: 'TranslationPaused' };
+  // The popup's restart-lost warning explicitly tells the user to "re-run Translate Page" --
+  // this is that re-run actually happening, so the stale warning must clear here too, not only
+  // on an explicit Clear Queue. Otherwise the message keeps showing a truthful-when-written but
+  // now-stale claim even after the user did exactly what it asked, which is its own honesty bug.
+  restartLost = 0;
 
   const settings = await getSettings();
   const cacheId = buildCacheId(message, settings);
@@ -790,7 +906,13 @@ async function queueTranslation(message) {
   });
   queuedRequests.set(cacheId, queuedPromise);
   queuedPromise.finally(() => queuedRequests.delete(cacheId));
+  persistQueueDescriptors();
   console.log(`[FMT] queued translation ${requestQueue.length}/${settings.queueLimit} ${cacheId}`);
+  // A slot may have freed up during the awaits above (getSettings/getCachedResult/
+  // in-flight join) between this item being deemed queue-worthy and actually landing in
+  // requestQueue -- without this, that freed slot has nothing to wake it back up until
+  // some unrelated request happens to settle later.
+  scheduleQueueDrain();
   return queuedPromise;
 }
 

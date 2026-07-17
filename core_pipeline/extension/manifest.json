@@ -1,6 +1,6 @@
 {
   "name": "Free Manga Translator",
-  "version": "1.1.14",
+  "version": "1.1.15",
   "manifest_version": 3,
   "description": "Translate Japanese, Chinese, and Korean manga to English through a local 8-step pipeline server",
   "icons": {

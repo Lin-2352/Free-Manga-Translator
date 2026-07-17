@@ -9,8 +9,12 @@
 
   // ===== Constants =====
   const MIN_IMAGE_SIZE = 200;
-  const MIN_PAGE_IMAGE_SIZE = 360;
-  const MIN_PAGE_IMAGE_AREA = 220000;
+  // A real manga page (358x520, from the localhost:3000 test site) was missing auto-detection
+  // by 2px on the min-side gate alone. Lowered just enough to catch it while every standard IAB
+  // ad size (300x250, 336x280, 320x480, etc.) still fails the min-side gate -- confirmed by an
+  // explicit audit before picking these numbers, not just tuned to the one failing sample.
+  const MIN_PAGE_IMAGE_SIZE = 340;
+  const MIN_PAGE_IMAGE_AREA = 170000;
   const MAX_DIMENSION = 4096;
   const CAPTURE_IMAGE_TYPE = 'image/jpeg';
   const CAPTURE_IMAGE_QUALITY = 0.92;
@@ -29,7 +33,7 @@
   const BASE_RETRY_DELAY = 3000;
   const DEFAULT_AUTO_QUEUE_LIMIT = 20;
   const MAX_AUTO_QUEUE_LIMIT = 50;
-  const EXTENSION_VERSION = '1.1.14';
+  const EXTENSION_VERSION = '1.1.15';
 
   // ===== State =====
   let isEnabled = false;
@@ -53,6 +57,7 @@
   const observedImages = new WeakSet();
   const spinnerMap = new Map();
   let spinnerFrame = null;
+  const errorBadgeMap = new Map();
   let scheduledScanTimer = null;
   let lastNavigationKey = '';
   let autoWatchdogTimer = null;
@@ -277,13 +282,14 @@
     if (spinnerFrame !== null) return;
     const tick = () => {
       updateSpinners();
-      spinnerFrame = spinnerMap.size > 0 ? requestAnimationFrame(tick) : null;
+      updateErrorBadges();
+      spinnerFrame = (spinnerMap.size > 0 || errorBadgeMap.size > 0) ? requestAnimationFrame(tick) : null;
     };
     spinnerFrame = requestAnimationFrame(tick);
   }
 
   function stopSpinnerLoopIfIdle() {
-    if (spinnerMap.size === 0 && spinnerFrame !== null) {
+    if (spinnerMap.size === 0 && errorBadgeMap.size === 0 && spinnerFrame !== null) {
       cancelAnimationFrame(spinnerFrame);
       spinnerFrame = null;
     }
@@ -295,6 +301,236 @@
       showSpinner(img);
     });
   }
+
+  // ===== Error badge (terminal-failure indicator, shares the spinner rAF loop) =====
+  // Shown on an image whose translation failed permanently (retries exhausted, or a
+  // non-retryable error) rather than dropping the failure silently -- the user previously
+  // had no way to tell "still working" apart from "gave up" apart from "never attempted".
+  // Click retries with the same force+manualSpecific path right-click translate uses.
+  function injectErrorBadgeStyles() {
+    if (document.getElementById('fmt-error-badge-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'fmt-error-badge-styles';
+    style.textContent = `
+      .fmt-img-error-badge {
+        position: fixed;
+        min-width: 22px;
+        height: 22px;
+        padding: 0 6px;
+        background: rgba(183, 28, 28, 0.92);
+        color: #fff;
+        border-radius: 11px;
+        z-index: 2147483641;
+        cursor: pointer;
+        font: 700 12px/22px system-ui, sans-serif;
+        text-align: center;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.45);
+        pointer-events: auto;
+      }
+      .fmt-img-error-badge:hover { background: rgba(211, 47, 47, 0.96); }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function positionErrorBadge(img, badge) {
+    if (!img.isConnected) {
+      hideErrorBadge(img);
+      return;
+    }
+    const rect = img.getBoundingClientRect();
+    if (rect.width < 10 || rect.height < 10 || rect.bottom < 0 || rect.right < 0 ||
+        rect.top > window.innerHeight || rect.left > window.innerWidth) {
+      badge.style.display = 'none';
+      return;
+    }
+    badge.style.display = 'block';
+    badge.style.left = `${Math.round(rect.right - 26)}px`;
+    badge.style.top = `${Math.round(rect.top + 6)}px`;
+  }
+
+  function updateErrorBadges() {
+    for (const [img, entry] of Array.from(errorBadgeMap.entries())) {
+      if (Date.now() - entry.shownAt > 45000) {
+        hideErrorBadge(img);
+        continue;
+      }
+      positionErrorBadge(img, entry.badge);
+    }
+  }
+
+  function hideErrorBadge(img) {
+    const entry = errorBadgeMap.get(img);
+    if (entry) {
+      entry.badge.remove();
+      errorBadgeMap.delete(img);
+    }
+    stopSpinnerLoopIfIdle();
+  }
+
+  function showErrorBadge(img, message) {
+    hideErrorBadge(img);
+    injectErrorBadgeStyles();
+    const rect = img.getBoundingClientRect();
+    if (rect.width < 10 || rect.height < 10) return;
+    const badge = document.createElement('div');
+    badge.className = 'fmt-img-error-badge';
+    badge.textContent = '!';
+    badge.title = `Translation failed: ${message || 'unknown error'} (click to retry)`;
+    badge.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      hideErrorBadge(img);
+      const originalSrc = getOriginalSrc(img);
+      const cacheKey = buildImageCacheKey(img, originalSrc);
+      translatedSrcs.delete(cacheKey);
+      pendingSrcs.delete(cacheKey);
+      retryCountMap.delete(cacheKey);
+      img.removeAttribute(TRANSLATED_ATTR);
+      img.removeAttribute(TRANSLATED_SRC_ATTR);
+      img.removeAttribute(PROCESSING_ATTR);
+      translateImage(img, { force: true, manualSpecific: true, originalSrc, cacheKey });
+    });
+    document.body.appendChild(badge);
+    errorBadgeMap.set(img, { badge, shownAt: Date.now() });
+    positionErrorBadge(img, badge);
+    ensureSpinnerLoop();
+  }
+
+  // ===== Panel picker (manual "inspect element"-style target selection) =====
+  // For the rare page the automatic scan/detection heuristics miss entirely: lets the user
+  // hover to highlight a candidate image and click to force-translate it directly, the same
+  // force+manualSpecific bypass right-click translate already uses, without needing the site to
+  // expose a right-click context menu on it at all.
+  let pickerActive = false;
+  let pickerHighlightEl = null;
+  let pickerHintEl = null;
+
+  function injectPickerStyles() {
+    if (document.getElementById('fmt-picker-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'fmt-picker-styles';
+    style.textContent = `
+      html.fmt-picking, html.fmt-picking * { cursor: crosshair !important; }
+      .fmt-picker-highlight {
+        position: fixed;
+        pointer-events: none;
+        border: 2px solid rgba(99, 102, 241, 0.9);
+        background: rgba(99, 102, 241, 0.08);
+        border-radius: 4px;
+        z-index: 2147483644;
+        display: none;
+      }
+      .fmt-picker-hint {
+        position: fixed;
+        left: 50%;
+        bottom: 24px;
+        transform: translateX(-50%);
+        background: rgba(17, 24, 39, 0.92);
+        color: #fff;
+        padding: 8px 16px;
+        border-radius: 999px;
+        font: 500 13px/1.4 system-ui, sans-serif;
+        z-index: 2147483645;
+        pointer-events: none;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  // Only needs to keep out things too small to plausibly be a manga panel -- the user is
+  // pointing at a specific element by hand, which is a much stronger signal than the automatic
+  // scan's own heuristics were ever meant to gate.
+  function pickerCandidateAt(x, y) {
+    const stack = typeof document.elementsFromPoint === 'function' ? document.elementsFromPoint(x, y) : [];
+    for (const el of stack) {
+      if (!el || el.nodeName !== 'IMG') continue;
+      const width = el.naturalWidth || el.width || 0;
+      const height = el.naturalHeight || el.height || 0;
+      if (width < 50 || height < 50) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 50 || rect.height < 50) continue;
+      return el;
+    }
+    return null;
+  }
+
+  function pickerHandleMove(event) {
+    const img = pickerCandidateAt(event.clientX, event.clientY);
+    if (!pickerHighlightEl) return;
+    if (!img) {
+      pickerHighlightEl.style.display = 'none';
+      return;
+    }
+    const rect = img.getBoundingClientRect();
+    pickerHighlightEl.style.display = 'block';
+    pickerHighlightEl.style.left = `${Math.round(rect.left)}px`;
+    pickerHighlightEl.style.top = `${Math.round(rect.top)}px`;
+    pickerHighlightEl.style.width = `${Math.round(rect.width)}px`;
+    pickerHighlightEl.style.height = `${Math.round(rect.height)}px`;
+  }
+
+  function pickerHandleClick(event) {
+    const img = pickerCandidateAt(event.clientX, event.clientY);
+    if (!img) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const originalSrc = getOriginalSrc(img);
+    const cacheKey = buildImageCacheKey(img, originalSrc);
+    translatedSrcs.delete(cacheKey);
+    pendingSrcs.delete(cacheKey);
+    retryCountMap.delete(cacheKey);
+    img.removeAttribute(TRANSLATED_ATTR);
+    img.removeAttribute(TRANSLATED_SRC_ATTR);
+    img.removeAttribute(PROCESSING_ATTR);
+    translateImage(img, { force: true, manualSpecific: true, pickerMode: true, originalSrc, cacheKey });
+    stopPanelPicker();
+  }
+
+  function pickerHandleKeydown(event) {
+    if (event.key === 'Escape') stopPanelPicker();
+  }
+
+  function startPanelPicker() {
+    if (pickerActive) return true;
+    // The Selection Panel (translationPanel.js) already owns page-level click capture for area
+    // selection -- both listening at once would fight over the same clicks. It wins because it
+    // was started second in that scenario (this only refuses to START while it's already open;
+    // see window.__fmtStopPanelPicker below for the reverse direction).
+    if (document.getElementById('fmt-panel-overlay')) return false;
+    injectPickerStyles();
+    pickerActive = true;
+    document.documentElement.classList.add('fmt-picking');
+    pickerHighlightEl = document.createElement('div');
+    pickerHighlightEl.className = 'fmt-picker-highlight';
+    document.body.appendChild(pickerHighlightEl);
+    pickerHintEl = document.createElement('div');
+    pickerHintEl.className = 'fmt-picker-hint';
+    pickerHintEl.textContent = 'Click an image to translate it. Esc to exit.';
+    document.body.appendChild(pickerHintEl);
+    document.addEventListener('mousemove', pickerHandleMove, true);
+    document.addEventListener('click', pickerHandleClick, true);
+    document.addEventListener('keydown', pickerHandleKeydown, true);
+    return true;
+  }
+
+  function stopPanelPicker() {
+    if (!pickerActive) return;
+    pickerActive = false;
+    document.documentElement.classList.remove('fmt-picking');
+    document.removeEventListener('mousemove', pickerHandleMove, true);
+    document.removeEventListener('click', pickerHandleClick, true);
+    document.removeEventListener('keydown', pickerHandleKeydown, true);
+    pickerHighlightEl?.remove();
+    pickerHighlightEl = null;
+    pickerHintEl?.remove();
+    pickerHintEl = null;
+  }
+
+  // translationPanel.js is a separately injected script (not part of this closure) that calls
+  // this before creating its own overlay, so opening the Selection Panel always wins over an
+  // already-active picker -- the two manual-targeting UIs can never both be listening at once.
+  window.__fmtStopPanelPicker = stopPanelPicker;
 
   // A PROCESSING marker's underlying request can die silently without ever
   // clearing it: the background message port breaks (MV3 service worker
@@ -333,6 +569,8 @@
       hideSpinner(img);
     });
     for (const img of Array.from(spinnerMap.keys())) hideSpinner(img);
+    for (const img of Array.from(errorBadgeMap.keys())) hideErrorBadge(img);
+    stopPanelPicker();
   }
 
   // ===== Image Size Calculation =====
@@ -373,7 +611,13 @@
     img.removeAttribute(PROCESSING_ATTR);
     img.removeAttribute(ORIGINAL_WIDTH_ATTR);
     img.removeAttribute(ORIGINAL_HEIGHT_ATTR);
+    // This only runs when getOriginalSrc has detected the src actually changed to something new
+    // (a reused <img> node now showing a different logical image, common on SPA readers) -- a
+    // Clear Page suppression on the PREVIOUS image must not silently carry over and suppress
+    // auto-translation of whatever the site swaps in next.
+    img.removeAttribute(MANUAL_CLEAR_ATTR);
     hideSpinner(img);
+    hideErrorBadge(img);
   }
 
   // Turning auto-translate on is itself an explicit user request to translate the
@@ -428,10 +672,10 @@
     return `${originalSrc || ''}|${width}x${height}`;
   }
 
-  function imageDimensionsReady(img) {
+  function imageDimensionsReady(img, minSize = MIN_IMAGE_SIZE) {
     const width = img.naturalWidth || img.width || 0;
     const height = img.naturalHeight || img.height || 0;
-    return width >= MIN_IMAGE_SIZE && height >= MIN_IMAGE_SIZE;
+    return width >= minSize && height >= minSize;
   }
 
   function isLikelyPageImage(img) {
@@ -482,6 +726,7 @@
     img.setAttribute(CACHE_KEY_ATTR, cacheKey || buildImageCacheKey(img, originalSrc));
     img.removeAttribute(PROCESSING_ATTR);
     hideSpinner(img);
+    hideErrorBadge(img);
     if (img.srcset) img.removeAttribute('srcset');
     img.src = translatedImageDataUrl;
     translatedSrcs.add(cacheKey || buildImageCacheKey(img, originalSrc));
@@ -510,6 +755,7 @@
     img.removeAttribute(CACHE_KEY_ATTR);
     img.removeAttribute(PROCESSING_ATTR);
     hideSpinner(img);
+    hideErrorBadge(img);
   }
 
   function resetTranslatedStateForForce(img, cacheKey) {
@@ -789,12 +1035,18 @@
     if (translatedSrcs.has(cacheKey)) return false;
     if (pendingSrcs.has(cacheKey)) return false;
     if (isDataImage(getEffectiveSrc(img)) && img.getAttribute(ORIGINAL_SRC_ATTR)) return false;
-    if (!imageDimensionsReady(img)) return false;
+    // The picker is the user pointing at a specific element the automatic scan already missed
+    // (that's the whole reason to reach for it), so its size gates only need to keep out things
+    // too small to plausibly be a manga panel -- not the much stricter thresholds automatic
+    // detection uses to avoid false-positiving on thumbnails and ad units across a whole page.
+    const minSize = options.pickerMode ? 50 : MIN_IMAGE_SIZE;
+    if (!imageDimensionsReady(img, minSize)) return false;
     if (!options.manualSpecific && !isLikelyPageImage(img)) return false;
 
     if (!isStandaloneImagePage()) {
       const rect = img.getBoundingClientRect();
-      if (rect.width < 100 || rect.height < 100) return false;
+      const minRect = options.pickerMode ? 50 : 100;
+      if (rect.width < minRect || rect.height < minRect) return false;
     }
 
     return true;
@@ -936,7 +1188,7 @@
           cleanupProcessing(img, cacheKey);
           return;
         }
-        if (response.error === 'FullQueue' || response.error === 'QueueFull' || response.error === 'RATE_LIMITED') {
+        if (response.error === 'FullQueue' || response.error === 'QueueFull' || response.error === 'RATE_LIMITED' || response.error === 'PIPELINE_TIMEOUT') {
           const retryCount = (retryCountMap.get(cacheKey) || 0) + 1;
           retryCountMap.set(cacheKey, retryCount);
 
@@ -952,6 +1204,14 @@
           } else {
             retryCountMap.delete(cacheKey);
           }
+        }
+        // TranslationPaused already returned above without reaching here; the other
+        // user-initiated actions (clearing the queue, soft/hard stop) aren't failures the
+        // user needs a badge for either -- everything else that lands here genuinely
+        // exhausted its retries or was never retryable, and deserves a visible signal
+        // instead of silently vanishing.
+        if (response.error !== 'QueueCleared' && response.error !== 'SoftStopped' && response.error !== 'HardStopped') {
+          showErrorBadge(img, response.error);
         }
         cleanupProcessing(img, cacheKey);
         return;
@@ -1040,7 +1300,10 @@
       // A newer request may already own this cacheKey's pending/processing
       // state if this one was superseded before it failed; only this
       // request's own state may be cleaned up.
-      if (requestGeneration === pageWorkGeneration) cleanupProcessing(img, cacheKey);
+      if (requestGeneration === pageWorkGeneration) {
+        showErrorBadge(img, error?.message || String(error || 'unknown error'));
+        cleanupProcessing(img, cacheKey);
+      }
     }
   }
 
@@ -1099,8 +1362,14 @@
     // OTHER path that reaches processImage (auto-translate scans, the intersection
     // observer, the watchdog) must not silently resurrect a page the user just
     // cleared, whether or not it happens to be in restoreOnly mode.
-    if (img.getAttribute(MANUAL_CLEAR_ATTR) && options.force !== true) return;
+    // getOriginalSrc() must run before the manual-clear gate below: on a reused DOM node whose
+    // src just changed (SPA page navigation), it detects that swap and clears MANUAL_CLEAR_ATTR
+    // itself via clearImageRuntimeState() -- a stale Clear Page marker from the PREVIOUS logical
+    // image must not survive to gate out whatever the site swaps in next. For an unchanged src
+    // it's a plain attribute read with no side effects, so this reorder is free for every other
+    // caller.
     const originalSrc = getOriginalSrc(img);
+    if (img.getAttribute(MANUAL_CLEAR_ATTR) && options.force !== true) return;
     if (!originalSrc) return;
     const cacheKey = buildImageCacheKey(img, originalSrc);
     if (options.force === true) resetTranslatedStateForForce(img, cacheKey);
@@ -1424,6 +1693,17 @@
           break;
         }
       }
+    }
+
+    if (message.kind === 'togglePanelPicker') {
+      if (pickerActive) {
+        stopPanelPicker();
+        sendResponse({ success: true, active: false });
+      } else {
+        const started = startPanelPicker();
+        sendResponse({ success: started, active: started, error: started ? undefined : 'SelectionPanelActive' });
+      }
+      return true;
     }
 
     if (message.kind === 'toggleTranslation') {
