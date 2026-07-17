@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import math
 import os
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, BinaryIO
 
 try:
     from dotenv import load_dotenv
@@ -18,6 +20,55 @@ except Exception:
 
 from pipeline_paths import PROJECT_ROOT
 from diagnostic_logger import write_diagnostic_event
+
+
+def _acquire_cross_process_file_lock(lock_path: Path, timeout: float = 10.0) -> BinaryIO:
+    """Blocks (briefly retrying) until an OS-level advisory lock on lock_path is acquired, or
+    raises TimeoutError. Returns the open file handle; the caller must pass it to
+    _release_cross_process_file_lock to release it. A plain in-process threading.Lock (which
+    ApiManager also has) only serializes threads within ONE Python process -- it does nothing for
+    two separate processes (e.g. the always-running backend plus a separate CLI/batch script)
+    that each construct their own ApiManager pointed at the same state file.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+b")
+    deadline = time.monotonic() + timeout
+    if os.name == "nt":
+        import msvcrt
+
+        while True:
+            try:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return fh
+            except OSError:
+                if time.monotonic() >= deadline:
+                    fh.close()
+                    raise TimeoutError(f"timed out waiting for cross-process lock: {lock_path}")
+                time.sleep(0.02)
+    else:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        return fh
+
+
+def _release_cross_process_file_lock(fh: BinaryIO) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            fh.seek(0)
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 DAILY_LIMIT_MESSAGE = "Your daily translation limit has been reached to protect API quotas. Please try again tomorrow."
@@ -67,10 +118,30 @@ class ApiManager:
     def __init__(self, state_path: Path | None = None) -> None:
         self._lock = threading.Lock()
         self._state_path = state_path or PROJECT_ROOT / "runtime_samples" / "api_quota_state.json"
+        self._lock_path = self._state_path.with_suffix(".lock")
         self._state: dict[str, Any] = self._read_state()
         self._env_path: Path | None = None
         self._missing_env_warning_emitted = False
         self._load_env()
+
+    @contextlib.contextmanager
+    def _synced(self):
+        """The critical section every state-touching public method must use instead of
+        `with self._lock:` directly. Acquires a cross-process file lock (serializing every
+        ApiManager instance across every process pointed at this state file) and refreshes
+        self._state from disk BEFORE yielding, so this operation's admission/rotation/lock
+        decisions are made against the current on-disk truth, not a stale snapshot from whenever
+        this instance was constructed or last wrote. The existing threading.Lock is kept nested
+        inside as defense in depth for threads sharing one instance; it alone cannot protect
+        against a second process, which is the actual gap this closes.
+        """
+        fh = _acquire_cross_process_file_lock(self._lock_path)
+        try:
+            with self._lock:
+                self._state = self._read_state()
+                yield
+        finally:
+            _release_cross_process_file_lock(fh)
 
     @property
     def providers(self) -> dict[str, ProviderConfig]:
@@ -490,6 +561,47 @@ class ApiManager:
             return []
         return [((start_index - 1 + offset) % key_count) + 1 for offset in range(key_count)]
 
+    def _key_roles(self, provider: str, key_count: int) -> list[str]:
+        """Optional per-key role assignment (e.g. 3 keys from 3 separate NIM accounts: one
+        dedicated to translation, one to vision_ocr/other steps, one held back as backup).
+        {PROVIDER}_KEY_ROLES is a CSV aligned index-for-index with the provider's key CSV.
+        Unset, empty, or length-mismatched (a misconfiguration -- safer to fail open than to
+        silently misroute) all resolve to every key having role "*" (unrestricted, matches any
+        capability at normal priority) -- this keeps every existing deployment's behavior
+        completely unchanged unless KEY_ROLES is deliberately configured.
+        """
+        raw = os.environ.get(f"{provider.upper()}_KEY_ROLES", "").strip()
+        if not raw:
+            return ["*"] * key_count
+        roles = [part.strip().lower() or "*" for part in raw.split(",")]
+        if len(roles) != key_count:
+            LOGGER.warning(
+                "%s_KEY_ROLES has %d entries but %d keys are configured -- ignoring roles for this provider",
+                provider.upper(),
+                len(roles),
+                key_count,
+            )
+            return ["*"] * key_count
+        return roles
+
+    def _role_priority(self, role: str, capability: str) -> int | None:
+        """0 = this key is a normal-priority candidate for `capability`; 1 = this key is a
+        backup, only tried once no priority-0 key is usable; None = this key is dedicated to a
+        DIFFERENT specific capability and must be skipped entirely for this request (so a
+        translation-only key, under a configured role split, is never touched by vision_ocr
+        traffic and vice versa -- the isolation the role feature exists for).
+        """
+        if role in ("*", capability):
+            return 0
+        if role == "backup":
+            return 1
+        return None
+
+    def _role_ordered_candidates(self, rotated_order: list[int], roles: list[str], capability: str) -> list[int]:
+        priority_0 = [index for index in rotated_order if self._role_priority(roles[index - 1], capability) == 0]
+        priority_1 = [index for index in rotated_order if self._role_priority(roles[index - 1], capability) == 1]
+        return priority_0 + priority_1
+
     def _provider_ready_reason(self, provider: str) -> str:
         config = self.providers.get(provider)
         if not config:
@@ -520,7 +632,7 @@ class ApiManager:
         safe_request_limit = max(1, int(self._request_limit(provider) * self._soft_cap_ratio(provider)))
         limit_scope = self._limit_scope(provider)
         now = self._now_iso()
-        with self._lock:
+        with self._synced():
             provider_state = self._provider_state_locked(provider)
             if self._is_provider_locked(provider_state):
                 self._write_state_locked()
@@ -539,7 +651,15 @@ class ApiManager:
             first_auth_lock_reason = ""
             key_count = len(keys)
             start_index = self._rotation_start_index_locked(provider_state, key_count)
-            for index in self._rotated_key_order(start_index, key_count):
+            roles = self._key_roles(provider, key_count)
+            # Priority-0 (role matches this capability, or unrestricted "*") candidates are tried
+            # first in rotation order; only if none of those are usable do priority-1 ("backup")
+            # candidates get tried. Keys dedicated to a DIFFERENT specific capability are excluded
+            # entirely -- see _role_priority. With no KEY_ROLES configured, every key is "*" and
+            # this candidate list is identical to the unfiltered rotation order (unchanged
+            # behavior for every existing deployment).
+            candidate_indices = self._role_ordered_candidates(self._rotated_key_order(start_index, key_count), roles, capability)
+            for index in candidate_indices:
                 key = keys[index - 1]
                 key_hash = self._key_hash(key)
                 key_state = self._ensure_key_state(provider_state, key_hash, index)
@@ -570,7 +690,9 @@ class ApiManager:
                 self._write_state_locked()
                 return ApiKeyLease(provider, index, key_hash, key, estimated_tokens, capability)
             self._write_state_locked()
-        if locked_count >= len(keys) and auth_locked_count == locked_count:
+        if not candidate_indices:
+            raise ApiProviderUnavailable(f"{provider}: no key has a role compatible with capability {capability}")
+        if locked_count >= len(candidate_indices) and auth_locked_count == locked_count:
             detail = first_auth_lock_reason or "all keys are access-blocked or auth-locked"
             raise ApiProviderAuthLocked(f"{provider}: {detail}")
         detail = first_soft_lock_reason or first_auth_lock_reason or "all keys are exhausted, locked, or unavailable"
@@ -598,7 +720,7 @@ class ApiManager:
         key = keys[key_index - 1]
         key_hash = self._key_hash(key)
         now = self._now_iso()
-        with self._lock:
+        with self._synced():
             provider_state = self._provider_state_locked(provider)
             if self._is_provider_locked(provider_state):
                 self._write_state_locked()
@@ -633,7 +755,7 @@ class ApiManager:
 
     def mark_success(self, lease: ApiKeyLease, response_payload: object | None = None) -> None:
         actual_tokens = self._extract_actual_tokens(response_payload)
-        with self._lock:
+        with self._synced():
             provider_state = self._provider_state_locked(lease.provider)
             key_state = self._ensure_key_state(provider_state, lease.key_hash, lease.key_index)
             if actual_tokens and actual_tokens > lease.reserved_tokens:
@@ -666,7 +788,7 @@ class ApiManager:
                 lock_reason = "provider access denied or network-blocked (HTTP 403)"
             else:
                 lock_reason = "provider authorization failed (HTTP 403)"
-        with self._lock:
+        with self._synced():
             provider_state = self._provider_state_locked(lease.provider)
             key_state = self._ensure_key_state(provider_state, lease.key_hash, lease.key_index)
             key_state["lastError"] = error_text[:600]
@@ -774,7 +896,7 @@ class ApiManager:
         safe_minute_requests = max(1, int(self._minute_request_limit(provider) * minute_soft_cap_ratio))
         limit_scope = self._limit_scope(provider)
         reason = self._provider_ready_reason(provider)
-        with self._lock:
+        with self._synced():
             provider_state = self._provider_state_locked(provider)
             minute_state = self._minute_state_locked(provider_state)
             rate_limited_until = str(provider_state.get("rateLimitedUntil") or "")
@@ -913,7 +1035,7 @@ class ApiManager:
         return bool(configured) and all(status["health"] in {"exhausted", "auth_locked"} for status in configured)
 
     def reset_state(self) -> None:
-        with self._lock:
+        with self._synced():
             self._state = {}
             self._write_state_locked()
 
