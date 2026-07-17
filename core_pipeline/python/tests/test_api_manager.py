@@ -300,6 +300,76 @@ class ApiManagerTests(unittest.TestCase):
             "an auth lock (lockedUntil, hour-based) must survive a date rollover -- it is not a daily-quota lock",
         )
 
+    def test_expired_provider_wide_auth_lock_does_not_mask_a_fresh_unrelated_key_lock(self) -> None:
+        # Reproduces a real incident, in the exact sequence it actually happened this project:
+        # under limit_scope="provider" (the old default), every key got 403'd (a leaked-key report
+        # from the provider), which correctly escalates to a provider-WIDE "auth_locked" lock --
+        # only the "provider" scope's escalation path sets provider_state["status"] at all. Days
+        # later that lock has long expired, the deployment has since switched to
+        # limit_scope="key" (this project's current config), and a completely different,
+        # genuinely-current problem hits every key again (a 429 "quota reduced to 0" today).
+        # provider_status() must report TODAY's real condition, not the stale provider-wide
+        # auth-lock label inherited from the resolved incident.
+        manager = self.build_manager(
+            {
+                "GEMINI_API_KEYS": "key-a,key-b",
+                "GEMINI_DAILY_TOKEN_LIMIT": "1000",
+                "GEMINI_DAILY_REQUEST_LIMIT": "20",
+                "GEMINI_LIMIT_SCOPE": "provider",
+            }
+        )
+        for index in (1, 2):
+            lease = manager.reserve_key_index("gemini", index, 10)
+            manager.mark_failure(lease, 403, "Your API key was reported as leaked. Please use another API key.")
+        status = manager.provider_status("gemini")
+        self.assertEqual(status["health"], "auth_locked", "setup: provider-wide lock escalated correctly")
+
+        import json as _json
+
+        data = _json.loads(manager._state_path.read_text(encoding="utf-8"))
+        self.assertTrue(
+            data["providers"]["gemini"].get("status") and data["providers"]["gemini"].get("lockedUntil"),
+            "setup: the provider-level fields must actually be set for this test to reproduce the real bug",
+        )
+
+        # Backdate the provider-wide lock (and each key's own lock) so it reads as long expired --
+        # simulating "this incident is over, days have passed" without touching the current date.
+        provider_entry = data["providers"]["gemini"]
+        provider_entry["lockedUntil"] = "2020-01-01T00:00:00+00:00"
+        for key_entry in provider_entry["keys"].values():
+            key_entry["lockedUntil"] = "2020-01-01T00:00:00+00:00"
+            key_entry["status"] = "healthy"
+            key_entry["softLocked"] = False
+        manager._state_path.write_text(_json.dumps(data), encoding="utf-8")
+
+        status_after_expiry = manager.provider_status("gemini")
+        self.assertEqual(
+            status_after_expiry["health"],
+            "healthy",
+            "an expired provider-wide auth lock must actually clear, not just stop blocking reservations",
+        )
+
+        # The deployment has since moved to limit_scope="key" (this project's current config,
+        # flipped after the old incident) -- a fresh, unrelated, genuinely-current failure now
+        # hits both keys individually: a 429 quota error, classified as "exhausted", never
+        # "auth_locked". Under scope="key" this never touches provider_state at all, so the bug
+        # can ONLY be caught if the stale provider-level fields were actually cleared above.
+        os.environ["GEMINI_LIMIT_SCOPE"] = "key"
+        for index in (1, 2):
+            lease = manager.reserve_key_index("gemini", index, 10)
+            manager.mark_failure(
+                lease, 429, "Quota exceeded for metric: generate_content_free_tier_requests, limit: 0"
+            )
+        status_today = manager.provider_status("gemini")
+        self.assertEqual(
+            status_today["health"],
+            "exhausted",
+            "today's real quota-exhaustion must be reported as such, not inherit the resolved auth-lock label",
+        )
+        self.assertEqual(status_today["keys"][0]["status"], "locked")
+        with self.assertRaises(ApiQuotaExhausted):
+            manager.reserve_key_index("gemini", 1, 10)
+
     def test_counters_never_go_negative_or_nan(self) -> None:
         manager = self.build_manager(
             {

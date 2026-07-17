@@ -40,6 +40,11 @@ class ApiManagerConcurrencyTests(unittest.TestCase):
             "GEMINI_DAILY_TOKEN_LIMIT": "10000",
             "GEMINI_DAILY_REQUEST_LIMIT": "200",
             "API_MANAGER_SOFT_CAP_RATIO": "0.8",
+            # This project's real .env now sets LIMIT_SCOPE=key for every provider (each key gets
+            # its own safe budget instead of sharing one pooled provider-wide budget) -- these
+            # cross-process races must be proven safe under the config actually running in
+            # production, not just the "provider" default these tests used to run under.
+            "GEMINI_LIMIT_SCOPE": "key",
         }
         self.env_patch = patch.dict(os.environ, self.env, clear=True)
         self.env_patch.start()

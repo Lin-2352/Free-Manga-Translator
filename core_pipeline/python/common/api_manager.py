@@ -309,6 +309,19 @@ class ApiManager:
             if not provider_state.get("lockedUntil"):
                 provider_state["status"] = "healthy"
             provider_state["date"] = self._today()
+        # A provider-level lock (e.g. an old leaked-key incident) that has since
+        # expired must not keep reporting its old status/reason indefinitely --
+        # the block above only clears it on date rollover, so a same-day expiry
+        # (or a rollover check that never saw an empty lockedUntil) would
+        # otherwise leave a stale "auth_locked"-style label sitting forever,
+        # masking whatever the provider's CURRENT, unrelated condition is.
+        if not self._is_provider_locked(provider_state) and (
+            provider_state.get("lockedUntil") or provider_state.get("status")
+        ):
+            provider_state["lockedUntil"] = ""
+            provider_state["status"] = "healthy"
+            provider_state["softLocked"] = False
+            provider_state["softLockReason"] = ""
         return provider_state
 
     def _key_hash(self, key: str) -> str:
@@ -916,21 +929,30 @@ class ApiManager:
                 is_locked = provider_locked or self._is_locked(key_state)
                 locked += 1 if is_locked else 0
                 if is_locked:
-                    locked_statuses.append(
-                        str(provider_state.get("status") or "")
-                        or str(key_state.get("status") or "")
-                        or "locked"
-                    )
-                    locked_reasons.append(
-                        (
-                            str(provider_state.get("softLockReason") or "")
-                            or str(provider_state.get("lastError") or "")
-                            or str(key_state.get("softLockReason") or "")
-                            or str(key_state.get("lastError") or "")
-                            or str(key_state.get("status") or "")
-                            or "key is temporarily locked"
-                        )[:240]
-                    )
+                    # Attribute status/reason to whichever level actually caused this
+                    # lock -- a provider-level lock (e.g. an account-wide leak) should
+                    # never overshadow a key's own, more specific, more current status
+                    # (e.g. today's per-key quota exhaustion) just because the
+                    # provider-level fields happen to still be non-empty.
+                    if provider_locked:
+                        locked_statuses.append(str(provider_state.get("status") or "") or "locked")
+                        locked_reasons.append(
+                            (
+                                str(provider_state.get("softLockReason") or "")
+                                or str(provider_state.get("lastError") or "")
+                                or "provider is temporarily locked"
+                            )[:240]
+                        )
+                    else:
+                        locked_statuses.append(str(key_state.get("status") or "") or "locked")
+                        locked_reasons.append(
+                            (
+                                str(key_state.get("softLockReason") or "")
+                                or str(key_state.get("lastError") or "")
+                                or str(key_state.get("status") or "")
+                                or "key is temporarily locked"
+                            )[:240]
+                        )
                 if limit_scope == "provider":
                     remaining_tokens = max(0, safe_tokens - provider_used_tokens)
                     remaining_requests = max(0, safe_requests - provider_used_requests)
