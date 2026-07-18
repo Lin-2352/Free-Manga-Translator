@@ -419,6 +419,15 @@
         border-radius: 4px;
         z-index: 2147483644;
         display: none;
+        opacity: 1;
+        transition: opacity .4s ease;
+      }
+      .fmt-picker-highlight.fmt-picker-selected {
+        border-color: rgba(34, 197, 94, 0.9);
+        background: rgba(34, 197, 94, 0.12);
+      }
+      .fmt-picker-highlight.fmt-picker-fading {
+        opacity: 0;
       }
       .fmt-picker-hint {
         position: fixed;
@@ -470,6 +479,13 @@
     pickerHighlightEl.style.height = `${Math.round(rect.height)}px`;
   }
 
+  // How long the selected panel's highlight stays fully visible before fading, so the user gets
+  // a clear "yes, this is the one I picked" confirmation instead of it vanishing the instant they
+  // click (the DevTools-inspect-element-style hover highlight already tracks the mouse live up to
+  // this point -- this only changes what happens AFTER a selection is made).
+  const PICKER_SELECTED_HOLD_MS = 900;
+  const PICKER_FADE_MS = 400;
+
   function pickerHandleClick(event) {
     const img = pickerCandidateAt(event.clientX, event.clientY);
     if (!img) return;
@@ -484,7 +500,20 @@
     img.removeAttribute(TRANSLATED_SRC_ATTR);
     img.removeAttribute(PROCESSING_ATTR);
     translateImage(img, { force: true, manualSpecific: true, pickerMode: true, originalSrc, cacheKey });
-    stopPanelPicker();
+
+    // Stop listening for further picks and restore the normal cursor immediately (that's the
+    // "stuck cursor" complaint), but keep the highlight rectangle itself in place over the
+    // selected image for a moment, marked "selected", before fading it out -- rather than
+    // yanking it away the instant the click registers.
+    const selectedHighlight = pickerHighlightEl;
+    stopPanelPicker({ keepHighlight: true });
+    if (selectedHighlight) {
+      selectedHighlight.classList.add('fmt-picker-selected');
+      setTimeout(() => {
+        selectedHighlight.classList.add('fmt-picker-fading');
+        setTimeout(() => selectedHighlight.remove(), PICKER_FADE_MS);
+      }, PICKER_SELECTED_HOLD_MS);
+    }
   }
 
   function pickerHandleKeydown(event) {
@@ -514,14 +543,17 @@
     return true;
   }
 
-  function stopPanelPicker() {
+  function stopPanelPicker(options = {}) {
     if (!pickerActive) return;
     pickerActive = false;
     document.documentElement.classList.remove('fmt-picking');
     document.removeEventListener('mousemove', pickerHandleMove, true);
     document.removeEventListener('click', pickerHandleClick, true);
     document.removeEventListener('keydown', pickerHandleKeydown, true);
-    pickerHighlightEl?.remove();
+    // A successful selection wants its highlight to stay on screen briefly (see
+    // pickerHandleClick, which owns removing it after the hold+fade); Escape/cancel and every
+    // other exit path has no "selection" to show, so it removes immediately as before.
+    if (!options.keepHighlight) pickerHighlightEl?.remove();
     pickerHighlightEl = null;
     pickerHintEl?.remove();
     pickerHintEl = null;

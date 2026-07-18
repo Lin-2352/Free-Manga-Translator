@@ -114,6 +114,7 @@ function createElement(tag) {
     };
   }
   const listeners = new Map();
+  const classSet = new Set();
   return {
     tagName: tag.toUpperCase(),
     className: '',
@@ -122,6 +123,11 @@ function createElement(tag) {
     title: '',
     id: '',
     listeners,
+    classList: {
+      add: (...names) => names.forEach((name) => classSet.add(name)),
+      remove: (...names) => names.forEach((name) => classSet.delete(name)),
+      contains: (name) => classSet.has(name),
+    },
     addEventListener(type, handler) {
       if (!listeners.has(type)) listeners.set(type, []);
       listeners.get(type).push(handler);
@@ -912,6 +918,14 @@ assert.equal(
 assert.equal(documentListeners.has('click'), false, 'picker listeners are removed on exit');
 assert.equal(documentListeners.has('mousemove'), false);
 assert.equal(documentListeners.has('keydown'), false);
+assert.equal(hintNode.removed, true, 'the hint pill is removed immediately on exit, unlike the highlight');
+assert.equal(
+  highlightNode.removed,
+  undefined,
+  'a successful pick must NOT remove the highlight immediately (like DevTools inspect-element, ' +
+  'it should hold briefly on the selected panel before fading -- not vanish the instant you click)',
+);
+assert.equal(highlightNode.classList.contains('fmt-picker-selected'), true, 'the highlight is marked selected so it can be styled distinctly while it holds');
 
 // Esc exits without translating anything.
 elementsFromPointStack = [pickerCandidate];
