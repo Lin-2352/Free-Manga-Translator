@@ -27,6 +27,11 @@ const MIN_FETCH_TIMEOUT_MS = 30_000;
 const MAX_FETCH_TIMEOUT_MS = 900_000;
 
 const outgoingRequests = new Map();
+// Parallel to outgoingRequests, keyed the same way: outgoingRequests only ever stored the raw
+// promise, with no way to tell a caller (the popup's live queue list) WHICH page/image is
+// actually dispatched right now. Set/deleted alongside outgoingRequests itself, never read from
+// admission-decision code paths so it can't affect dispatch/ordering, only what's displayed.
+const outgoingRequestMeta = new Map();
 const activeControllers = new Map();
 const queuedRequests = new Map();
 const requestQueue = [];
@@ -184,6 +189,25 @@ function buildQueueStats(settings) {
   // adding both here can't double-count: the reservation releases the
   // moment the request actually registers in outgoingRequests).
   const activeCount = outgoingRequests.size + reservedSlots;
+  // Per-item breakdown for the popup's live queue list: active items first (whichever page/image
+  // actually holds a GPU slot right now), then queued items in the SAME order they sit in
+  // requestQueue -- push() at the tail, shift() from the head, so this position is exactly the
+  // real FIFO dispatch order, not a re-derived guess.
+  const items = [
+    ...Array.from(outgoingRequestMeta.entries()).map(([cacheId, meta]) => ({
+      cacheId,
+      pageHost: pageHostFromUrl(meta.pageUrl),
+      originalImageUrl: meta.originalImageUrl,
+      status: 'active',
+    })),
+    ...requestQueue.map((entry, index) => ({
+      cacheId: entry.cacheId || '',
+      pageHost: pageHostFromUrl(entry.message?.pageUrl),
+      originalImageUrl: entry.message?.originalImageUrl || '',
+      status: 'queued',
+      position: index + 1,
+    })),
+  ];
   return {
     cacheSize: translationCache.size,
     cacheLimit: settings?.cacheLimit ?? DEFAULT_CACHE_LIMIT,
@@ -192,6 +216,7 @@ function buildQueueStats(settings) {
     queueLimit,
     parallelLimit,
     queuedUnique: queuedRequests.size,
+    items,
     isPaused,
     restartLost,
     pressurePercent: Math.min(100, Math.round(((activeCount + queuedCount) / capacity) * 100)),
@@ -831,6 +856,7 @@ async function processTranslation(message, options = {}) {
     } finally {
       clearTimeout(timeoutTimer);
       outgoingRequests.delete(cacheId);
+      outgoingRequestMeta.delete(cacheId);
       activeControllers.delete(cacheId);
       maybeClearKeepAliveAlarm();
       scheduleQueueDrain();
@@ -838,6 +864,11 @@ async function processTranslation(message, options = {}) {
   })();
 
   outgoingRequests.set(cacheId, promise);
+  outgoingRequestMeta.set(cacheId, {
+    pageUrl: message.pageUrl || '',
+    originalImageUrl: message.originalImageUrl || '',
+    startedAt: nowMs(),
+  });
   ensureKeepAliveAlarm();
   return promise;
 }

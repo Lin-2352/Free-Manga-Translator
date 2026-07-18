@@ -493,6 +493,63 @@ body {
   transition: width .35s ease;
 }
 
+.queue-items-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: var(--space-2);
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.queue-item-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border: 1px solid var(--line-card);
+  border-radius: var(--radius-md);
+  background: var(--panel-alt);
+  padding: 4px var(--space-2);
+  font-size: 11px;
+}
+
+.queue-item-position {
+  flex: 0 0 auto;
+  min-width: 16px;
+  color: var(--text-muted);
+  font-weight: var(--fw-bold);
+  text-align: right;
+}
+
+.queue-item-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: var(--text-strong);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-item-status {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  font-size: 9px;
+  font-weight: var(--fw-bold);
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+
+.queue-item-status.status-active {
+  background: var(--meter-blue-a);
+  color: #fff;
+}
+
+.queue-item-status.status-queued {
+  background: var(--panel);
+  color: var(--text-muted);
+  border: 1px solid var(--line-card);
+}
+
 .queue-clear-btn {
   width: 100%;
   margin: var(--space-2) 0 0;

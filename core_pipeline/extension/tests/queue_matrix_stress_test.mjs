@@ -650,6 +650,71 @@ await run('SW wake-by-message does not resurrect a just-cleared restartLost (def
 });
 
 // =========================================================================================
+// Section 4b -- first-come-first-translate priority across revisits: auto-translate visiting
+// pages 1..5 in order must dispatch/queue in that exact order; going BACK to an already-queued
+// or already-active page must NOT re-add it or change its position (no new page was added);
+// visiting a genuinely NEW page afterward must append at the end. Also proves the popup's live
+// item list (getTranslationStats().items) reflects this order and status.
+// =========================================================================================
+await run('first-come-first-translate priority survives revisits; new page appends at the end', async () => {
+  await send({ kind: 'setParallelLimit', limit: 1 });
+  await send({ kind: 'setQueueLimit', limit: 10 });
+
+  const tag = 'priority';
+  const promises = [];
+  for (let n = 1; n <= 5; n += 1) {
+    promises.push(send(pageMessage(tag, n)));
+    await flush();
+  }
+
+  // s.items is an array constructed inside the vm sandbox's own realm -- assert.deepEqual's
+  // strict prototype check fails against a literal array in THIS script's realm even when the
+  // contents are byte-identical (Object.getPrototypeOf(sandboxArray) !== Array.prototype here).
+  // Comparing plain joined strings sidesteps that entirely since string primitives carry no
+  // realm/prototype identity.
+  const orderOf = (stats) => stats.items.slice(1).map((item) => item.originalImageUrl.match(/\/(\d)\.jpg$/)[1]).join(',');
+  const positionsOf = (stats) => stats.items.slice(1).map((item) => item.position).join(',');
+
+  let s = await stats();
+  assert.equal(s.items[0].status, 'active', 'page 1 (first visited) must be the one holding the GPU slot');
+  assert.match(s.items[0].originalImageUrl, /\/1\.jpg$/, 'page 1 must be active, not some other page');
+  assert.equal(orderOf(s), '2,3,4,5', 'queued items must be in exact visit order 2,3,4,5');
+  assert.equal(positionsOf(s), '1,2,3,4', 'queue positions must be 1-indexed and contiguous');
+
+  // "Go back" to page 1 (still active) and page 3 (still queued) -- no new page was added, so
+  // this must be a pure no-op: same cacheId joins the existing active/queued entry, the queue
+  // array itself is never touched (see queueTranslation's outgoingRequests/queuedRequests checks).
+  const revisit1 = send(pageMessage(tag, 1));
+  const revisit3 = send(pageMessage(tag, 3));
+  await flush();
+
+  s = await stats();
+  assert.equal(s.activeRequests, 1, 'revisiting must not spawn a second active request for the same page');
+  assert.equal(s.queueLength, 4, 'revisiting a queued page must not add a duplicate queue entry');
+  assert.equal(orderOf(s), '2,3,4,5', 'revisiting page 1 (active) and page 3 (queued) must not reorder the queue at all');
+
+  // Resolve page 1 -- page 2 should now take the GPU slot, queue becomes [3, 4, 5].
+  heldResolvers.get('hold-priority-page-1|100x100')?.();
+  await flush();
+  await promises[0];
+  await revisit1;
+
+  s = await stats();
+  assert.match(s.items[0].originalImageUrl, /\/2\.jpg$/, 'page 2 must be promoted to active after page 1 finishes');
+  assert.equal(orderOf(s), '3,4,5', 'remaining queue order must be unaffected by page 1 finishing');
+
+  // A genuinely NEW page (6) must append at the end, after the existing queue, not jump ahead.
+  const p6 = send(pageMessage(tag, 6));
+  await flush();
+  s = await stats();
+  assert.equal(orderOf(s), '3,4,5,6', 'a new page must append at the end of the existing queue, not reorder or jump ahead');
+
+  // Drain everything so resetState()'s next-test teardown starts clean.
+  await resolveAllAndDrain(tag);
+  await Promise.allSettled([...promises, revisit3, p6]);
+});
+
+// =========================================================================================
 // Section 5 -- seeded invariant fuzz. mulberry32 PRNG for reproducibility; a failing seed is
 // printed so it can be replayed deterministically.
 // =========================================================================================

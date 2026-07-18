@@ -19,6 +19,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const statsText = document.getElementById('statsText');
   const cacheStatusText = document.getElementById('cacheStatusText');
   const recentTranslations = document.getElementById('recentTranslations');
+  const queueItemsList = document.getElementById('queueItemsList');
   const localPipelineUrl = document.getElementById('localPipelineUrl');
   const localPipelineLanguage = document.getElementById('localPipelineLanguage');
   const translationCachePages = document.getElementById('translationCachePages');
@@ -332,7 +333,45 @@ document.addEventListener('DOMContentLoaded', () => {
       if (queueLength > 0) parts.push(`${queueLength}/${queueLimit} queued`);
       if (restartLost > 0) parts.push(`${restartLost} lost in restart - re-run Translate Page`);
       statsText.textContent = parts.length ? parts.join(' Â· ') : 'ready';
+
+      renderQueueItems(Array.isArray(response.items) ? response.items : []);
     });
+  }
+
+  // Live per-item breakdown so the actual FIFO dispatch order (active items first, then queued
+  // in the exact order they'll be dispatched) is visible, not just an aggregate count -- items
+  // are keyed by cacheId, which is stable across an unchanged page revisit (see background.js's
+  // pendingSrcs/translatedSrcs dedup), so this list only reflects genuinely new/changed work.
+  function imageLabelFromUrl(url) {
+    try {
+      const path = new URL(String(url || '')).pathname;
+      const name = path.split('/').filter(Boolean).pop();
+      return name ? decodeURIComponent(name) : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function renderQueueItems(items) {
+    if (!queueItemsList) return;
+    if (!items.length) {
+      queueItemsList.hidden = true;
+      queueItemsList.innerHTML = '';
+      return;
+    }
+    queueItemsList.hidden = false;
+    queueItemsList.innerHTML = items.map((item) => {
+      const isActive = item.status === 'active';
+      const label = [item.pageHost, imageLabelFromUrl(item.originalImageUrl)].filter(Boolean).join(' - ') || 'image';
+      const positionLabel = isActive ? '&bull;' : String(item.position ?? '');
+      return `
+        <div class="queue-item-row">
+          <span class="queue-item-position">${positionLabel}</span>
+          <span class="queue-item-label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
+          <span class="queue-item-status status-${isActive ? 'active' : 'queued'}">${isActive ? 'active' : 'queued'}</span>
+        </div>
+      `;
+    }).join('');
   }
 
   function timeAgoLabel(timestampMs) {
