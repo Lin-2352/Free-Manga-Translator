@@ -104,10 +104,14 @@ the actual extension source, not assumed:
 3. **The code, bundled for Kaggle.** Your repository is **private** (verified via `gh
    repo view` before writing this document). §3 below walks through the recommended
    way to get it onto Kaggle without ever putting a long-lived GitHub credential there.
-4. **Your `.env` file**, the same one your local backend already uses, with your real
-   API provider keys. You are not creating new keys — you're reusing the ones you
-   already have, delivered to Kaggle via Kaggle Secrets (§4), never committed or
-   uploaded anywhere in plaintext.
+4. **Your provider API keys**, the same ones your local backend already uses, delivered
+   to Kaggle as individual Kaggle Secrets (§4) — never as a `.env` file, never committed
+   or uploaded anywhere in plaintext. If any of your existing keys have ever been
+   pasted into a chat, a public gist, a screenshot, or anywhere else outside your own
+   `.env` file and provider dashboards, **rotate that key on the provider's dashboard
+   first** and use the freshly rotated value when you create its Kaggle Secret in §4 —
+   an old, possibly-exposed key has no business getting a second life on a
+   publicly-tunneled backend.
 
 ---
 
@@ -213,69 +217,103 @@ protect you from your own notebook code:**
   full) once you've loaded the `.env` into the process — filter to just the keys you
   need to see, or better, don't print environment state at all in a saved cell.
 
-### Exactly 3 secrets — no more, no less
+### One small secret per credential — not one blob
 
-The committed notebook (`deploy/kaggle/fmt_kaggle_backend.ipynb`) reads exactly three
-secret names — verified by grepping the notebook's own cells, not assumed:
-`FMT_ENV_B64`, `NGROK_AUTHTOKEN`, `FMT_AUTH_TOKEN`. **You do not need a `GH_PAT`
-secret** — that's only for the git-clone path (§3 Option B), and this document's
-primary path (Option A, the dataset zip) doesn't touch GitHub credentials at all. Don't
-add it; an unused secret is a needless thing to keep track of.
+An earlier version of this document used a single `FMT_ENV_B64` secret holding your
+entire `.env` file, base64-encoded, as one ~15KB blob. **That design is retired.** While
+testing this deployment, that single large secret would not save — the Kaggle Secrets
+panel accepted the label and value, the Save button was clickable, but the panel
+reverted to "No secrets added" immediately after, with no error shown. Deep research
+across Kaggle's own documentation, the `kaggle_secrets.py` client source, and every
+public bug report and forum thread found **no documented size or count limit** for
+Kaggle Secrets, and no report matching this exact symptom — so the precise cause was
+never confirmed. What *is* confirmed is that the only pattern Kaggle's own community
+actually uses for many credentials is **one small secret per credential**, not a single
+blob. This document now uses that pattern. It sidesteps whatever the blob's problem
+was, whether that was payload size or something else, and it's the better-supported
+approach regardless.
 
-For each one below: in the Kaggle notebook editor, open **Add-ons → Secrets** (the
-panel in your screenshot), type the **exact label** shown, paste the **value** produced
-by the command under it, click **Save**, then make sure the toggle next to it is **ON**
-for this notebook (Kaggle requires you to explicitly attach each secret per-notebook —
-easy to create a secret and forget this step, which silently makes it invisible to
-`UserSecretsClient.get_secret()` at runtime with a `NotFoundError`, not a helpful
+The committed notebook (`deploy/kaggle/fmt_kaggle_backend.ipynb`) reads exactly
+**12 secret names** — verified by grepping the notebook's own cells, not assumed. Every
+label below is spelled **identically** to the environment variable it becomes — no
+translation table to keep in your head. **You do not need a `GH_PAT` secret** — that's
+only for the git-clone path (§3 Option B), and this document's primary path (Option A,
+the dataset zip) doesn't touch GitHub credentials at all.
+
+For each one: in the Kaggle notebook editor, open **Add-ons → Secrets**, type the
+**exact label** shown, paste the **value**, click **Save**, then make sure the toggle
+next to it is **ON** for this notebook (Kaggle requires you to explicitly attach each
+secret per-notebook — easy to create a secret and forget this step, which silently
+makes it invisible to `UserSecretsClient.get_secret()` at runtime, not a helpful
 message).
 
----
-
-**Secret 1 — Label: `FMT_ENV_B64`**
-
-This is every API key from your real `.env`, base64-encoded as one blob. Run this
-**on your own machine** (PowerShell), which copies the result straight to your
-clipboard — nothing is printed to any terminal or log:
-
-```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("D:\Desktop\translator D\app\Manga Translator\core_pipeline\.env")) | Set-Clipboard
-```
-
-Paste directly into the **Value** field (Ctrl+V). Verified round-trip-safe on this
-exact `.env` file before writing this document: encoding then decoding the result
-reproduces the original file byte-for-byte.
-
-*Why one blob instead of one Kaggle Secret per provider key:* your `.env` has ~9
-providers × up to 4 keys each, plus model overrides and quota settings. One secret
-decoded straight back into a real `.env` file on the Kaggle side means the notebook and
-your local machine read the literal same file format — no risk of a Kaggle-side key
-list silently drifting out of sync as you rotate keys over time.
-
-*Deliberately NOT included in this blob:* `FMT_AUTH_TOKEN` (secret 3 below). Your local
-`.env` should **not** contain `FMT_AUTH_TOKEN` — the notebook injects it as its own
-separate environment variable in cell 3, layered on top of whatever the decoded `.env`
-contains. This is what lets the exact same `.env` file work unchanged both locally (no
-token enforced — the backend behaves exactly as it always has) and on Kaggle (token
-enforced, because cell 3 sets it there and only there) — you never need two versions of
-your `.env`.
+**A provider you don't use can simply be skipped** — leave its secret uncreated. The
+notebook's Cell 3 treats a missing provider secret exactly like an unfilled line in a
+local `.env`: that provider is left unconfigured, and the pipeline already treats an
+unconfigured provider as zero-quota and never reserved. You don't need all 12 to get a
+working deployment; you need the ones matching the providers your local `.env`
+currently has real keys for.
 
 ---
 
-**Secret 2 — Label: `NGROK_AUTHTOKEN`**
+### Step 1 — the go/no-go check: create `NGROK_AUTHTOKEN` first
 
-From your ngrok dashboard (dashboard.ngrok.com) → **Your Authtoken** (left sidebar,
-under Getting Started/Setup & Installation — ngrok's exact menu wording has moved
-around over time, but it's always on the page that shows a long token starting
-`2` or similar, with a copy-icon button next to it). Click the copy icon, paste
-directly into **Value**.
+Before touching any provider key, create **just this one secret** and confirm it
+actually appears in the Secrets list afterward:
 
-This is *not* the same thing as the static domain you claimed — that's a hostname
-string you'll type directly into cell 6 of the notebook (§5), not a secret.
+- Label: `NGROK_AUTHTOKEN`
+- Value: from your ngrok dashboard (dashboard.ngrok.com) → **Your Authtoken** (left
+  sidebar, under Getting Started/Setup & Installation — the exact menu wording has
+  moved around over time, but it's always on the page showing a long token starting
+  `2` or similar, with a copy-icon button next to it).
+
+Click **Save**, then look at the Secrets list.
+
+- **If it appears and stays there** — the account/browser can save secrets normally.
+  Continue to Step 2 below with confidence; the rest of the secrets will behave the
+  same way.
+- **If it also reverts to "No secrets added"** — this isn't about payload size (this
+  value is a short token, nowhere near 15KB), so don't create the other 11 secrets yet;
+  they'll very likely hit the same wall. Instead try, in order: a hard refresh
+  (Ctrl+Shift+R) before retrying, an incognito window or a different browser, clicking
+  **Save Version** on the notebook first (an unsaved draft notebook has been reported
+  to behave oddly with Secrets) and then retrying, or simply waiting a few minutes and
+  retrying (transient Kaggle-side hiccups have been reported and self-resolve). Once
+  this one secret saves and sticks, come back and continue below.
+
+This is not a separate testing phase tacked onto setup — it *is* the first real step,
+just ordered so a systemic problem shows up after 30 seconds instead of after
+re-entering 12 credentials.
 
 ---
 
-**Secret 3 — Label: `FMT_AUTH_TOKEN`**
+### Step 2 — the provider keys
+
+For every provider you actually use (skip the rest), create a secret with the label
+below, using the **same comma-separated key format** your local `.env` already uses for
+that variable. **If any of these keys were ever exposed outside your own `.env` file
+and provider dashboard — including having been pasted into any chat — rotate it on the
+provider's dashboard first and paste the freshly rotated value here, not the old one.**
+
+| Secret label (== exact env var name) | Get the key from |
+|---|---|
+| `GEMINI_API_KEYS` | Google AI Studio (aistudio.google.com) → **Get API key** |
+| `GITHUB_API_KEYS` | GitHub → Settings → Developer settings → **Personal access tokens** (fine-grained) |
+| `GROQ_API_KEYS` | console.groq.com → **API Keys** |
+| `MISTRAL_API_KEYS` | console.mistral.ai → **API Keys** |
+| `OPENROUTER_API_KEYS` | openrouter.ai → **Keys** |
+| `CEREBRAS_API_KEYS` | cloud.cerebras.ai → **API Keys** |
+| `FIREWORKS_API_KEYS` | fireworks.ai → **API Keys** |
+| `CLOUDFLARE_WORKERS_API_KEYS` | Cloudflare dashboard → My Profile → **API Tokens** |
+| `CLOUDFLARE_ACCOUNT_IDS` | Cloudflare dashboard → Workers & Pages overview page (right sidebar shows your Account ID) |
+| `NVIDIA_NIM_API_KEYS` | build.nvidia.com (NIM/API Catalog) → **Get API Key** on any model page |
+
+Same routine as Step 1 for each: Add-ons → Secrets → type the label exactly → paste the
+value → Save → confirm it's toggled **ON** for this notebook.
+
+---
+
+### Step 3 — `FMT_AUTH_TOKEN`
 
 A password only you know, shared between your Kaggle-hosted backend and your local
 extension, so a stranger who stumbles on your public tunnel URL can't send it real
@@ -287,9 +325,7 @@ requests (§8). Generate one yourself — don't reuse a password from anywhere e
 
 This prints a random 40-character token to the PowerShell window (verified working:
 produces exactly 40 alphanumeric characters each run). **Select and copy that printed
-value** (it's not sensitive the same way an API key is — it's a password you're
-choosing, not a third party's credential — but treat it the same way anyway: don't
-paste it anywhere public). Paste it as this secret's **Value**.
+value** and paste it as the Value for a secret labeled `FMT_AUTH_TOKEN`.
 
 **Write this value down somewhere** (a local password manager, a text file that isn't
 ever committed) — you'll need to paste this *exact same string* into the extension
@@ -305,8 +341,14 @@ is the whole point.
 This is what "no error in the first build" actually comes down to — confirm all of this
 *before* clicking run on cell 1:
 
-- [ ] Add-ons → Secrets shows exactly `FMT_ENV_B64`, `NGROK_AUTHTOKEN`, `FMT_AUTH_TOKEN`
-      — all three toggled **ON** for this notebook.
+- [ ] Add-ons → Secrets shows `NGROK_AUTHTOKEN` and it's stayed in the list since Step 1
+      (your go/no-go check already passed).
+- [ ] Add-ons → Secrets shows a secret for every provider your `.env` currently has a
+      real key for (Step 2) — skipped providers are fine, just double-check you didn't
+      skip one you actually meant to use.
+- [ ] Add-ons → Secrets shows `FMT_AUTH_TOKEN` (Step 3).
+- [ ] Every secret above is toggled **ON** for this notebook — creating a secret does
+      not automatically attach it.
 - [ ] Add-ons → Data shows your `fmt-core-pipeline` dataset attached (§3) — if you
       haven't uploaded `fmt_core_pipeline.zip` as a dataset yet, do that first; cell 1
       asserts on this path and fails fast, on purpose, rather than limping through a
@@ -329,8 +371,9 @@ yourself. Each cell is explained here; expected timings are in §7.
 **Before running anything:** in the notebook's right-side panel, set **Accelerator →
 GPU T4 x2**, and toggle **Internet → On** (required for pip installs, HF model
 downloads, and the tunnel itself). Attach your `fmt-core-pipeline` dataset (Add-ons →
-Data → your dataset). Attach the four secrets from §4 (Add-ons → Secrets → toggle each
-one on for this notebook).
+Data → your dataset). Attach the secrets from §4 (Add-ons → Secrets → toggle each one
+on for this notebook) — `NGROK_AUTHTOKEN` and `FMT_AUTH_TOKEN` always, plus one per
+provider you actually use.
 
 **Cell 1 — environment sanity check.** Confirms GPU is actually visible, the dataset is
 attached, and you didn't forget a toggle before burning notebook quota on nothing:
@@ -372,27 +415,65 @@ this repo (the pipeline's ML deps vs. the FastAPI layer) — both are needed; th
 repo's own `backend_api/Dockerfile` only installs the second one and is not a complete
 reference for this deployment.
 
-**Cell 3 — decode secrets into environment.** Reads `FMT_ENV_B64` from Kaggle Secrets,
-decodes it back into a real `.env` file, and points the backend at it via
-`FMT_ENV_FILE` — the exact override mechanism `api_manager.py`'s `_load_env` already
-supports, read at startup before every other candidate path. `FMT_AUTH_TOKEN` is set
-directly as a process environment variable (the backend reads it once at import time),
-and — critically — **nothing here is printed**:
+**Cell 3 — load secrets into environment.** Reads each provider's key straight from its
+own small Kaggle Secret into `os.environ` — **no `.env` file is ever written to disk**.
+A provider whose secret was never created (§4 Step 2) is simply left unconfigured,
+matching how an unfilled line in a local `.env` already behaves. Non-secret pipeline
+tuning is hardcoded in the same cell since none of it is sensitive — this mirrors the
+values in this repo's own `.env.example`; edit them directly if you want Kaggle to run
+with different settings than your local machine. `FMT_AUTH_TOKEN` is set directly as a
+process environment variable (the backend reads it once at import time), and —
+critically — **nothing here is printed**:
 ```python
-import base64, os
+import os
 from kaggle_secrets import UserSecretsClient
 
 secrets = UserSecretsClient()
-env_bytes = base64.b64decode(secrets.get_secret("FMT_ENV_B64"))
-env_path = "/kaggle/working/fmt.env"
-with open(env_path, "wb") as f:
-    f.write(env_bytes)
-os.chmod(env_path, 0o600)
 
-os.environ["FMT_ENV_FILE"] = env_path
+def optional_secret(label):
+    try:
+        return secrets.get_secret(label) or ""
+    except Exception:
+        return ""
+
+PROVIDER_SECRET_LABELS = [
+    "GEMINI_API_KEYS", "GITHUB_API_KEYS", "GROQ_API_KEYS", "MISTRAL_API_KEYS",
+    "OPENROUTER_API_KEYS", "CEREBRAS_API_KEYS", "FIREWORKS_API_KEYS",
+    "CLOUDFLARE_WORKERS_API_KEYS", "CLOUDFLARE_ACCOUNT_IDS", "NVIDIA_NIM_API_KEYS",
+]
+configured = []
+for label in PROVIDER_SECRET_LABELS:
+    value = optional_secret(label)
+    if value:
+        os.environ[label] = value
+        configured.append(label.replace("_API_KEYS", "").replace("_ACCOUNT_IDS", ""))
+
 os.environ["FMT_AUTH_TOKEN"] = secrets.get_secret("FMT_AUTH_TOKEN")
+
+os.environ.update({
+    "TRANSLATION_PROVIDER_ORDER": "mistral,cerebras,fireworks,groq,nvidia,github,openrouter,gemini,cloudflare",
+    "USE_API_TRANSLATION": "auto",
+    "LOCAL_TRANSLATOR_MODEL": "facebook/nllb-200-distilled-600M",
+    "NVIDIA_KEY_ROLES": "translation,vision_ocr,backup",
+    "OPENROUTER_KEY_ROLES": "translation,translation,vision_ocr,backup",
+    "FMT_STARTUP_WARMUP": "0",
+    "FMT_GPU_IDLE_UNLOAD_SECONDS": "600",
+})
+print(f"Configured providers ({len(configured)}/10): {', '.join(configured) or 'none'}")
 print("Secrets loaded (values not shown).")
 ```
+The printed summary line is your first real verification checkpoint — it lists which
+providers loaded (never their values) before you've even reached cell 4. If a provider
+you expected is missing from it, its secret either wasn't created or wasn't toggled ON
+for this notebook (§4).
+
+Why no `.env` file at all, unlike the retired design: `api_manager.py`'s `_load_env`
+uses `load_dotenv(path, override=True)` — if a `.env` file were found anywhere on its
+search path, *its* values would silently win over anything already set in `os.environ`
+by this cell. Since the dataset zip never includes a `.env` file (§3 excludes it) and
+this cell doesn't write one, `_load_env` finds nothing on Kaggle and logs a purely
+cosmetic "no .env file found" warning — the directly-set values above are used cleanly,
+with no override risk.
 
 **Cell 4 — launch the backend.** Runs uvicorn exactly the way `start_backend.ps1` does
 locally (same working directory, same module path), as a background subprocess so the
@@ -481,14 +562,12 @@ while True:
 Interrupt this cell (■ Stop) when you're done reading and want to move to the shutdown
 cell — it's an intentional infinite loop, not a bug.
 
-**Cell 8 — clean shutdown.** Closes the tunnel, stops the backend, and removes the
-decoded `.env` from disk so it doesn't linger in `/kaggle/working` if you save outputs:
+**Cell 8 — clean shutdown.** Closes the tunnel and stops the backend. Nothing is
+written to disk by Cell 3 in this design, so there's no leftover secrets file to clean
+up:
 ```python
-import os
 ngrok.disconnect(tunnel.public_url)
 backend_proc.terminate()
-if os.path.exists("/kaggle/working/fmt.env"):
-    os.remove("/kaggle/working/fmt.env")
 print("Shut down cleanly.")
 ```
 
@@ -634,6 +713,13 @@ treat the tunnel URL itself as the real perimeter:
   no-op — it is not a remote-code-execution surface introduced by this deployment
   (there's no PowerShell interpreter on the box to spawn in the first place).
 
+**If you've ever shared a real key outside your own `.env` and provider dashboards** —
+including pasting one into a chat, a screenshot, or a gist while troubleshooting this
+setup — treat it as compromised and rotate it on the provider's dashboard before this
+deployment goes live. §4 Step 2 already has you re-enter each provider's key
+individually, so rotating first costs nothing extra; it's the same paste, just with a
+fresh value.
+
 **Kaggle Terms of Service note:** this document describes running your own personal
 pipeline for your own interactive reading use, bounded by Kaggle's own quota and
 session limits — not standing up a 24/7 public service on Kaggle's free tier. Review
@@ -690,8 +776,10 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 | Extension badge stuck on "Offline" right after Save | Pasted a bare domain instead of the full `/v1/translate-image` path (§6) | Fix the URL field, click Save again |
 | `403` on every request from the extension | `FMT_AUTH_TOKEN` set on the backend but not matching (or not set) in the popup's auth token field | Make sure both sides have the exact same token value, no trailing whitespace |
 | `paddlepaddle`/`paddleocr` install hangs or fails | Occasionally flaky on Kaggle's network | Re-run the pip install cell; these packages are large and occasionally need a retry |
-| Out-of-memory (OOM) errors during translation | Too many concurrent jobs for one T4 | Lower `FMT_PIPELINE_MAX_PARALLEL` in your `.env` (and re-encode `FMT_ENV_B64`) — default 2 should normally fit a T4's 16GB comfortably |
+| Out-of-memory (OOM) errors during translation | Too many concurrent jobs for one T4 | Lower `FMT_PIPELINE_MAX_PARALLEL` directly in cell 3's `os.environ.update({...})` block — default 2 should normally fit a T4's 16GB comfortably |
 | Dataset not visible in notebook | Forgot to attach it, or uploaded under a different name than referenced in cell 1/2 | Add-ons → Data → attach; match the exact `/kaggle/input/<name>` path in the notebook |
+| A secret you created won't stay in the Secrets list (reverts to "No secrets added" right after Save) | Not confirmed — no documented Kaggle limit matches this; possibly a transient session/browser issue | Follow the go/no-go branch in §4 Step 1: hard refresh, try incognito/a different browser, save the notebook first, or wait a few minutes and retry |
+| A provider you expected doesn't show up in cell 3's "Configured providers" printout | Its secret wasn't created, or was created but not toggled ON for this notebook | Add-ons → Secrets → check the label matches exactly and the toggle is ON, then re-run cell 3 |
 
 ---
 
@@ -699,8 +787,8 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 
 For when you've already read the above once and just need the checklist:
 
-1. Kaggle: phone-verified, GPU T4×2 + Internet on, dataset attached, 4 secrets
-   attached.
+1. Kaggle: phone-verified, GPU T4×2 + Internet on, dataset attached, `NGROK_AUTHTOKEN`
+   + `FMT_AUTH_TOKEN` + one secret per provider you use attached (§4).
 2. Run notebook cells 1-6 (`deploy/kaggle/fmt_kaggle_backend.ipynb`).
 3. Copy the printed public URL + `/v1/translate-image`.
 4. Extension popup → Local Pipeline URL = that value, Backend auth token = your
