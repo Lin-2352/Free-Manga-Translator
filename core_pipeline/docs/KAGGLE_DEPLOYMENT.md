@@ -213,31 +213,110 @@ protect you from your own notebook code:**
   full) once you've loaded the `.env` into the process — filter to just the keys you
   need to see, or better, don't print environment state at all in a saved cell.
 
-**Secrets to create** (Add-ons → Secrets → Add a new secret, one at a time):
+### Exactly 3 secrets — no more, no less
 
-| Secret name | Value | Used for |
-|---|---|---|
-| `FMT_ENV_B64` | Base64 of your entire local `.env` file (command below) | All your provider API keys, in one shot — no per-key drift between your local `.env` and Kaggle |
-| `NGROK_AUTHTOKEN` | Your ngrok authtoken | Authenticates the tunnel client |
-| `FMT_AUTH_TOKEN` | A password you make up (e.g. output of `openssl rand -hex 24`) | The shared secret the extension and backend use to authenticate each other over the public tunnel (§6, §8) |
-| `GH_PAT` (only if using Option B in §3) | Your fine-grained PAT | Cloning the private repo |
+The committed notebook (`deploy/kaggle/fmt_kaggle_backend.ipynb`) reads exactly three
+secret names — verified by grepping the notebook's own cells, not assumed:
+`FMT_ENV_B64`, `NGROK_AUTHTOKEN`, `FMT_AUTH_TOKEN`. **You do not need a `GH_PAT`
+secret** — that's only for the git-clone path (§3 Option B), and this document's
+primary path (Option A, the dataset zip) doesn't touch GitHub credentials at all. Don't
+add it; an unused secret is a needless thing to keep track of.
 
-To produce the `FMT_ENV_B64` value, run **on your own machine**:
+For each one below: in the Kaggle notebook editor, open **Add-ons → Secrets** (the
+panel in your screenshot), type the **exact label** shown, paste the **value** produced
+by the command under it, click **Save**, then make sure the toggle next to it is **ON**
+for this notebook (Kaggle requires you to explicitly attach each secret per-notebook —
+easy to create a secret and forget this step, which silently makes it invisible to
+`UserSecretsClient.get_secret()` at runtime with a `NotFoundError`, not a helpful
+message).
+
+---
+
+**Secret 1 — Label: `FMT_ENV_B64`**
+
+This is every API key from your real `.env`, base64-encoded as one blob. Run this
+**on your own machine** (PowerShell), which copies the result straight to your
+clipboard — nothing is printed to any terminal or log:
 
 ```powershell
-# PowerShell
 [Convert]::ToBase64String([IO.File]::ReadAllBytes("D:\Desktop\translator D\app\Manga Translator\core_pipeline\.env")) | Set-Clipboard
 ```
 
-This copies the base64 text to your clipboard — paste it directly as the Secret value.
-Nothing is printed to any terminal or log.
+Paste directly into the **Value** field (Ctrl+V). Verified round-trip-safe on this
+exact `.env` file before writing this document: encoding then decoding the result
+reproduces the original file byte-for-byte.
 
-**Why one base64 blob instead of one Kaggle Secret per API key:** your `.env` already
-has ~9 providers × up to 4 keys each, plus model overrides, quota settings, and now
-`FMT_AUTH_TOKEN`. One secret that's decoded straight back into a real `.env` file on
-the Kaggle side means the notebook, `api_manager.py`, and your local machine are all
-reading literally the same file format — no risk of a Kaggle-side key list silently
-drifting out of sync with your local one as you rotate keys over time.
+*Why one blob instead of one Kaggle Secret per provider key:* your `.env` has ~9
+providers × up to 4 keys each, plus model overrides and quota settings. One secret
+decoded straight back into a real `.env` file on the Kaggle side means the notebook and
+your local machine read the literal same file format — no risk of a Kaggle-side key
+list silently drifting out of sync as you rotate keys over time.
+
+*Deliberately NOT included in this blob:* `FMT_AUTH_TOKEN` (secret 3 below). Your local
+`.env` should **not** contain `FMT_AUTH_TOKEN` — the notebook injects it as its own
+separate environment variable in cell 3, layered on top of whatever the decoded `.env`
+contains. This is what lets the exact same `.env` file work unchanged both locally (no
+token enforced — the backend behaves exactly as it always has) and on Kaggle (token
+enforced, because cell 3 sets it there and only there) — you never need two versions of
+your `.env`.
+
+---
+
+**Secret 2 — Label: `NGROK_AUTHTOKEN`**
+
+From your ngrok dashboard (dashboard.ngrok.com) → **Your Authtoken** (left sidebar,
+under Getting Started/Setup & Installation — ngrok's exact menu wording has moved
+around over time, but it's always on the page that shows a long token starting
+`2` or similar, with a copy-icon button next to it). Click the copy icon, paste
+directly into **Value**.
+
+This is *not* the same thing as the static domain you claimed — that's a hostname
+string you'll type directly into cell 6 of the notebook (§5), not a secret.
+
+---
+
+**Secret 3 — Label: `FMT_AUTH_TOKEN`**
+
+A password only you know, shared between your Kaggle-hosted backend and your local
+extension, so a stranger who stumbles on your public tunnel URL can't send it real
+requests (§8). Generate one yourself — don't reuse a password from anywhere else:
+
+```powershell
+-join ((48..57)+(65..90)+(97..122)|Get-Random -Count 40|ForEach-Object{[char]$_})
+```
+
+This prints a random 40-character token to the PowerShell window (verified working:
+produces exactly 40 alphanumeric characters each run). **Select and copy that printed
+value** (it's not sensitive the same way an API key is — it's a password you're
+choosing, not a third party's credential — but treat it the same way anyway: don't
+paste it anywhere public). Paste it as this secret's **Value**.
+
+**Write this value down somewhere** (a local password manager, a text file that isn't
+ever committed) — you'll need to paste this *exact same string* into the extension
+popup's "Backend auth token" field in §6. If the two don't match character-for-character,
+every request will get a `403` and the popup will just show "Offline" with no more
+specific explanation, which is confusing to debug blind — matching values on both ends
+is the whole point.
+
+---
+
+### Before you run the notebook: a 60-second checklist
+
+This is what "no error in the first build" actually comes down to — confirm all of this
+*before* clicking run on cell 1:
+
+- [ ] Add-ons → Secrets shows exactly `FMT_ENV_B64`, `NGROK_AUTHTOKEN`, `FMT_AUTH_TOKEN`
+      — all three toggled **ON** for this notebook.
+- [ ] Add-ons → Data shows your `fmt-core-pipeline` dataset attached (§3) — if you
+      haven't uploaded `fmt_core_pipeline.zip` as a dataset yet, do that first; cell 1
+      asserts on this path and fails fast, on purpose, rather than limping through a
+      confusing later error.
+- [ ] Side panel → Accelerator = **GPU T4 x2**, Internet = **On**.
+- [ ] You've written down your `FMT_AUTH_TOKEN` value somewhere durable — you'll need
+      it again in §6, after the notebook is already running.
+- [ ] Cell 6's `STATIC_DOMAIN` variable is edited to your actual claimed ngrok domain
+      (§2) before you run it — the placeholder `yourname-something.ngrok-free.app`
+      will fail to connect if left as-is.
 
 ---
 
