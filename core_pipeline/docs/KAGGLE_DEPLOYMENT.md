@@ -128,13 +128,24 @@ Kaggle Dataset.
 # Run this on your own machine, inside the repo.
 cd "D:\Desktop\translator D\app\Manga Translator"
 
-# Build a clean copy for upload -- excludes secrets, caches, and anything that
-# would just bloat the dataset without being needed on Kaggle.
-robocopy core_pipeline kaggle_upload\core_pipeline /E /XD .git __pycache__ runtime_samples .venv `
+# Build a clean copy for upload -- excludes secrets and every local-only dev/test
+# artifact directory (quality_reports, runtime_samples, validation_logs, training_data,
+# runtime_logs, extension) so the upload carries only what's actually needed to run the
+# backend (code + vendored model weights: ~682MB zipped, verified by actually running
+# this command), not the ~1GB of local test output that would otherwise get swept in
+# alongside it. The extension itself never runs on Kaggle -- it stays local in your
+# browser -- so it's excluded too.
+robocopy core_pipeline kaggle_upload\core_pipeline /E /XD .git __pycache__ runtime_samples `
+  .venv quality_reports validation_logs training_data runtime_logs extension `
   /XF .env "*.pyc"
 
 Compress-Archive -Path kaggle_upload\core_pipeline -DestinationPath fmt_core_pipeline.zip -Force
 ```
+
+This creates `fmt_core_pipeline.zip` in the directory you `cd`'d into above — i.e.
+`D:\Desktop\translator D\app\Manga Translator\fmt_core_pipeline.zip` — right alongside
+the `kaggle_upload\` staging folder `robocopy` builds it from. That's the file you
+upload as the Kaggle Dataset in the next step.
 
 Then on kaggle.com:
 
