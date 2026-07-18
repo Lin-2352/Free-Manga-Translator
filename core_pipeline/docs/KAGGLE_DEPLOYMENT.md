@@ -376,27 +376,56 @@ on for this notebook) — `NGROK_AUTHTOKEN` and `FMT_AUTH_TOKEN` always, plus on
 provider you actually use.
 
 **Cell 1 — environment sanity check.** Confirms GPU is actually visible, the dataset is
-attached, and you didn't forget a toggle before burning notebook quota on nothing:
+attached, and you didn't forget a toggle before burning notebook quota on nothing.
+Kaggle mounts an attached dataset at `/kaggle/input/<slug>` in most sessions, but
+interactive/draft sessions have been observed mounting it one level deeper instead, at
+`/kaggle/input/datasets/<your-username>/<slug>` — confirmed by running
+`os.listdir("/kaggle/input")` during this document's own testing and seeing `['datasets']`
+instead of the dataset slug directly. This cell checks both locations so it works
+either way, and prints which one it found:
 ```python
 import subprocess, os
-assert os.path.isdir("/kaggle/input/fmt-core-pipeline"), \
-    "Dataset not attached -- Add-ons -> Data -> attach your fmt-core-pipeline dataset"
+
+DATASET_SLUG = "fmt-core-pipeline"
+
+def find_dataset_dir(slug):
+    candidates = [f"/kaggle/input/{slug}"]
+    datasets_root = "/kaggle/input/datasets"
+    if os.path.isdir(datasets_root):
+        candidates += [
+            f"{datasets_root}/{owner}/{slug}" for owner in os.listdir(datasets_root)
+        ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    raise AssertionError(
+        f"Dataset not attached -- Add-ons -> Data -> attach your {slug} dataset "
+        f"(checked: {candidates})"
+    )
+
+DATASET_DIR = find_dataset_dir(DATASET_SLUG)
+print("Dataset found at:", DATASET_DIR)
 print(subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"],
                       capture_output=True, text=True).stdout)
 ```
-Expect two lines naming `Tesla T4, 15360 MiB` (or similar). If this cell errors or
-shows no GPUs, the accelerator setting wasn't applied — fix it in the side panel and
-restart the session before continuing.
+Expect a `Dataset found at: ...` line followed by two lines naming
+`Tesla T4, 15360 MiB` (or similar). If this cell raises the `AssertionError`, the
+printed `checked:` list shows every path it looked at — compare that against
+`os.listdir("/kaggle/input")` (and, if present, `os.listdir("/kaggle/input/datasets")`)
+to see what Kaggle actually named your mount. If GPU output is empty instead, the
+accelerator setting wasn't applied — fix it in the side panel and restart the session
+before continuing.
 
 **Cell 2 — copy code + install dependencies.** Kaggle's disk under `/kaggle/input` is
-read-only; copy to `/kaggle/working` first. Kaggle's base image already ships a recent
-torch build — check it before reinstalling the pinned CUDA wheel, since a fresh
-`pip install torch==2.6.0 --index-url .../cu124` costs several minutes you can usually
-skip:
+read-only; copy to `/kaggle/working` first, from `DATASET_DIR` (resolved by Cell 1, so
+this works regardless of which mount layout Kaggle used for your session). Kaggle's
+base image already ships a recent torch build — check it before reinstalling the
+pinned CUDA wheel, since a fresh `pip install torch==2.6.0 --index-url .../cu124`
+costs several minutes you can usually skip:
 ```python
 import shutil, subprocess, sys, torch
 
-shutil.copytree("/kaggle/input/fmt-core-pipeline/core_pipeline",
+shutil.copytree(os.path.join(DATASET_DIR, "core_pipeline"),
                  "/kaggle/working/core_pipeline", dirs_exist_ok=True)
 %cd /kaggle/working/core_pipeline
 
@@ -777,7 +806,8 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 | `403` on every request from the extension | `FMT_AUTH_TOKEN` set on the backend but not matching (or not set) in the popup's auth token field | Make sure both sides have the exact same token value, no trailing whitespace |
 | `paddlepaddle`/`paddleocr` install hangs or fails | Occasionally flaky on Kaggle's network | Re-run the pip install cell; these packages are large and occasionally need a retry |
 | Out-of-memory (OOM) errors during translation | Too many concurrent jobs for one T4 | Lower `FMT_PIPELINE_MAX_PARALLEL` directly in cell 3's `os.environ.update({...})` block — default 2 should normally fit a T4's 16GB comfortably |
-| Dataset not visible in notebook | Forgot to attach it, or uploaded under a different name than referenced in cell 1/2 | Add-ons → Data → attach; match the exact `/kaggle/input/<name>` path in the notebook |
+| Cell 1's `AssertionError` fires even though Add-ons → Data shows the dataset attached | Kaggle mounted it one level deeper than expected (`/kaggle/input/datasets/<username>/<slug>`, seen on interactive/draft sessions) — the error's printed `checked:` list shows exactly what was tried | Run `os.listdir("/kaggle/input")` and, if it shows `['datasets']`, also `os.listdir("/kaggle/input/datasets")` to see the real path; Cell 1 already checks both layouts, so this should only happen if the dataset name itself doesn't match `fmt-core-pipeline` |
+| Dataset not visible in notebook at all | Forgot to attach it, or uploaded under a different name | Add-ons → Data → attach; the name must match `DATASET_SLUG` in cell 1 |
 | A secret you created won't stay in the Secrets list (reverts to "No secrets added" right after Save) | Not confirmed — no documented Kaggle limit matches this; possibly a transient session/browser issue | Follow the go/no-go branch in §4 Step 1: hard refresh, try incognito/a different browser, save the notebook first, or wait a few minutes and retry |
 | A provider you expected doesn't show up in cell 3's "Configured providers" printout | Its secret wasn't created, or was created but not toggled ON for this notebook | Add-ons → Secrets → check the label matches exactly and the toggle is ON, then re-run cell 3 |
 
