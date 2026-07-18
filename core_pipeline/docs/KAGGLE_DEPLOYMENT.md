@@ -165,6 +165,15 @@ uploading a **new dataset version** (same Dataset page → "New Version"), which
 simpler than juggling Git LFS pulls inside a notebook that has no persistent disk
 between sessions anyway.
 
+**Backend-code changes need a new dataset version to take effect.** Cell 2 of the
+notebook (§5) copies straight from this dataset every run — editing `main.py` (or
+anything else) in your local repo has zero effect on Kaggle until you re-zip and
+upload a new dataset version. One narrow exception: Cell 2 hot-patches the *copied*
+`main.py`'s CORS config on every run (adds the ngrok bypass header, §4) specifically
+so that particular fix doesn't require a re-upload while it's still new — but that's
+a deliberate, temporary, single-purpose patch, not a general mechanism. Don't rely on
+it for anything else; re-upload the dataset for any other backend change.
+
 ### Option B: fine-grained GitHub PAT (if you'd rather clone directly)
 
 If you prefer live `git clone` inside the notebook instead of a dataset:
@@ -285,6 +294,13 @@ This is not a separate testing phase tacked onto setup — it *is* the first rea
 just ordered so a systemic problem shows up after 30 seconds instead of after
 re-entering 12 credentials.
 
+**Optional 13th secret — `NGROK_STATIC_DOMAIN`.** Cell 6 normally reads your claimed
+domain from a `STATIC_DOMAIN` constant you edit directly in the notebook. If you'd
+rather not edit notebook code (e.g. you plan to re-copy this notebook, or share it),
+create a secret labeled `NGROK_STATIC_DOMAIN` with your domain as the value instead —
+Cell 6 checks for this secret first and only falls back to the `STATIC_DOMAIN`
+constant if it doesn't exist. Not required; the constant works fine on its own.
+
 ---
 
 ### Step 2 — the provider keys
@@ -356,9 +372,9 @@ This is what "no error in the first build" actually comes down to — confirm al
 - [ ] Side panel → Accelerator = **GPU T4 x2**, Internet = **On**.
 - [ ] You've written down your `FMT_AUTH_TOKEN` value somewhere durable — you'll need
       it again in §6, after the notebook is already running.
-- [ ] Cell 6's `STATIC_DOMAIN` variable is edited to your actual claimed ngrok domain
-      (§2) before you run it — the placeholder `yourname-something.ngrok-free.app`
-      will fail to connect if left as-is.
+- [ ] Either Cell 6's `STATIC_DOMAIN` variable is edited to your actual claimed ngrok
+      domain (§2), or you created the optional `NGROK_STATIC_DOMAIN` secret — Cell 6
+      raises immediately, before opening a tunnel, if neither is a real domain.
 
 ---
 
@@ -366,7 +382,9 @@ This is what "no error in the first build" actually comes down to — confirm al
 
 This mirrors `deploy/kaggle/fmt_kaggle_backend.ipynb`, committed in this repository —
 you can copy that file directly into a new Kaggle notebook, or type these cells in
-yourself. Each cell is explained here; expected timings are in §7.
+yourself. Expected timings are in §7. **Every cell below is idempotent** — safe to
+re-run on its own if something fails partway, and if the whole session dies, the
+recovery is simply "re-run Cell 1 through Cell 6 top to bottom," no manual cleanup.
 
 **Before running anything:** in the notebook's right-side panel, set **Accelerator →
 GPU T4 x2**, and toggle **Internet → On** (required for pip installs, HF model
@@ -376,128 +394,104 @@ on for this notebook) — `NGROK_AUTHTOKEN` and `FMT_AUTH_TOKEN` always, plus on
 provider you actually use.
 
 **Cell 1 — environment sanity check.** Confirms GPU is actually visible, the dataset is
-attached, and you didn't forget a toggle before burning notebook quota on nothing.
-Kaggle mounts an attached dataset at `/kaggle/input/<slug>` in most sessions, but
-interactive/draft sessions have been observed mounting it one level deeper instead, at
-`/kaggle/input/datasets/<your-username>/<slug>` — confirmed by running
-`os.listdir("/kaggle/input")` during this document's own testing and seeing `['datasets']`
-instead of the dataset slug directly. This cell checks both locations so it works
-either way, and prints which one it found:
-```python
-import subprocess, os
+attached, and prints every preinstalled library version Cell 2 is about to touch
+(torch/numpy/cv2/onnxruntime) via a **fresh subprocess** — never a kernel import,
+since Cell 2 uninstalls/reinstalls several of these and a kernel that already imported
+one would hold a stale copy. Kaggle mounts an attached dataset at `/kaggle/input/<slug>`
+in most sessions, but interactive/draft sessions have been observed mounting it one
+level deeper instead, at `/kaggle/input/datasets/<your-username>/<slug>` — confirmed by
+running `os.listdir("/kaggle/input")` during this document's own testing and seeing
+`['datasets']` instead of the dataset slug directly. This cell checks both locations so
+it works either way, and prints which one it found. See the notebook's own Cell 1 for
+the full code (`fmt-cell1-v2`).
 
-DATASET_SLUG = "fmt-core-pipeline"
+Expect a `Dataset found at: ...` line, GPU lines naming `Tesla T4, 15360 MiB` (or
+similar), and a version line per preinstalled library. If this cell raises the
+`AssertionError`, the printed `checked:` list shows every path it looked at — compare
+against `os.listdir("/kaggle/input")` (and, if present,
+`os.listdir("/kaggle/input/datasets")`) to see what Kaggle actually named your mount.
+If GPU output is empty instead, the accelerator setting wasn't applied — fix it in the
+side panel and restart the session before continuing.
 
-def find_dataset_dir(slug):
-    candidates = [f"/kaggle/input/{slug}"]
-    datasets_root = "/kaggle/input/datasets"
-    if os.path.isdir(datasets_root):
-        candidates += [
-            f"{datasets_root}/{owner}/{slug}" for owner in os.listdir(datasets_root)
-        ]
-    for path in candidates:
-        if os.path.isdir(path):
-            return path
-    raise AssertionError(
-        f"Dataset not attached -- Add-ons -> Data -> attach your {slug} dataset "
-        f"(checked: {candidates})"
-    )
+**Cell 2 — copy code, fonts, CORS hot-patch, smart dependency install.** The biggest
+cell in the notebook, doing nine things in a load-bearing order (`fmt-cell2-v3` in
+the notebook):
 
-DATASET_DIR = find_dataset_dir(DATASET_SLUG)
-print("Dataset found at:", DATASET_DIR)
-print(subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"],
-                      capture_output=True, text=True).stdout)
-```
-Expect a `Dataset found at: ...` line followed by two lines naming
-`Tesla T4, 15360 MiB` (or similar). If this cell raises the `AssertionError`, the
-printed `checked:` list shows every path it looked at — compare that against
-`os.listdir("/kaggle/input")` (and, if present, `os.listdir("/kaggle/input/datasets")`)
-to see what Kaggle actually named your mount. If GPU output is empty instead, the
-accelerator setting wasn't applied — fix it in the side panel and restart the session
-before continuing.
-
-**Cell 2 — copy code + install dependencies.** Kaggle's disk under `/kaggle/input` is
-read-only; copy to `/kaggle/working` first, from `DATASET_DIR` (resolved by Cell 1, so
-this works regardless of which mount layout Kaggle used for your session). Kaggle's
-base image already ships a recent torch build — check it before reinstalling the
-pinned CUDA wheel, since a fresh `pip install torch==2.6.0 --index-url .../cu124`
-costs several minutes you can usually skip:
-```python
-import shutil, subprocess, sys, torch
-
-shutil.copytree(os.path.join(DATASET_DIR, "core_pipeline"),
-                 "/kaggle/working/core_pipeline", dirs_exist_ok=True)
-%cd /kaggle/working/core_pipeline
-
-need_torch_reinstall = not (torch.__version__.startswith("2.6") and torch.cuda.is_available())
-if need_torch_reinstall:
-    subprocess.run([sys.executable, "-m", "pip", "install",
-                     "torch==2.6.0", "torchvision==0.21.0",
-                     "--index-url", "https://download.pytorch.org/whl/cu124"], check=True)
-
-subprocess.run([sys.executable, "-m", "pip", "install", "-r", "python/requirements.txt"], check=True)
-subprocess.run([sys.executable, "-m", "pip", "install", "-r", "backend_api/requirements.txt"], check=True)
-subprocess.run([sys.executable, "-m", "pip", "install", "pyngrok"], check=True)
-```
-`python/requirements.txt` and `backend_api/requirements.txt` are two separate files in
-this repo (the pipeline's ML deps vs. the FastAPI layer) — both are needed; the
-repo's own `backend_api/Dockerfile` only installs the second one and is not a complete
-reference for this deployment.
+1. **Copy** `DATASET_DIR/core_pipeline` → `/kaggle/working/core_pipeline` (`/kaggle/input`
+   is read-only).
+2. **Hot-patch the copy's CORS config** to allow ngrok's interstitial-bypass header
+   (see the note in §3 about this being a temporary patch, not a permanent fix).
+3. **Fonts.** The dataset ships no fonts (verified: zero files matching `font` in the
+   zip) and the vendored `ComicNeue-{Bold,Regular}.ttf` live outside `core_pipeline`
+   in this repo, so they never make it into the dataset at all. Step 8's typesetting
+   font-resolution chain (`run_step8_typeset.py`) tries Windows paths first, then a
+   bundled-fonts directory that — on Kaggle's `cwd=/kaggle/working/core_pipeline` —
+   resolves to `/kaggle/working/fonts`, then finally `/usr/share/fonts/truetype/dejavu/`.
+   This cell downloads both ComicNeue fonts from Google's official Fonts repo into
+   exactly that path, **validates each one actually loads** with `PIL.ImageFont`
+   (a truncated download would otherwise sit there looking valid and render garbage
+   text later), and deletes anything that fails validation. It only raises if
+   ComicNeue failed **and** the DejaVu fallback is also absent — otherwise you get a
+   working font, just possibly not the intended comic-style one.
+4. **Torch**: keeps the preinstalled build if it's already CUDA-capable ≥ 2.6 (Kaggle's
+   2025-era image shipped torch 2.6.0+cu124 preinstalled), otherwise installs the
+   pinned `cu124` wheels.
+5. **Uninstall-first**: removes any preinstalled `onnxruntime` (CPU build), and every
+   `opencv-*` variant, before installing anything — a CPU `onnxruntime` package can
+   **silently shadow** `onnxruntime-gpu` (the pipeline's ONNX text detector and LaMa
+   inpainter create a CUDA-only `InferenceSession` with no CPU fallback — this is a
+   hard crash on every request, not a slowdown), and Kaggle images commonly preinstall
+   `opencv-python-headless`, which conflicts with this repo's pinned non-headless
+   `opencv-python` (both packages own the same `cv2/` namespace — having both installed
+   corrupts the import).
+6. **Filtered install**: writes a copy of `python/requirements.txt` with the
+   torch/torchvision lines dropped (when keeping the preinstalled build) and
+   `opencv-python` swapped for `opencv-python-headless`, then installs it, then
+   `backend_api/requirements.txt`, then `pyngrok`.
+7. **Post-install cleanup**: `ultralytics` and `paddleocr`/`paddlex`
+   transitively pull non-headless `opencv-python` back in even after the filtered
+   install — this cell uninstalls it again and force-reinstalls
+   `opencv-python-headless` last, with `--no-deps` so nothing re-drags it back a
+   second time.
+8. **`onnxruntime-gpu` CUDA pin** — found via a live run, not the original audit:
+   the requirements' `onnxruntime-gpu>=1.26.0` resolves to 1.27.0+, which switched its
+   default build from CUDA 12 to CUDA 13 (`libcudart.so.13`, absent on Kaggle's
+   CUDA-12.4 box) — import fails outright. Force-reinstalls the pinned
+   `onnxruntime-gpu==1.26.0`, the last version still defaulting to CUDA 12.
+9. **`torchaudio` version pin** — also found via a live run: some transitive dependency
+   (transformers/easyocr audio extras) pulls in a `torchaudio` build mismatched with
+   the reused `torch==2.6.0+cu124`, breaking with an `undefined symbol` error the
+   first time anything imports it (during warmup, not at install time — so this one
+   doesn't surface until Cell 5). Force-reinstalls a matching `torchaudio==2.6.0` from
+   the same `cu124` index used for torch/torchvision.
+10. **Smoke test**: in a **fresh subprocess** (this kernel may still hold stale
+   imports of packages just uninstalled), scans installed distributions (exactly
+   one opencv variant, `onnxruntime-gpu` present and plain `onnxruntime` absent) and
+   creates a **real** `onnxruntime.InferenceSession` on the actual text-detector model
+   with `providers=['CUDAExecutionProvider']`, asserting CUDA is the active provider —
+   `get_available_providers()` alone would only prove the wheel *compiled with* CUDA
+   support, not that it can actually *initialize* it on this VM's driver/cuDNN stack.
 
 **Cell 3 — load secrets into environment.** Reads each provider's key straight from its
 own small Kaggle Secret into `os.environ` — **no `.env` file is ever written to disk**.
 A provider whose secret was never created (§4 Step 2) is simply left unconfigured,
-matching how an unfilled line in a local `.env` already behaves. Non-secret pipeline
-tuning is hardcoded in the same cell since none of it is sensitive — this mirrors the
-values in this repo's own `.env.example`; edit them directly if you want Kaggle to run
-with different settings than your local machine. `FMT_AUTH_TOKEN` is set directly as a
-process environment variable (the backend reads it once at import time), and —
-critically — **nothing here is printed**:
-```python
-import os
-from kaggle_secrets import UserSecretsClient
+matching how an unfilled line in a local `.env` already behaves. `FMT_AUTH_TOKEN` is
+read with `.strip()` and the cell **raises if it's missing or empty after stripping** —
+a token that silently collapsed to `""` would leave every gated route armed only by
+the `X-Fmt-Client` header, which is public (it's in this repo's own source), so this
+cell refuses to start with auth silently disabled on a public tunnel rather than fail
+open. Non-secret pipeline tuning is hardcoded in the same cell since none of it is
+sensitive — this mirrors the values in this repo's own `.env.example`; edit them
+directly if you want Kaggle to run with different settings than your local machine.
+**Nothing here is ever printed.**
 
-secrets = UserSecretsClient()
+The printed summary line (`Configured providers (N/10): ...`) is your first real
+verification checkpoint — it lists which providers loaded (never their values) before
+you've even reached Cell 4. If a provider you expected is missing from it, its secret
+either wasn't created or wasn't toggled ON for this notebook (§4).
 
-def optional_secret(label):
-    try:
-        return secrets.get_secret(label) or ""
-    except Exception:
-        return ""
-
-PROVIDER_SECRET_LABELS = [
-    "GEMINI_API_KEYS", "GITHUB_API_KEYS", "GROQ_API_KEYS", "MISTRAL_API_KEYS",
-    "OPENROUTER_API_KEYS", "CEREBRAS_API_KEYS", "FIREWORKS_API_KEYS",
-    "CLOUDFLARE_WORKERS_API_KEYS", "CLOUDFLARE_ACCOUNT_IDS", "NVIDIA_NIM_API_KEYS",
-]
-configured = []
-for label in PROVIDER_SECRET_LABELS:
-    value = optional_secret(label)
-    if value:
-        os.environ[label] = value
-        configured.append(label.replace("_API_KEYS", "").replace("_ACCOUNT_IDS", ""))
-
-os.environ["FMT_AUTH_TOKEN"] = secrets.get_secret("FMT_AUTH_TOKEN")
-
-os.environ.update({
-    "TRANSLATION_PROVIDER_ORDER": "mistral,cerebras,fireworks,groq,nvidia,github,openrouter,gemini,cloudflare",
-    "USE_API_TRANSLATION": "auto",
-    "LOCAL_TRANSLATOR_MODEL": "facebook/nllb-200-distilled-600M",
-    "NVIDIA_KEY_ROLES": "translation,vision_ocr,backup",
-    "OPENROUTER_KEY_ROLES": "translation,translation,vision_ocr,backup",
-    "FMT_STARTUP_WARMUP": "0",
-    "FMT_GPU_IDLE_UNLOAD_SECONDS": "600",
-})
-print(f"Configured providers ({len(configured)}/10): {', '.join(configured) or 'none'}")
-print("Secrets loaded (values not shown).")
-```
-The printed summary line is your first real verification checkpoint — it lists which
-providers loaded (never their values) before you've even reached cell 4. If a provider
-you expected is missing from it, its secret either wasn't created or wasn't toggled ON
-for this notebook (§4).
-
-Why no `.env` file at all, unlike the retired design: `api_manager.py`'s `_load_env`
-uses `load_dotenv(path, override=True)` — if a `.env` file were found anywhere on its
+Why no `.env` file at all: `api_manager.py`'s `_load_env` uses
+`load_dotenv(path, override=True)` — if a `.env` file were found anywhere on its
 search path, *its* values would silently win over anything already set in `os.environ`
 by this cell. Since the dataset zip never includes a `.env` file (§3 excludes it) and
 this cell doesn't write one, `_load_env` finds nothing on Kaggle and logs a purely
@@ -506,99 +500,60 @@ with no override risk.
 
 **Cell 4 — launch the backend.** Runs uvicorn exactly the way `start_backend.ps1` does
 locally (same working directory, same module path), as a background subprocess so the
-notebook cell returns immediately and later cells can run:
-```python
-import subprocess, sys
+notebook cell returns immediately and later cells can run. Re-run safe: terminates any
+backend this notebook already started (and, as a belt-and-braces fallback, `pkill`s any
+stray uvicorn process matching this app) before launching a new one — otherwise a
+re-run leaks the old process holding port 8766 and the new one fails to bind. The bind
+stays on **127.0.0.1**, not `0.0.0.0` — the tunnel client (Cell 6) runs on this same VM
+and reaches the backend over loopback, so there is never a reason to bind a wider
+interface here; doing so would only expand the Kaggle VM's own attack surface for no
+benefit.
 
-backend_log = open("/kaggle/working/backend.log", "w")
-backend_proc = subprocess.Popen(
-    [sys.executable, "-m", "uvicorn", "backend_api.app.main:app",
-     "--host", "127.0.0.1", "--port", "8766"],
-    cwd="/kaggle/working/core_pipeline",
-    stdout=backend_log, stderr=subprocess.STDOUT,
-)
-print(f"Backend starting, pid={backend_proc.pid}. Logs: /kaggle/working/backend.log")
-```
-The bind stays on **127.0.0.1**, not `0.0.0.0` — the tunnel client (cell 6) runs on
-this same VM and reaches the backend over loopback, so there is never a reason to bind
-a wider interface here; doing so would only expand the Kaggle VM's own attack surface
-for no benefit.
+**Cell 5 — wait for health + force warmup.** Polls `/v1/health` (up to 5 minutes),
+checking after every poll whether the backend process has actually **died** —
+if it has, this cell prints the last 60 lines of `backend.log` and raises immediately,
+instead of waiting out the rest of the timeout for nothing. Once healthy, it forces
+`/v1/warmup` (loads manga_ocr, the text/bubble detectors, magi, the inpainting models)
+and polls for up to **20 minutes**, since a first-ever run downloads several GB
+(magi, manga-ocr, EasyOCR, the ~2.4GB NLLB translator — see §7). Requests now send
+**`X-Fmt-Auth` alongside `X-Fmt-Client`**, because `/v1/warmup` is one of the routes
+gated by `FMT_AUTH_TOKEN` (Cell 3 always sets it) — sending only `X-Fmt-Client`, as an
+earlier version of this cell did, gets a `403` here and crashes the cell.
 
-**Cell 5 — wait for health + force warmup.** Polls `/v1/health` until the process
-actually accepts connections, then forces `/v1/warmup` (loads manga_ocr, the text/
-bubble detectors, magi, the inpainting models, fonts) and polls until it reports
-`pass`:
-```python
-import time, urllib.request, json
-
-def get_json(url, method="GET"):
-    req = urllib.request.Request(url, method=method,
-                                  headers={"X-Fmt-Client": "free-manga-translator-extension"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.load(resp)
-
-for _ in range(30):
-    try:
-        get_json("http://127.0.0.1:8766/v1/health")
-        break
-    except Exception:
-        time.sleep(2)
-else:
-    raise RuntimeError("Backend did not come up -- check /kaggle/working/backend.log")
-
-get_json("http://127.0.0.1:8766/v1/warmup", method="POST")
-for _ in range(60):
-    status = get_json("http://127.0.0.1:8766/v1/health")["warmup"]["status"]
-    print("warmup:", status)
-    if status in ("pass", "fail"):
-        break
-    time.sleep(5)
-```
-See §7 for realistic timing (first-ever run vs. a warm cache).
+**Cell 5b — loopback end-to-end translate (new).** The single highest-value check in
+the whole notebook. Before any tunnel exists, this cell POSTs a real sample manga page
+(`samples/sample1/sample.jpg`, bundled in the dataset) to
+`127.0.0.1:8766/v1/translate-image` with both headers, asserts the response status is
+`pass`, prints a report summary, and displays the translated image inline. This single
+request exercises the CUDA ONNX text detector, OpenCV, PaddleOCR, EasyOCR, the LaMa
+inpainter, the fonts installed in Cell 2, and whichever translation provider keys you
+configured — all at once. **If this cell passes, the pipeline itself is proven working
+end to end**, and any problem you hit afterward is tunnel- or extension-side, not
+pipeline-side — a genuinely useful thing to know before debugging blind.
 
 **Cell 6 — open the tunnel.** Uses `pyngrok` with your static domain, so the public URL
-is the same every session:
-```python
-from pyngrok import ngrok, conf
-from kaggle_secrets import UserSecretsClient
-
-secrets = UserSecretsClient()
-conf.get_default().auth_token = secrets.get_secret("NGROK_AUTHTOKEN")
-
-# Replace with the exact static domain you claimed in the ngrok dashboard (§2).
-STATIC_DOMAIN = "yourname-something.ngrok-free.app"
-tunnel = ngrok.connect(8766, domain=STATIC_DOMAIN)
-print("Public URL:", tunnel.public_url)
-print("Paste this into the extension popup's Local Pipeline URL field:")
-print(f"  {tunnel.public_url}/v1/translate-image")
-```
+is the same every session. Re-run safe: calls `ngrok.kill()` first, since the free
+tier only allows one active agent session and a bare re-run of `ngrok.connect` on the
+same domain fails with `ERR_NGROK_334`/`108`. The domain comes from the optional
+`NGROK_STATIC_DOMAIN` secret if you created one (§4), otherwise from the
+`STATIC_DOMAIN` constant — **edit that constant to your claimed domain** if you didn't
+create the secret; the cell raises immediately if neither is a real domain, rather
+than opening a tunnel to a placeholder.
 
 **Cell 7 — keep the session alive.** Kaggle interactive sessions can idle-disconnect;
 this cell just keeps the notebook actively running and periodically confirms the
 backend is still healthy, so you have a live signal in the notebook output if
-something crashes:
-```python
-import time
-while True:
-    try:
-        status = get_json("http://127.0.0.1:8766/v1/health")
-        print(time.strftime("%H:%M:%S"), "ok, warmup:", status["warmup"]["status"],
-              "active jobs:", status["scheduler"]["active"])
-    except Exception as e:
-        print(time.strftime("%H:%M:%S"), "backend check failed:", e)
-    time.sleep(60)
-```
-Interrupt this cell (■ Stop) when you're done reading and want to move to the shutdown
-cell — it's an intentional infinite loop, not a bug.
+something crashes. Interrupt it (■ Stop) when you're done reading and want to move to
+the shutdown cell — it's an intentional infinite loop, not a bug. **This loop does NOT
+defeat Kaggle's idle watchdog** (§7) — a running cell isn't counted as user
+interaction, only clicks/keystrokes in the tab are. Don't start this cell during
+initial setup; only start it at handoff, once Cells 1-6 have all passed.
 
-**Cell 8 — clean shutdown.** Closes the tunnel and stops the backend. Nothing is
-written to disk by Cell 3 in this design, so there's no leftover secrets file to clean
-up:
-```python
-ngrok.disconnect(tunnel.public_url)
-backend_proc.terminate()
-print("Shut down cleanly.")
-```
+**Cell 8 — clean shutdown.** Uses `ngrok.kill()` rather than
+`ngrok.disconnect(tunnel.public_url)`, since the latter raises a `NameError` if the
+kernel was ever restarted and `tunnel` no longer exists in memory — `ngrok.kill()`
+works regardless of kernel state. Nothing is written to disk by Cell 3 in this design,
+so there's no leftover secrets file to clean up.
 
 ---
 
@@ -622,6 +577,12 @@ does not change between Kaggle sessions. Every future session, you only need to 
 the notebook (cells 1-6); the extension side needs nothing further, unless you rotate
 your `FMT_AUTH_TOKEN`.
 
+**You don't need to do anything about ngrok's browser-warning interstitial.** The
+extension's `fmtHeaders()` (`background.js`) already sends the documented bypass
+header (`ngrok-skip-browser-warning`) on every backend request, unconditionally — it's
+harmless against a plain local backend, which just ignores the extra header. This is
+built into the extension itself, not something this deployment adds.
+
 **What works remotely vs. what doesn't**, so you're not surprised:
 
 | Popup feature | Works remotely? |
@@ -639,13 +600,23 @@ your `FMT_AUTH_TOKEN`.
 
 ## 7. Operational reality — what to actually expect
 
-**Kaggle GPU quota:** 30 GPU-hours per week (resets weekly), and a **~12-hour maximum
-continuous session** even within quota. Plan reading sessions accordingly; the notebook
-does not auto-restart itself when a session ends — you'll need to re-run it.
+**Kaggle GPU quota:** 30 GPU-hours per week (resets weekly), and a **9-hour maximum
+continuous session** even within quota — there is no way to extend a single session
+past that. Plan reading sessions accordingly; the notebook does not auto-restart
+itself when a session ends — you'll need to re-run Cells 1-6 (all idempotent, §5).
 
-**Idle behavior:** Kaggle can disconnect an interactive session that appears idle in
-the browser tab. Keep the notebook tab open and occasionally check it; cell 7's
-keep-alive loop helps but is not a guarantee against Kaggle's own idle policy.
+**Idle watchdog — read this, it's not what Cell 7 makes it look like.** Kaggle kills
+an interactive session after roughly **60 minutes with no interaction in the browser
+tab** — and critically, **a running cell does not count as interaction**. Cell 7's
+keep-alive loop keeps the *kernel* busy, which is necessary but not sufficient; Kaggle
+still expects UI interaction (a click, a keystroke) roughly hourly and will show an
+"are you still there?" prompt. Keep the notebook tab open and actually interact with
+it occasionally, even while Cell 7 is running — don't rely on the loop alone to keep
+an unattended session alive for hours.
+
+**Only interactive sessions work for this deployment.** A "Save Version"/batch commit
+run executes headless to completion and its tunnel URL isn't reachable the way you
+need — always run this as a live interactive session, not a scheduled/committed one.
 
 **Cold-start timing** (first run on a fresh session, nothing cached):
 - pip installs (cell 2): **5-10 minutes**, most of it Paddle/PaddleOCR and (if
@@ -669,6 +640,13 @@ faster — a T4 is a real datacenter GPU) **plus** the round-trip over the tunne
 image upload and translated-image download. For typical manga page sizes this tunnel
 overhead is small compared to pipeline time, but it is not zero — expect slightly
 higher latency than a purely local setup, especially on a slower home connection.
+
+**ngrok free-tier egress cap: 1GB/month.** Every translated page comes back as a
+base64 data URL (≈1.33× the raw image bytes), so realistically budget **~400-700
+translated pages per month** on the free tier before you hit the cap (depends heavily
+on page resolution). For light personal reading this is unlikely to matter; for heavy
+use, switch to the `cloudflared` fallback in §9, which has no such bandwidth cap
+(trading away the static-domain convenience — see §9 for that trade-off).
 
 **Tunnel blips and the offline circuit breaker:** the extension's circuit breaker
 (`background.js`) trips on a genuine network-level failure (`TypeError` from a failed
@@ -810,6 +788,14 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 | Dataset not visible in notebook at all | Forgot to attach it, or uploaded under a different name | Add-ons → Data → attach; the name must match `DATASET_SLUG` in cell 1 |
 | A secret you created won't stay in the Secrets list (reverts to "No secrets added" right after Save) | Not confirmed — no documented Kaggle limit matches this; possibly a transient session/browser issue | Follow the go/no-go branch in §4 Step 1: hard refresh, try incognito/a different browser, save the notebook first, or wait a few minutes and retry |
 | A provider you expected doesn't show up in cell 3's "Configured providers" printout | Its secret wasn't created, or was created but not toggled ON for this notebook | Add-ons → Secrets → check the label matches exactly and the toggle is ON, then re-run cell 3 |
+| Cell 2's smoke test fails with `session.get_providers()[0] != 'CUDAExecutionProvider'` (or an ORT provider/cuDNN error) | A CPU `onnxruntime` package shadowed `onnxruntime-gpu`, or the CUDA/cuDNN stack didn't initialize | Re-run cell 2 (idempotent — it uninstalls onnxruntime variants before reinstalling); if it persists, restart the session and re-run cells 1-2 fresh |
+| `onnxruntime` import fails with `libcudart.so.13: cannot open shared object file` | `onnxruntime-gpu` resolved to 1.27.0+, which switched its default CUDA build from 12 to 13 — Kaggle's box only has CUDA 12.4 | Cell 2 already pins `onnxruntime-gpu==1.26.0` (step 6b) specifically for this; if a future Kaggle image ships a newer CUDA, that pin may need bumping — check `torch.version.cuda` in Cell 1's preflight output first |
+| Warmup fails with `libtorchaudio.so: undefined symbol: aoti_torch_abi_version` | A transitive dependency (transformers/easyocr audio extras) pulled in a `torchaudio` build that doesn't match the reused `torch==2.6.0+cu124` | Cell 2 already force-reinstalls a matching `torchaudio==2.6.0` from the same `cu124` index as torch (step 6c) specifically for this |
+| Cell 2's smoke test fails with a stray-opencv-dist assertion, or `cv2` import errors mentioning `cv2.dnn`/missing attributes | Two opencv variants installed simultaneously (dual-`cv2` corruption) — usually `ultralytics` or `paddleocr` re-pulling non-headless `opencv-python` | Re-run cell 2 — its post-install cleanup step force-reinstalls `opencv-python-headless` last with `--no-deps` specifically to fix this |
+| Any import error mentioning `_ARRAY_API not found` or "compiled using NumPy 1.x" | numpy ABI mismatch — something upgraded numpy without recompiling against it | Restart the Kaggle session and re-run cells 1-2 fresh; don't `pip install --upgrade numpy` manually mid-session |
+| Cell 5/5b requests return the ngrok interstitial HTML instead of JSON (only after the tunnel is up — see §9 for pre-tunnel testing) | The `ngrok-skip-browser-warning` header wasn't sent, or is being stripped somewhere upstream | The extension already sends this header on every request (§6); if you're testing with `curl` directly, add `-H "ngrok-skip-browser-warning: 1"` |
+| `ERR_NGROK_334` or `ERR_NGROK_108` when opening the tunnel | A previous tunnel session on this domain/account is still open (common after a notebook re-run) | Cell 6 already calls `ngrok.kill()` before connecting — if you're still seeing this, the *previous* session may be running in a different notebook or browser tab; close it first |
+| Cell 4 fails with "address already in use" on port 8766 | A previous backend process from this notebook is still holding the port | Cell 4 already kills any prior backend it started before launching a new one — if you're still seeing this, another notebook/session is bound to 8766; restart the Kaggle session |
 
 ---
 
@@ -819,9 +805,11 @@ For when you've already read the above once and just need the checklist:
 
 1. Kaggle: phone-verified, GPU T4×2 + Internet on, dataset attached, `NGROK_AUTHTOKEN`
    + `FMT_AUTH_TOKEN` + one secret per provider you use attached (§4).
-2. Run notebook cells 1-6 (`deploy/kaggle/fmt_kaggle_backend.ipynb`).
-3. Copy the printed public URL + `/v1/translate-image`.
+2. Run notebook cells 1-5b (`deploy/kaggle/fmt_kaggle_backend.ipynb`) — Cell 5b's
+   loopback translate passing means the pipeline itself is proven working before you
+   touch the tunnel or the extension.
+3. Run Cell 6, copy the printed public URL + `/v1/translate-image`.
 4. Extension popup → Local Pipeline URL = that value, Backend auth token = your
    `FMT_AUTH_TOKEN`, Save.
-5. Translate normally. Cell 7 keeps the session alive; cell 8 shuts down cleanly when
-   you're done.
+5. Translate normally. Cell 7 keeps the session alive (but see §7 — you still need to
+   interact with the tab roughly hourly); Cell 8 shuts down cleanly when you're done.
