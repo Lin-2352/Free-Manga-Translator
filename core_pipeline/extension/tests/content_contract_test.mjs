@@ -25,6 +25,7 @@ let holdUrl = null;
 let resolveHeldUrl = null;
 let noTextRescuedUrl = null;
 let errorTriggerUrl = null;
+let offlineTriggerUrl = null;
 const documentListeners = new Map();
 let fakePanelOverlayPresent = false;
 let elementsFromPointStack = [];
@@ -242,6 +243,9 @@ const sandbox = {
         if (message.kind === 'translateImage') translateRequests.push(message);
         if (message.kind === 'translateImage' && message.originalImageUrl === errorTriggerUrl) {
           return { error: 'LOCAL_PIPELINE_500' };
+        }
+        if (message.kind === 'translateImage' && message.originalImageUrl === offlineTriggerUrl) {
+          return { error: 'PIPELINE_OFFLINE' };
         }
         if (message.kind === 'translateImage' && message.originalImageUrl === noTextRescuedUrl) {
           return {
@@ -864,6 +868,37 @@ await new Promise((resolve) => setTimeout(resolve, 10));
 assert.equal(translateRequests.length, requestsBeforeError + 2, 'clicking the badge issued a fresh translate request');
 assert.equal(badgeNode.removed, true, 'the badge is removed as soon as it is clicked');
 assert.equal(translatedAttrs.get('data-fmt-translated'), 'true', 'the retried translation succeeded and applied normally');
+
+// ===== PIPELINE_OFFLINE (background.js's circuit breaker) must be silent on the page -- no
+// spinner left showing, no error badge -- unlike every other terminal/retryable error above. =====
+fakeImages = [fakeImage];
+translatedAttrs.clear();
+removedAttrs.length = 0;
+const offlineUrl = 'https://example.test/offline-page.jpg';
+fakeImage.src = offlineUrl;
+fakeImage.currentSrc = offlineUrl;
+offlineTriggerUrl = offlineUrl;
+const appendedBeforeOffline = appendedNodes.length;
+const requestsBeforeOffline = translateRequests.length;
+
+contentListener({ kind: 'translatePageOnce' }, {}, () => {});
+await new Promise((resolve) => setTimeout(resolve, 10));
+
+assert.equal(translateRequests.length, requestsBeforeOffline + 1, 'exactly one attempt was sent for the offline response');
+assert.equal(translatedAttrs.has('data-fmt-processing'), false, 'the processing marker (and its spinner) is cleared immediately, not left spinning');
+const offlineBadge = appendedNodes.slice(appendedBeforeOffline).find((node) => node.className === 'fmt-img-error-badge');
+assert.equal(offlineBadge, undefined, 'PIPELINE_OFFLINE never shows a visible error badge on the page -- the offline state only surfaces in the popup');
+// The resume retry is scheduled with a 12s delay; this harness's setTimeout mock only fires
+// callbacks scheduled at <=20ms (see the sandbox.setTimeout override above) and drops longer
+// ones, so the actual auto-resume firing is not exercised here -- only the synchronous,
+// immediately-observable page state (no spinner, no badge) that this test targets.
+offlineTriggerUrl = null;
+// This image is deliberately left unsettled (not translated, not error-badged, eligible for a
+// silent future retry) -- unlike every other scenario above, which always resolves an image to a
+// terminal state before the next section runs. Clear it out of fakeImages so a later section's
+// own setup (e.g. changing the queue limit, which rescans whatever fakeImages currently holds)
+// doesn't accidentally pick up and re-translate this still-pending image as a side effect.
+fakeImages = [];
 
 // ===== Panel picker (manual "inspect element"-style target selection) =====
 const pickerCandidate = makeQueueImage(

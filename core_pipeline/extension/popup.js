@@ -21,6 +21,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const recentTranslations = document.getElementById('recentTranslations');
   const queueItemsList = document.getElementById('queueItemsList');
   const localPipelineUrl = document.getElementById('localPipelineUrl');
+  const localPipelineAuthToken = document.getElementById('localPipelineAuthToken');
   const localPipelineLanguage = document.getElementById('localPipelineLanguage');
   const translationCachePages = document.getElementById('translationCachePages');
   const translationQueuePages = document.getElementById('translationQueuePages');
@@ -110,11 +111,13 @@ document.addEventListener('DOMContentLoaded', () => {
       'mangaFontColor',
       'localPipelineUrl',
       'localPipelineLanguage',
+      'localPipelineAuthToken',
     ]);
 
     translationToggle.checked = result.translationEnabled === true;
     localPipelineUrl.value = result.localPipelineUrl || DEFAULT_LOCAL_PIPELINE_URL;
     localPipelineLanguage.value = result.localPipelineLanguage || 'ja';
+    if (localPipelineAuthToken) localPipelineAuthToken.value = result.localPipelineAuthToken || '';
     translationCachePages.value = String(result.translationCachePages ?? DEFAULT_CACHE_LIMIT);
     translationQueuePages.value = String(result.translationQueuePages ?? DEFAULT_QUEUE_LIMIT);
     translationParallelPages.value = String(result.translationParallelPages ?? DEFAULT_PARALLEL_LIMIT);
@@ -335,6 +338,19 @@ document.addEventListener('DOMContentLoaded', () => {
       statsText.textContent = parts.length ? parts.join(' Â· ') : 'ready';
 
       renderQueueItems(Array.isArray(response.items) ? response.items : []);
+
+      // Live signal from background.js's own network-level failure detection (the circuit
+      // breaker) -- flips the badge to Offline within one poll cycle of a real dispatch failing,
+      // instead of waiting for the user to close/reopen the popup or hit Save (checkServerHealth's
+      // only two call sites). Intentionally asymmetric: this only ever pushes the badge TOWARD
+      // Offline, never away from it -- pipelineBreakerOpen === false just means no recent
+      // network-level failure was observed, which is weaker than an actual health-check response,
+      // so checkServerHealth() remains the sole source of truth for "Reachable".
+      if (response.pipelineBreakerOpen === true) {
+        apiStatus.classList.remove('active');
+        apiStatus.classList.add('error');
+        setEngineStatus('Offline — will resume automatically');
+      }
     });
   }
 
@@ -789,6 +805,7 @@ document.addEventListener('DOMContentLoaded', () => {
         await chrome.storage.local.set({
           localPipelineUrl: value,
           localPipelineLanguage: localPipelineLanguage.value || 'ja',
+          localPipelineAuthToken: localPipelineAuthToken ? localPipelineAuthToken.value.trim() : '',
         });
         await runtimeMessage({ kind: 'clearCache' });
       });

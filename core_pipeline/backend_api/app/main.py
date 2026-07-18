@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hmac
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -40,7 +42,7 @@ app.add_middleware(
     allow_origin_regex=r"^(chrome-extension://.*|http://127\.0\.0\.1(:\d+)?|http://localhost(:\d+)?)$",
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Fmt-Client"],
+    allow_headers=["Content-Type", "Authorization", "X-Fmt-Client", "X-Fmt-Auth"],
 )
 
 # Every route except the bare health check requires this header. It buys two things cheaply:
@@ -52,12 +54,25 @@ app.add_middleware(
 EXTENSION_CLIENT_HEADER = "X-Fmt-Client"
 EXTENSION_CLIENT_VALUE = "free-manga-translator-extension"
 
+# Optional real auth, layered on top of the client-header gate above rather than replacing it.
+# Unset (the default for every local/loopback deployment) => byte-identical to today's behavior,
+# nothing below ever runs. Set (e.g. when this server is reachable over a public tunnel, such as
+# the Kaggle-GPU deployment path) => every gated route also requires this exact token in
+# X-Fmt-Auth. FMT_AUTH_TOKEN is read once at import time like the rest of this module's
+# environment-derived constants; a running server picking up a changed token needs a restart,
+# same as every other env-derived setting here.
+FMT_AUTH_TOKEN = os.environ.get("FMT_AUTH_TOKEN", "").strip()
+AUTH_HEADER = "X-Fmt-Auth"
+
 
 def _require_extension_client(
-    x_fmt_client: str | None = Header(default=None, alias=EXTENSION_CLIENT_HEADER)
+    x_fmt_client: str | None = Header(default=None, alias=EXTENSION_CLIENT_HEADER),
+    x_fmt_auth: str | None = Header(default=None, alias=AUTH_HEADER),
 ) -> None:
     if x_fmt_client != EXTENSION_CLIENT_VALUE:
         raise HTTPException(status_code=403, detail="Missing or invalid client header")
+    if FMT_AUTH_TOKEN and not hmac.compare_digest(x_fmt_auth or "", FMT_AUTH_TOKEN):
+        raise HTTPException(status_code=403, detail="Missing or invalid auth token")
 
 
 _GATED = [Depends(_require_extension_client)]

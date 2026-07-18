@@ -31,6 +31,7 @@
   const CACHE_KEY_ATTR = 'data-fmt-cache-key';
   const MAX_RETRIES = 3;
   const BASE_RETRY_DELAY = 3000;
+  const PIPELINE_OFFLINE_RETRY_DELAY_MS = 12000;
   const DEFAULT_AUTO_QUEUE_LIMIT = 20;
   const MAX_AUTO_QUEUE_LIMIT = 50;
   const EXTENSION_VERSION = '1.1.15';
@@ -1217,6 +1218,21 @@
           queueLimit: response.queueLimit,
         });
         if (response.error === 'TranslationPaused') {
+          cleanupProcessing(img, cacheKey);
+          return;
+        }
+        if (response.error === 'PIPELINE_OFFLINE') {
+          // Backend confirmed unreachable (background.js's circuit breaker). Unlike the bounded
+          // retry path below, this does NOT count against MAX_RETRIES and never shows an error
+          // badge on the page -- the outage could last arbitrarily long, and the offline state is
+          // only surfaced in the extension popup, not on every image on the page.
+          // cleanupProcessing already hid this image's spinner (fast short-circuit, not a hang);
+          // just reschedule silently and let the breaker's own recovery probe resume it.
+          setTimeout(() => {
+            img.removeAttribute(PROCESSING_ATTR);
+            pendingSrcs.delete(cacheKey);
+            translateImage(img, { force: options.force === true, originalSrc, cacheKey });
+          }, PIPELINE_OFFLINE_RETRY_DELAY_MS);
           cleanupProcessing(img, cacheKey);
           return;
         }

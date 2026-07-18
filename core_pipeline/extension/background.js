@@ -8,6 +8,16 @@ const APP_VERSION = '1.1.15';
 // closing an unpreflighted "simple request" CSRF gap against a companion API with no other auth.
 const FMT_CLIENT_HEADER = 'X-Fmt-Client';
 const FMT_CLIENT_VALUE = 'free-manga-translator-extension';
+// Optional second header, only sent when the user has set a token in the popup (e.g. the backend
+// is reachable over a public tunnel rather than loopback -- see docs/KAGGLE_DEPLOYMENT.md). Empty
+// or unset locally means this never gets added, so every existing local deployment is unaffected.
+const FMT_AUTH_HEADER = 'X-Fmt-Auth';
+
+function fmtHeaders(settings, extra = {}) {
+  const headers = { ...extra, [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE };
+  if (settings?.localPipelineAuthToken) headers[FMT_AUTH_HEADER] = settings.localPipelineAuthToken;
+  return headers;
+}
 const CACHE_VERSION = `local-8-step-v13-quality-performance-hardening-v${APP_VERSION}`;
 const DEFAULT_PARALLEL_LIMIT = 2;
 const MAX_PARALLEL_LIMIT = 3;
@@ -84,6 +94,42 @@ chrome.alarms?.onAlarm?.addListener((alarm) => {
 // await), so every admission check sees in-flight-but-not-yet-registered dispatches too.
 let reservedSlots = 0;
 
+// Tripped only by a fetch()-level rejection inside callLocalPipeline's own await -- the ONLY
+// place callLocalPipeline throws a TypeError; every other throw there (!response.ok branch,
+// LOCAL_PIPELINE_EMPTY_RESPONSE) is a plain Error, proving the server DID respond. So
+// error?.name === 'TypeError' is the precise, narrow signal for "server unreachable" -- distinct
+// from an ordinary PIPELINE_TIMEOUT (one slow request, server may still be alive) and distinct
+// from an HTTP error response (server IS reachable). Once tripped, new/retried dispatches
+// short-circuit instead of each independently re-waiting out settings.fetchTimeoutMs.
+let breakerOpen = false;
+let breakerOpenedAt = 0;
+let breakerNextProbeAt = 0;
+const BREAKER_PROBE_INTERVAL_MS = 12_000;
+
+function tripBreaker() {
+  if (breakerOpen) return;
+  breakerOpen = true;
+  breakerOpenedAt = nowMs();
+  breakerNextProbeAt = breakerOpenedAt + BREAKER_PROBE_INTERVAL_MS;
+  console.warn('[FMT] local pipeline appears unreachable; short-circuiting new requests until it recovers');
+}
+
+function resetBreaker() {
+  if (!breakerOpen) return;
+  breakerOpen = false;
+  breakerOpenedAt = 0;
+  breakerNextProbeAt = 0;
+}
+
+// false => short-circuit this dispatch with PIPELINE_OFFLINE instead of touching the network.
+function shouldAttemptDispatch() {
+  if (!breakerOpen) return true;
+  const now = nowMs();
+  if (now < breakerNextProbeAt) return false;
+  breakerNextProbeAt = now + BREAKER_PROBE_INTERVAL_MS;
+  return true;
+}
+
 let cacheLoaded = false;
 let isPaused = false;
 
@@ -150,6 +196,7 @@ async function getSettings() {
   const result = await chrome.storage.local.get([
     'localPipelineUrl',
     'localPipelineLanguage',
+    'localPipelineAuthToken',
     'translationCachePages',
     'translationQueuePages',
     'translationParallelPages',
@@ -162,6 +209,7 @@ async function getSettings() {
   return {
     localPipelineUrl: String(result.localPipelineUrl || DEFAULT_LOCAL_PIPELINE_URL).trim() || DEFAULT_LOCAL_PIPELINE_URL,
     localPipelineLanguage: String(result.localPipelineLanguage || 'ja').trim() || 'ja',
+    localPipelineAuthToken: String(result.localPipelineAuthToken || '').trim(),
     cacheLimit: Number.isFinite(cacheLimit)
       ? Math.max(0, Math.min(MAX_CACHE_LIMIT, cacheLimit))
       : DEFAULT_CACHE_LIMIT,
@@ -219,6 +267,7 @@ function buildQueueStats(settings) {
     items,
     isPaused,
     restartLost,
+    pipelineBreakerOpen: breakerOpen,
     pressurePercent: Math.min(100, Math.round(((activeCount + queuedCount) / capacity) * 100)),
   };
 }
@@ -331,7 +380,7 @@ async function sendDiagnosticLog(event, details = {}, settings = null) {
     await fetch(diagnosticLogUrlForPipeline(resolvedSettings.localPipelineUrl), {
       method: 'POST',
       cache: 'no-store',
-      headers: { 'Content-Type': 'application/json', [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+      headers: fmtHeaders(resolvedSettings, { 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
     });
   } catch {
@@ -355,7 +404,7 @@ async function postPipelineControl(settings, pathname) {
     const response = await fetch(backendUrlForPipeline(settings.localPipelineUrl, pathname), {
       method: 'POST',
       cache: 'no-store',
-      headers: { [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+      headers: fmtHeaders(settings),
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(responseErrorDetail(payload) || `CONTROL_${response.status}`);
@@ -375,7 +424,7 @@ async function requestPipelineWarmup(settings, force = false) {
     const response = await fetch(warmupUrlForPipeline(settings.localPipelineUrl), {
       method: 'POST',
       cache: 'no-store',
-      headers: { [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+      headers: fmtHeaders(settings),
     });
     if (!response.ok) warmupRequestedFor.delete(key);
     const payload = await response.json().catch(() => ({}));
@@ -441,7 +490,7 @@ async function getPipelineQuotaStatus(settings) {
     const response = await fetch(quotaUrlForPipeline(settings.localPipelineUrl), {
       method: 'GET',
       cache: 'no-store',
-      headers: { [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+      headers: fmtHeaders(settings),
     });
     if (!response.ok) throw new Error(`QUOTA_${response.status}`);
     return await response.json();
@@ -455,7 +504,7 @@ async function getPipelineVramStatus(settings) {
     const response = await fetch(vramUrlForPipeline(settings.localPipelineUrl), {
       method: 'GET',
       cache: 'no-store',
-      headers: { [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+      headers: fmtHeaders(settings),
     });
     if (!response.ok) throw new Error(`VRAM_${response.status}`);
     return await response.json();
@@ -469,7 +518,7 @@ async function openPipelineLogWindow(settings, logType) {
     const response = await fetch(logWindowUrlForPipeline(settings.localPipelineUrl, logType), {
       method: 'POST',
       cache: 'no-store',
-      headers: { [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+      headers: fmtHeaders(settings),
     });
     if (!response.ok) throw new Error(`LOG_WINDOW_${response.status}`);
     return await response.json();
@@ -678,7 +727,7 @@ async function callLocalPipeline(base64Data, width, height, settings, metadata =
   const traceId = metadata.traceId || makeTraceId('pipe');
   const response = await fetch(settings.localPipelineUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE },
+    headers: fmtHeaders(settings, { 'Content-Type': 'application/json' }),
     signal,
     body: JSON.stringify({
       imageData: base64Data,
@@ -777,6 +826,20 @@ async function processTranslation(message, options = {}) {
     return queueTranslation(message);
   }
 
+  // Placed after the parallel-limit admission check (so queued items still queue exactly as
+  // today) and before any AbortController/timeout/outgoingRequests bookkeeping below, so a
+  // short-circuit here never reserves a slot and never starts a timer. It DOES still need to
+  // recheck the keep-alive alarm: a message reaching here via the queue-drain path may have had
+  // ensureKeepAliveAlarm() called back when it was originally enqueued, and this return skips
+  // processTranslation's own finally block (the alarm's normal recheck point) entirely -- without
+  // this call, a burst that drains purely through short-circuits would leave the alarm dangling
+  // even though outgoingRequests/requestQueue both correctly settle back to empty.
+  if (!shouldAttemptDispatch()) {
+    sendDiagnosticLog('background.translate.breaker_open', { traceId, cacheId }, settings).catch(() => {});
+    maybeClearKeepAliveAlarm();
+    return { error: 'PIPELINE_OFFLINE' };
+  }
+
   const controller = new AbortController();
   activeControllers.set(cacheId, controller);
   options.onDispatched?.();
@@ -821,6 +884,7 @@ async function processTranslation(message, options = {}) {
         originalImageUrl: message.originalImageUrl || '',
         cacheId,
       }, controller.signal);
+      resetBreaker(); // a real attempt reached the server and got a real answer -- clearly back up
       if (isPaused) throw new Error('TranslationPaused');
       await putCachedResult(cacheId, result, settings, message.pageUrl);
       console.log(`[FMT] local pipeline done trace=${traceId} ${cacheId} in ${Math.round(nowMs() - startedAt)}ms`);
@@ -842,9 +906,22 @@ async function processTranslation(message, options = {}) {
       }, settings);
       return result;
     } catch (error) {
-      const messageText = error.name === 'AbortError'
-        ? (timedOut ? 'PIPELINE_TIMEOUT' : 'TranslationPaused')
-        : error.message;
+      if (error?.name === 'TypeError') {
+        // fetch() itself could not reach the server -- connection refused / offline / DNS fail.
+        tripBreaker();
+      } else if (error?.name !== 'AbortError') {
+        // Any other exception (HTTP error status, malformed response) proves the server IS
+        // reachable -- a stale "open" breaker must not keep short-circuiting on fresh evidence.
+        resetBreaker();
+      }
+      // AbortError (our own fetchTimeoutMs timeout) intentionally leaves breaker state untouched
+      // -- one slow request is not proof the whole backend is down.
+      const messageText = error?.name === 'TypeError'
+        // Normalize so the request that TRIPS the breaker reports the same code as every
+        // subsequent short-circuited request -- otherwise the first offline image would show a
+        // raw "Failed to fetch" while every later one shows PIPELINE_OFFLINE.
+        ? 'PIPELINE_OFFLINE'
+        : (error.name === 'AbortError' ? (timedOut ? 'PIPELINE_TIMEOUT' : 'TranslationPaused') : error.message);
       if (messageText !== 'TranslationPaused') console.error('[FMT] Local pipeline error:', messageText);
       await sendDiagnosticLog('background.translate.error', {
         traceId,

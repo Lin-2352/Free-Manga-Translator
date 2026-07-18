@@ -31,6 +31,7 @@ const elementIds = [
   'translationCachePages',
   'translationQueuePages',
   'translationParallelPages',
+  'localPipelineAuthToken',
   'saveLocalPipelineBtn',
   'apiStatus',
   'quotaCards',
@@ -48,6 +49,7 @@ const elementIds = [
   'queuedJobsText',
   'parallelJobsText',
   'queueMeterFill',
+  'queueItemsList',
   'clearQueueBtn',
   'engineStatusText',
   'hoverHelp',
@@ -101,6 +103,8 @@ let closed = false;
 let systemPrefersDark = false;
 const runtimeMessages = [];
 let pickerShouldStart = true;
+let statsItems = [];
+let statsPipelineBreakerOpen = false;
 const storageWrites = [];
 const documentElementAttrs = {};
 const documentElement = {
@@ -146,6 +150,7 @@ const helpPanelTarget = {
 
 const sandbox = {
   console,
+  URL,
   setTimeout: (callback) => {
     const id = nextTimerId++;
     pendingTimers.set(id, callback);
@@ -204,7 +209,18 @@ const sandbox = {
         runtimeMessages.push(message);
         let response = { success: true };
         if (message.kind === 'getTranslationStats') {
-          response = { cacheSize: 0, cacheLimit: 12, activeRequests: 0, queueLength: 0, queueLimit: 5, parallelLimit: 2, pressurePercent: 0, isPaused: false };
+          response = {
+            cacheSize: 0,
+            cacheLimit: 12,
+            activeRequests: statsItems.filter((item) => item.status === 'active').length,
+            queueLength: statsItems.filter((item) => item.status !== 'active').length,
+            queueLimit: 5,
+            parallelLimit: 2,
+            pressurePercent: 0,
+            isPaused: false,
+            items: statsItems,
+            pipelineBreakerOpen: statsPipelineBreakerOpen,
+          };
         }
         if (message.kind === 'checkPipelineHealth') {
           response = { ok: true, cacheSize: 0 };
@@ -299,6 +315,22 @@ vm.runInContext(source, sandbox, { filename: popupPath });
 assert.equal(typeof domReadyListener, 'function', 'popup registered DOMContentLoaded');
 
 await domReadyListener();
+assert.equal(elements.get('localPipelineAuthToken').value, '', 'auth token field is empty by default (no local deployment sends one)');
+elements.get('localPipelineAuthToken').value = '  my-tunnel-token  ';
+await elements.get('saveLocalPipelineBtn').listeners.click();
+assert.equal(
+  storageWrites.some((payload) => payload.localPipelineAuthToken === 'my-tunnel-token'),
+  true,
+  'Save trims and persists the auth token alongside the pipeline URL/language',
+);
+elements.get('localPipelineAuthToken').value = '';
+await elements.get('saveLocalPipelineBtn').listeners.click();
+assert.equal(
+  storageWrites.some((payload) => payload.localPipelineAuthToken === ''),
+  true,
+  'clearing the field and saving again persists an empty token, not the stale previous value',
+);
+
 await elements.get('startEngineBtn').listeners.click();
 assert.equal(
   runtimeMessages.some((message) => message.kind === 'startEngine'),
@@ -368,12 +400,43 @@ assert.equal(
   true,
   'Hard Stop calls the background hard-stop command',
 );
+statsItems = [
+  { status: 'active', pageHost: 'example.test', originalImageUrl: 'https://example.test/manga/page-1.jpg' },
+  { status: 'queued', position: 1, pageHost: 'example.test', originalImageUrl: 'https://example.test/manga/page-2.jpg' },
+];
 await elements.get('clearQueueBtn').listeners.click();
 assert.equal(
   runtimeMessages.some((message) => message.kind === 'clearQueue'),
   true,
   'Clear Queue calls the bounded queue cleanup command',
 );
+assert.equal(elements.get('queueItemsList').hidden, false, 'per-item queue list becomes visible once items are reported');
+const queueItemsHtml = elements.get('queueItemsList').innerHTML;
+assert.equal(queueItemsHtml.includes('page-1.jpg'), true, 'active item renders its image label');
+assert.equal(queueItemsHtml.includes('page-2.jpg'), true, 'queued item renders its image label');
+assert.equal(queueItemsHtml.includes('status-active'), true, 'active item gets the active status class');
+assert.equal(queueItemsHtml.includes('status-queued'), true, 'queued item gets the queued status class');
+statsItems = [];
+
+// The circuit breaker in background.js (pipelineBreakerOpen) is a live signal, distinct from
+// checkPipelineHealth -- it must be able to push the badge to Offline even though the health
+// check mock above already returned { ok: true }, since the breaker can trip well after the
+// popup's one-time health check ran.
+assert.equal(
+  elements.get('apiStatus').classList.toggles.some((t) => t.name === 'active' && t.enabled === true),
+  true,
+  'sanity: apiStatus was previously marked active by checkServerHealth',
+);
+statsPipelineBreakerOpen = true;
+await elements.get('clearQueueBtn').listeners.click();
+assert.equal(
+  elements.get('apiStatus').classList.removed.slice(-1)[0],
+  'active',
+  'a live breaker-open signal removes the active class even after an earlier healthy check',
+);
+assert.equal(elements.get('apiStatus').classList.added.slice(-1)[0], 'error', 'and marks the badge as error');
+assert.equal(elements.get('engineStatusText').textContent, 'Offline — will resume automatically', 'engine status text explains the outage is self-recovering');
+statsPipelineBreakerOpen = false;
 let messagesBefore = runtimeMessages.length;
 await elements.get('clearBtn').listeners.click();
 let clearPageMessages = runtimeMessages.slice(messagesBefore);

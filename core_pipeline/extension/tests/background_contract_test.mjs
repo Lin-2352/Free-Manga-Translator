@@ -11,7 +11,9 @@ const source = fs.readFileSync(backgroundPath, 'utf8');
 let messageListener;
 let fetchedUrl = '';
 let fetchedBody = null;
+let fetchedHeaders = null;
 let fetchCount = 0;
+let localPipelineAuthTokenSetting = '';
 let contentInjected = false;
 const contentMessages = [];
 const executedScripts = [];
@@ -19,6 +21,8 @@ let queueLimitSetting = 12;
 let parallelLimitSetting = 2;
 let localPipelineLanguageSetting = 'ja';
 const heldFetchResolvers = [];
+const alarmCalls = { create: 0, clear: 0 };
+let alarmActiveAccordingToMock = false;
 
 class MockFileReader {
   readAsDataURL() {
@@ -39,6 +43,7 @@ const sandbox = {
         get: async () => ({
           localPipelineUrl: 'http://127.0.0.1:8766/v1/translate-image',
           localPipelineLanguage: localPipelineLanguageSetting,
+          localPipelineAuthToken: localPipelineAuthTokenSetting,
           translationCachePages: 12,
           translationQueuePages: queueLimitSetting,
           translationParallelPages: parallelLimitSetting,
@@ -83,6 +88,18 @@ const sandbox = {
       },
     },
     action: { setIcon: () => {} },
+    alarms: {
+      create: (name) => {
+        alarmCalls.create += 1;
+        alarmActiveAccordingToMock = true;
+      },
+      clear: (name) => {
+        alarmCalls.clear += 1;
+        alarmActiveAccordingToMock = false;
+        return Promise.resolve(true);
+      },
+      onAlarm: { addListener: () => {} },
+    },
   },
   fetch: async (url, options = {}) => {
     if (String(url).includes('/v1/diagnostics/log')) {
@@ -94,6 +111,7 @@ const sandbox = {
     fetchCount += 1;
     fetchedUrl = url;
     fetchedBody = options.body ? JSON.parse(options.body) : null;
+    fetchedHeaders = options.headers || {};
     if (String(url).includes('/v1/quota-status')) {
       return {
         ok: true,
@@ -219,6 +237,41 @@ assert.equal(fetchedBody.metadata.originalImageUrl, 'https://example.test/page-1
 assert.equal(response.translatedImageDataUrl, 'data:image/png;base64,ZmFrZQ==');
 assert.equal(response.pipelineReport.pipeline, 'local-8-stage');
 assert.equal(fetchCount, 1);
+assert.equal(
+  Object.prototype.hasOwnProperty.call(fetchedHeaders, 'X-Fmt-Auth'),
+  false,
+  'no auth token configured -- X-Fmt-Auth is never sent (byte-identical to every existing local deployment)',
+);
+
+// ===== Optional auth-token hardening (docs/KAGGLE_DEPLOYMENT.md): when the user configures a
+// token in the popup, every backend fetch must carry it; when they don't, it must never appear. =====
+localPipelineAuthTokenSetting = 'super-secret-tunnel-token';
+await new Promise((resolve) => {
+  messageListener(
+    {
+      kind: 'translateImage',
+      base64Data: 'data:image/png;base64,dG9rZW4=',
+      cacheKey: 'https://example.test/token-page.jpg|100x120',
+      originalImageUrl: 'https://example.test/token-page.jpg',
+      pageCacheKey: 'https://example.test/manga',
+      width: 100,
+      height: 120,
+      pageUrl: 'https://example.test/manga',
+    },
+    { tab: { id: 1 } },
+    resolve,
+  );
+});
+assert.equal(fetchedHeaders['X-Fmt-Auth'], 'super-secret-tunnel-token', 'translate-image request carries the configured auth token');
+assert.equal(fetchedHeaders['X-Fmt-Client'], 'free-manga-translator-extension', 'the client-id header is still sent alongside the auth token');
+
+const quotaResponse = await new Promise((resolve) => {
+  messageListener({ kind: 'getQuotaStatus' }, { tab: { id: 1 } }, resolve);
+});
+assert.equal(fetchedHeaders['X-Fmt-Auth'], 'super-secret-tunnel-token', 'non-translate control routes (quota-status) also carry the token');
+assert.equal(quotaResponse.ok, true);
+
+localPipelineAuthTokenSetting = '';
 
 localPipelineLanguageSetting = 'zh';
 await new Promise((resolve) => {
@@ -385,6 +438,9 @@ const queuedHeld = new Promise((resolve) => {
 
 await new Promise((resolve) => setTimeout(resolve, 0));
 
+assert.equal(alarmActiveAccordingToMock, true, 'keep-alive alarm created while a request is active/queued');
+assert.equal(alarmCalls.create >= 1, true, 'chrome.alarms.create was actually invoked, not just the in-memory flag');
+
 const queueFull = await new Promise((resolve) => {
   messageListener(
     {
@@ -409,5 +465,9 @@ assert.equal((await activeHeld).translatedImageDataUrl, 'data:image/png;base64,Z
 await new Promise((resolve) => setTimeout(resolve, 0));
 heldFetchResolvers.shift()?.();
 assert.equal((await queuedHeld).translatedImageDataUrl, 'data:image/png;base64,ZmFrZQ==');
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+assert.equal(alarmActiveAccordingToMock, false, 'keep-alive alarm cleared once both active and queued work have drained');
+assert.equal(alarmCalls.clear >= 1, true, 'chrome.alarms.clear was actually invoked, not just the in-memory flag');
 
 console.log('extension_background_contract=pass');
