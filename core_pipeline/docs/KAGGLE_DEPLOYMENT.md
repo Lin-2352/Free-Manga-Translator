@@ -294,12 +294,13 @@ This is not a separate testing phase tacked onto setup — it *is* the first rea
 just ordered so a systemic problem shows up after 30 seconds instead of after
 re-entering 12 credentials.
 
-**Optional 13th secret — `NGROK_STATIC_DOMAIN`.** Cell 6 normally reads your claimed
-domain from a `STATIC_DOMAIN` constant you edit directly in the notebook. If you'd
-rather not edit notebook code (e.g. you plan to re-copy this notebook, or share it),
-create a secret labeled `NGROK_STATIC_DOMAIN` with your domain as the value instead —
-Cell 6 checks for this secret first and only falls back to the `STATIC_DOMAIN`
-constant if it doesn't exist. Not required; the constant works fine on its own.
+**13th secret — `NGROK_STATIC_DOMAIN` (recommended, required for a true "Run All").**
+Cell 6 normally reads your claimed domain from a `STATIC_DOMAIN` constant you edit
+directly in the notebook. Create a secret labeled `NGROK_STATIC_DOMAIN` with your
+domain as the value instead, and Cell 6 picks it up automatically — no manual cell
+editing needed at all. This is what makes **Run All** actually work start to finish;
+without it, Cell 6 stops with an assertion telling you to either create this secret or
+edit the placeholder by hand.
 
 ---
 
@@ -414,7 +415,7 @@ If GPU output is empty instead, the accelerator setting wasn't applied — fix i
 side panel and restart the session before continuing.
 
 **Cell 2 — copy code, fonts, CORS hot-patch, smart dependency install.** The biggest
-cell in the notebook, doing nine things in a load-bearing order (`fmt-cell2-v4` in
+cell in the notebook, doing ten things in a load-bearing order (`fmt-cell2-v5` in
 the notebook):
 
 1. **Copy** `DATASET_DIR/core_pipeline` → `/kaggle/working/core_pipeline` (`/kaggle/input`
@@ -452,25 +453,32 @@ the notebook):
    torch/torchvision lines dropped (when keeping the preinstalled build) and
    `opencv-python` swapped for `opencv-python-headless`, then installs it, then
    `backend_api/requirements.txt`, then `pyngrok`.
-7. **Post-install cleanup**: `ultralytics` and `paddleocr`/`paddlex`
+7. **`sentencepiece`** — found via a live run: the NLLB local-translator tokenizer
+   (`facebook/nllb-200-distilled-600M`) needs it and `transformers` raises "Couldn't
+   instantiate the backend tokenizer" without it. It was genuinely missing from
+   `python/requirements.txt` (now fixed there too), installed directly here so the
+   fix doesn't wait on a new dataset version.
+8. **Post-install cleanup**: `ultralytics` and `paddleocr`/`paddlex`
    transitively pull non-headless `opencv-python` back in even after the filtered
    install — this cell uninstalls it again and force-reinstalls
    `opencv-python-headless` last, with `--no-deps` so nothing re-drags it back a
    second time.
-8. **`onnxruntime-gpu` CUDA pin** — found via a live run, not the original audit:
+9. **`onnxruntime-gpu` CUDA pin** — found via a live run, not the original audit:
    the requirements' `onnxruntime-gpu>=1.26.0` resolves to 1.27.0+, which switched its
-   default build from CUDA 12 to CUDA 13 (`libcudart.so.13`, absent on Kaggle's
-   CUDA-12.4 box) — import fails outright. Force-reinstalls the pinned
+   default build from CUDA 12 to CUDA 13 (`libcudart.so.13`, absent on any Kaggle
+   CUDA-12.x box) — import fails outright. Force-reinstalls the pinned
    `onnxruntime-gpu==1.26.0`, the last version still defaulting to CUDA 12.
-9. **`torchaudio` version pin** — also found via a live run: some transitive dependency
+10. **`torchaudio` version pin** — also found via a live run: some transitive dependency
    (transformers/easyocr audio extras) pulls in a `torchaudio` build mismatched with
    the active torch, breaking with an `undefined symbol` error the first time anything
    imports it (during warmup, not at install time — so this one doesn't surface until
-   Cell 5). Rather than hardcode a torch version here (which broke once already — see
-   step 4's note), this queries the *actual* active torch version via a fresh
-   subprocess and force-reinstalls a `torchaudio` build matching that exact
-   version+CUDA combo.
-10. **Smoke test**: in a **fresh subprocess** (this kernel may still hold stale
+   Cell 5). Rather than hardcode a torch version here (which broke once already —
+   Kaggle's image drifted between sessions from torch 2.6.0+cu124 to 2.10.0+cu128, and
+   a naive `.startswith()` version check silently mis-triggered an unwanted downgrade,
+   which is what caused this exact torchaudio mismatch in the first place), this
+   queries the *actual* active torch version via a fresh subprocess and
+   force-reinstalls a `torchaudio` build matching that exact version+CUDA combo.
+11. **Smoke test**: in a **fresh subprocess** (this kernel may still hold stale
    imports of packages just uninstalled), scans installed distributions (exactly
    one opencv variant, `onnxruntime-gpu` present and plain `onnxruntime` absent) and
    creates a **real** `onnxruntime.InferenceSession` on the actual text-detector model
@@ -540,11 +548,16 @@ pipeline-side — a genuinely useful thing to know before debugging blind.
 **Cell 6 — open the tunnel.** Uses `pyngrok` with your static domain, so the public URL
 is the same every session. Re-run safe: calls `ngrok.kill()` first, since the free
 tier only allows one active agent session and a bare re-run of `ngrok.connect` on the
-same domain fails with `ERR_NGROK_334`/`108`. The domain comes from the optional
-`NGROK_STATIC_DOMAIN` secret if you created one (§4), otherwise from the
-`STATIC_DOMAIN` constant — **edit that constant to your claimed domain** if you didn't
-create the secret; the cell raises immediately if neither is a real domain, rather
-than opening a tunnel to a placeholder.
+same domain fails with `ERR_NGROK_334`/`108`. The domain comes from the
+`NGROK_STATIC_DOMAIN` secret if you created one (§4, recommended — this is what lets
+Run All work unattended), otherwise from the `STATIC_DOMAIN` constant — edit that
+constant to your claimed domain if you didn't create the secret; the cell raises
+immediately if neither is a real domain, rather than opening a tunnel to a
+placeholder. **Self-healing fallback**: if ngrok rejects the explicit domain as a
+paid-only "custom subdomain" — observed live with newer `.ngrok-free.dev` dev-domains,
+even when the domain is genuinely reserved to the account (§10) — this cell catches
+that specific error and automatically retries with no domain argument at all, letting
+ngrok auto-assign the account's dev domain instead of hard-failing.
 
 **Cell 7 — keep the session alive.** Kaggle interactive sessions can idle-disconnect;
 this cell just keeps the notebook actively running and periodically confirms the
@@ -796,7 +809,9 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 | A provider you expected doesn't show up in cell 3's "Configured providers" printout | Its secret wasn't created, or was created but not toggled ON for this notebook | Add-ons → Secrets → check the label matches exactly and the toggle is ON, then re-run cell 3 |
 | Cell 2's smoke test fails with `session.get_providers()[0] != 'CUDAExecutionProvider'` (or an ORT provider/cuDNN error) | A CPU `onnxruntime` package shadowed `onnxruntime-gpu`, or the CUDA/cuDNN stack didn't initialize | Re-run cell 2 (idempotent — it uninstalls onnxruntime variants before reinstalling); if it persists, restart the session and re-run cells 1-2 fresh |
 | `onnxruntime` import fails with `libcudart.so.13: cannot open shared object file` | `onnxruntime-gpu` resolved to 1.27.0+, which switched its default CUDA build from 12 to 13 — Kaggle's box only has CUDA 12.4 | Cell 2 already pins `onnxruntime-gpu==1.26.0` (step 6b) specifically for this; if a future Kaggle image ships a newer CUDA, that pin may need bumping — check `torch.version.cuda` in Cell 1's preflight output first |
-| Warmup fails with `libtorchaudio.so: undefined symbol: aoti_torch_abi_version` | A transitive dependency (transformers/easyocr audio extras) pulled in a `torchaudio` build that doesn't match the reused `torch==2.6.0+cu124` | Cell 2 already force-reinstalls a matching `torchaudio==2.6.0` from the same `cu124` index as torch (step 6c) specifically for this |
+| Warmup fails with `libtorchaudio.so: undefined symbol: aoti_torch_abi_version` | A transitive dependency (transformers/easyocr audio extras) pulled in a `torchaudio` build that doesn't match the active torch | Cell 2 already force-reinstalls a matching `torchaudio` build from the same CUDA index as the active torch (step 10) — determined dynamically, not hardcoded, specifically for this |
+| Warmup fails with `Couldn't instantiate the backend tokenizer... You need to have sentencepiece or tiktoken installed` | The NLLB local-translator tokenizer needs `sentencepiece`, which was genuinely missing from `python/requirements.txt` | Cell 2 already installs it explicitly (step 7); if you're on an older notebook version, re-import the current `.ipynb` |
+| Cell 6 gets `ERR_NGROK_313` / "Only paid plans may create endpoints with custom subdomains" even though the domain is reserved to your account | A known quirk with newer `.ngrok-free.dev` dev-domains and explicit `domain=` requests | Cell 6 already catches this specific error and retries with no domain argument, letting ngrok auto-assign your account's dev domain instead of failing |
 | Cell 2's smoke test fails with a stray-opencv-dist assertion, or `cv2` import errors mentioning `cv2.dnn`/missing attributes | Two opencv variants installed simultaneously (dual-`cv2` corruption) — usually `ultralytics` or `paddleocr` re-pulling non-headless `opencv-python` | Re-run cell 2 — its post-install cleanup step force-reinstalls `opencv-python-headless` last with `--no-deps` specifically to fix this |
 | Any import error mentioning `_ARRAY_API not found` or "compiled using NumPy 1.x" | numpy ABI mismatch — something upgraded numpy without recompiling against it | Restart the Kaggle session and re-run cells 1-2 fresh; don't `pip install --upgrade numpy` manually mid-session |
 | Cell 5/5b requests return the ngrok interstitial HTML instead of JSON (only after the tunnel is up — see §9 for pre-tunnel testing) | The `ngrok-skip-browser-warning` header wasn't sent, or is being stripped somewhere upstream | The extension already sends this header on every request (§6); if you're testing with `curl` directly, add `-H "ngrok-skip-browser-warning: 1"` |
@@ -810,12 +825,17 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 For when you've already read the above once and just need the checklist:
 
 1. Kaggle: phone-verified, GPU T4×2 + Internet on, dataset attached, `NGROK_AUTHTOKEN`
-   + `FMT_AUTH_TOKEN` + one secret per provider you use attached (§4).
-2. Run notebook cells 1-5b (`deploy/kaggle/fmt_kaggle_backend.ipynb`) — Cell 5b's
-   loopback translate passing means the pipeline itself is proven working before you
-   touch the tunnel or the extension.
-3. Run Cell 6, copy the printed public URL + `/v1/translate-image`.
+   + `FMT_AUTH_TOKEN` + `NGROK_STATIC_DOMAIN` + one secret per provider you use
+   attached (§4). Including `NGROK_STATIC_DOMAIN` means the next step needs zero
+   manual editing.
+2. **Run → Run All** (`deploy/kaggle/fmt_kaggle_backend.ipynb`). Cells 1-6 run
+   unattended — Cell 5b's loopback translate passing means the pipeline itself is
+   proven working before the tunnel or extension are ever touched. It will then
+   appear to hang on Cell 7 — that's correct, not a bug (see the notebook's intro
+   cell).
+3. Copy Cell 6's printed public URL + `/v1/translate-image`.
 4. Extension popup → Local Pipeline URL = that value, Backend auth token = your
    `FMT_AUTH_TOKEN`, Save.
 5. Translate normally. Cell 7 keeps the session alive (but see §7 — you still need to
-   interact with the tab roughly hourly); Cell 8 shuts down cleanly when you're done.
+   interact with the tab roughly hourly); when done, ■ Stop Cell 7, then run Cell 8
+   by hand to shut down cleanly.
