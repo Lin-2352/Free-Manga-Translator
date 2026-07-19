@@ -839,7 +839,27 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 
 ---
 
-## Quick start
+## 11. Cold-start timing
+
+As of `fmt-cell2-v8`/`fmt-cell5b-v3`, every cell from Cell 1 through Cell 6 prints
+`[TIMING]` lines: Cell 2 breaks its own runtime down by step (repo copy, hot-patches,
+fonts, torch check, each pip install/reinstall, the smoke test), and Cells 4/5/5b/6
+each print elapsed time since Cell 1 started, so `Run All` on a genuinely fresh
+Kaggle session (not a resumed one — resumed sessions reuse a warm pip/HF cache and
+give misleadingly fast numbers) tells you exactly where the time goes instead of
+guessing. This is purely additive instrumentation — no installs, pins, or hot-patches
+changed.
+
+What to do with the numbers: the pipeline bundles most of its models directly in the
+dataset (`core_pipeline/models/`) — only `manga-ocr` (~450MB) and `magi` (~1-1.2GB)
+download from Hugging Face during warmup on a cold cache, and `facebook/nllb-200-
+distilled-600M` (~2.4GB) downloads separately, and only if Cell 5b's translate falls
+back to the local translator because no configured API provider succeeded (Cell 5b's
+`[TIMING]` line now also prints which provider was actually used, so you know whether
+that download happened on this run). If Cell 2's step-by-step total dominates the
+overall time, the pip install/dependency-resolution path is the bottleneck; if
+warmup/Cell 5b dominates instead, it's model download or GPU load. Whichever it is,
+that's the number to optimize next — don't guess.
 
 For when you've already read the above once and just need the checklist:
 
