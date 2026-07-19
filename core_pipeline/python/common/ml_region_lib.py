@@ -211,6 +211,20 @@ def load_semantic_model(model_path: str, allow_cpu: bool = False):
         def set_tied(self, value): self._tied_weights_keys = value
         transformers.PreTrainedModel.all_tied_weights_keys = property(get_tied, set_tied)
 
+    # Tokenizer-routing shim: transformers >=5.13.0 registers "vision-encoder-decoder"
+    # (TrOCR's model_type, loaded internally by magi via TrOCRProcessor) in
+    # TOKENIZER_MAPPING_NAMES pointing straight at the generic TokenizersBackend class,
+    # which can only build from a tokenizer.json -- and microsoft/trocr-base-printed has
+    # never shipped one (only vocab.json+merges.txt). AutoTokenizer.from_pretrained then
+    # fails with a misleading "need sentencepiece or tiktoken" ValueError that has
+    # nothing to do with sentencepiece. Point the mapping at the correct concrete class
+    # (RobertaTokenizer, which reads vocab.json+merges.txt directly) instead -- verified
+    # empirically: fixes 5.14.1, and is a harmless no-op on <=5.12.0, which never
+    # registers this model_type in the mapping at all (falls through to the hub's own
+    # tokenizer_config.json class there, which is already RobertaTokenizer).
+    from transformers.models.auto import tokenization_auto as _tok_auto
+    _tok_auto.TOKENIZER_MAPPING_NAMES["vision-encoder-decoder"] = "RobertaTokenizer"
+
     repo_id = model_path or "ragavsachdeva/magi"
     if repo_id == "magi":
         repo_id = "ragavsachdeva/magi"

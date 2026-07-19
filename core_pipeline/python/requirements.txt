@@ -17,15 +17,23 @@ onnxruntime-gpu>=1.26.0
 opencv-python>=4.10.0
 numpy>=2.3.0,<3.0.0
 Pillow>=12.0.0
-transformers>=5.12.0
-# sentencepiece: needed directly by the NLLB local-translator tokenizer
-# (facebook/nllb-200-distilled-600M). protobuf: sentencepiece needs a compatible protobuf
-# to actually convert a slow tokenizer to fast at runtime -- without a matching pair,
-# transformers raises "Couldn't instantiate the backend tokenizer... need sentencepiece
-# or tiktoken installed" even with sentencepiece present and importable (a known
-# transformers issue class, e.g. huggingface/transformers#36322). Confirmed live: this
-# exact error also hits magi's bundled TrOCR/RobertaTokenizer dependency
-# (microsoft/trocr-base-printed), not just NLLB -- pin both together, not just one.
+transformers>=5.12.0,<5.13
+# Upper bound is load-bearing, not cosmetic: transformers 5.13.0 registers TrOCR's
+# model_type ("vision-encoder-decoder", loaded internally by magi via TrOCRProcessor)
+# in TOKENIZER_MAPPING_NAMES pointing at the generic TokenizersBackend class, which can
+# only build from a tokenizer.json -- and microsoft/trocr-base-printed has never shipped
+# one (only vocab.json+merges.txt). AutoTokenizer.from_pretrained then raises a
+# misleading "need sentencepiece or tiktoken" ValueError that has nothing to do with
+# sentencepiece (verified: neither package is the cause). Confirmed present through at
+# least 5.14.1 and unfixed on transformers main as of 2026-07; no known upper bound
+# where it's resolved. ml_region_lib.py's load_semantic_model() also carries a runtime
+# shim (re-registers the mapping entry to RobertaTokenizer) as a second, independent
+# layer for any environment where this upper bound can't be guaranteed -- e.g. the
+# Kaggle deployment notebook, which pins its own transformers version separately from
+# this file. Either fix alone is sufficient; both verified locally against the actual
+# failing call on both a pre- and post-regression version before shipping.
+# sentencepiece + protobuf: needed by the NLLB local-translator tokenizer
+# (facebook/nllb-200-distilled-600M) -- unrelated to the TrOCR issue above.
 sentencepiece>=0.2.0
 protobuf>=3.20.0,<6
 easyocr>=1.7.2

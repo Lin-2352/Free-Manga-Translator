@@ -414,15 +414,32 @@ against `os.listdir("/kaggle/input")` (and, if present,
 If GPU output is empty instead, the accelerator setting wasn't applied — fix it in the
 side panel and restart the session before continuing.
 
-**Cell 2 — copy code, fonts, CORS hot-patch, smart dependency install.** The biggest
-cell in the notebook, doing ten things in a load-bearing order (`fmt-cell2-v6` in
-the notebook):
+**Cell 2 — copy code, fonts, CORS + tokenizer-routing hot-patches, smart dependency
+install.** The biggest cell in the notebook, doing eleven things in a load-bearing
+order (`fmt-cell2-v7` in the notebook):
 
 1. **Copy** `DATASET_DIR/core_pipeline` → `/kaggle/working/core_pipeline` (`/kaggle/input`
    is read-only).
 2. **Hot-patch the copy's CORS config** to allow ngrok's interstitial-bypass header
-   (see the note in §3 about this being a temporary patch, not a permanent fix).
-3. **Fonts.** The dataset ships no fonts (verified: zero files matching `font` in the
+   (temporary — bakes into the next dataset version).
+3. **Hot-patch the copy's `ml_region_lib.py`** with a tokenizer-routing shim — the
+   actual, source-confirmed fix for the tokenizer failure below (also temporary,
+   same reason). Explained in full in §10; short version: `transformers` ≥5.13.0
+   registers TrOCR's `model_type` (`"vision-encoder-decoder"`, loaded internally by
+   magi via `TrOCRProcessor`) in `TOKENIZER_MAPPING_NAMES` pointing at the generic
+   `TokenizersBackend` class, which can only build from a `tokenizer.json` —
+   and `microsoft/trocr-base-printed` has never shipped one (confirmed: only
+   `vocab.json`+`merges.txt`, plus a negative-cache 404 marker for `tokenizer.json`
+   in the local HF cache). `AutoTokenizer.from_pretrained` then raises a misleading
+   `"need sentencepiece or tiktoken"` `ValueError` that has nothing to do with either
+   package. The shim re-registers that one mapping entry to `RobertaTokenizer`
+   (which reads `vocab.json`+`merges.txt` directly, exactly what this repo needs) —
+   **verified empirically, in both directions, on this exact failing call**, before
+   ever going near Kaggle: fails without it on `transformers==5.14.1`, succeeds with
+   it; harmless no-op on `transformers==5.12.0`, which never even populates that
+   mapping entry (falls through to the hub's own `tokenizer_config.json` class,
+   already `RobertaTokenizer` there).
+4. **Fonts.** The dataset ships no fonts (verified: zero files matching `font` in the
    zip) and the vendored `ComicNeue-{Bold,Regular}.ttf` live outside `core_pipeline`
    in this repo, so they never make it into the dataset at all. Step 8's typesetting
    font-resolution chain (`run_step8_typeset.py`) tries Windows paths first, then a
@@ -434,14 +451,14 @@ the notebook):
    text later), and deletes anything that fails validation. It only raises if
    ComicNeue failed **and** the DejaVu fallback is also absent — otherwise you get a
    working font, just possibly not the intended comic-style one.
-4. **Torch**: keeps the preinstalled build if it's already CUDA-capable ≥ 2.6, otherwise
+5. **Torch**: keeps the preinstalled build if it's already CUDA-capable ≥ 2.6, otherwise
    installs the pinned `cu124` wheels. The version check compares `(major, minor)` as
    integers, not a string prefix — Kaggle's image drifts over time (observed
    torch 2.6.0+cu124 one session, 2.10.0+cu128 the next on a fresh container), and an
    earlier string-`.startswith()` version of this check silently broke on "2.10" and
-   triggered an unwanted downgrade to 2.6.0, which is what caused the `torchaudio`
-   mismatch below in the first place.
-5. **Uninstall-first**: removes any preinstalled `onnxruntime` (CPU build), and every
+   triggered an unwanted downgrade to 2.6.0, which is what caused a `torchaudio`
+   mismatch in an earlier round of this notebook.
+6. **Uninstall-first**: removes any preinstalled `onnxruntime` (CPU build), and every
    `opencv-*` variant, before installing anything — a CPU `onnxruntime` package can
    **silently shadow** `onnxruntime-gpu` (the pipeline's ONNX text detector and LaMa
    inpainter create a CUDA-only `InferenceSession` with no CPU fallback — this is a
@@ -449,47 +466,32 @@ the notebook):
    `opencv-python-headless`, which conflicts with this repo's pinned non-headless
    `opencv-python` (both packages own the same `cv2/` namespace — having both installed
    corrupts the import).
-6. **Filtered install**: writes a copy of `python/requirements.txt` with the
+7. **Filtered install**: writes a copy of `python/requirements.txt` with the
    torch/torchvision lines dropped (when keeping the preinstalled build) and
    `opencv-python` swapped for `opencv-python-headless`, then installs it, then
    `backend_api/requirements.txt`, then `pyngrok`.
-7. **`sentencepiece` + `protobuf` alignment** — found via two live rounds, not
-   guessed. Round one added bare `sentencepiece` after NLLB's tokenizer needed it;
-   the smoke test confirmed it imports fine, but warmup still failed with the
-   identical "Couldn't instantiate the backend tokenizer... need sentencepiece or
-   tiktoken" error. Round two traced the *actual* source directly from magi's own
-   code on the HF Hub: `ragavsachdeva/magi`'s `processing_magi.py` loads
-   `TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")` — whose
-   `tokenizer_class` is `RobertaTokenizer`, not sentencepiece-based at all. This is
-   a known class of `transformers` bug (e.g. `huggingface/transformers#36322`):
-   the generic tokenizer error fires when `sentencepiece` and `protobuf` versions
-   don't line up, even for tokenizer classes that don't use sentencepiece
-   themselves, because the fast-tokenizer-conversion machinery's availability
-   checks share one import point. Force-reinstalls `sentencepiece` and `protobuf`
-   **together** (not `--no-deps`, unlike the other pins above) so pip resolves a
-   mutually compatible pair instead of pairing a fresh `sentencepiece` against
-   whatever `protobuf` Kaggle happened to preinstall for an unrelated package.
-   Both are now pinned in `python/requirements.txt` too.
-8. **Post-install cleanup**: `ultralytics` and `paddleocr`/`paddlex`
+8. **`sentencepiece` + `protobuf`**: needed by the NLLB local-translator tokenizer
+   (`facebook/nllb-200-distilled-600M`) — unrelated to the TrOCR/magi tokenizer issue
+   above, which the routing shim (step 3) fixes, not these packages. (An earlier round
+   of this notebook incorrectly attributed the TrOCR error to a sentencepiece/protobuf
+   mismatch; that theory didn't survive contact with the real traceback — see §10.)
+9. **Post-install cleanup**: `ultralytics` and `paddleocr`/`paddlex`
    transitively pull non-headless `opencv-python` back in even after the filtered
    install — this cell uninstalls it again and force-reinstalls
    `opencv-python-headless` last, with `--no-deps` so nothing re-drags it back a
    second time.
-9. **`onnxruntime-gpu` CUDA pin** — found via a live run, not the original audit:
-   the requirements' `onnxruntime-gpu>=1.26.0` resolves to 1.27.0+, which switched its
-   default build from CUDA 12 to CUDA 13 (`libcudart.so.13`, absent on any Kaggle
-   CUDA-12.x box) — import fails outright. Force-reinstalls the pinned
-   `onnxruntime-gpu==1.26.0`, the last version still defaulting to CUDA 12.
-10. **`torchaudio` version pin** — also found via a live run: some transitive dependency
-   (transformers/easyocr audio extras) pulls in a `torchaudio` build mismatched with
-   the active torch, breaking with an `undefined symbol` error the first time anything
-   imports it (during warmup, not at install time — so this one doesn't surface until
-   Cell 5). Rather than hardcode a torch version here (which broke once already —
-   Kaggle's image drifted between sessions from torch 2.6.0+cu124 to 2.10.0+cu128, and
-   a naive `.startswith()` version check silently mis-triggered an unwanted downgrade,
-   which is what caused this exact torchaudio mismatch in the first place), this
-   queries the *actual* active torch version via a fresh subprocess and
-   force-reinstalls a `torchaudio` build matching that exact version+CUDA combo.
+10. **`onnxruntime-gpu` CUDA pin** — found via a live run: the requirements'
+   `onnxruntime-gpu>=1.26.0` resolves to 1.27.0+, which switched its default build
+   from CUDA 12 to CUDA 13 (`libcudart.so.13`, absent on any Kaggle CUDA-12.x box) —
+   import fails outright. Force-reinstalls the pinned `onnxruntime-gpu==1.26.0`, the
+   last version still defaulting to CUDA 12. Also **`torchaudio`**: a transitive
+   dependency (transformers/easyocr audio extras) can pull in a `torchaudio` build
+   mismatched with the active torch, breaking with an `undefined symbol` error the
+   first time anything imports it — this cell queries the *actual* active torch
+   version via a fresh subprocess and force-reinstalls a matching `torchaudio` build.
+   Finally, **`transformers==5.12.0`** is pinned explicitly — belt-and-braces with the
+   step-3 shim, matching the exact version the full pipeline (magi + TrOCR +
+   manga-ocr + NLLB) is proven on daily on the maintainer's own machine.
 11. **Smoke test**: in a **fresh subprocess** (this kernel may still hold stale
    imports of packages just uninstalled), scans installed distributions (exactly
    one opencv variant, `onnxruntime-gpu` present and plain `onnxruntime` absent) and
@@ -497,11 +499,11 @@ the notebook):
    with `providers=['CUDAExecutionProvider']`, asserting CUDA is the active provider —
    `get_available_providers()` alone would only prove the wheel *compiled with* CUDA
    support, not that it can actually *initialize* it on this VM's driver/cuDNN stack.
-   It also actually loads `AutoTokenizer.from_pretrained("microsoft/trocr-base-printed")`
-   — the exact call that was failing during warmup — rather than just checking that
-   `sentencepiece` imports, which turned out not to be sufficient evidence (see step 7).
-   A real failure here surfaces in Cell 2, in seconds, instead of 5+ minutes into
-   warmup with a generic error and no indication of which tokenizer actually broke.
+   It also runs the literal `TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")`
+   call magi makes — the exact call that was failing during warmup — rather than just
+   checking that a package imports, which turned out not to be sufficient evidence in
+   an earlier round (see §10). A real failure here surfaces in Cell 2, in seconds,
+   with the true traceback, instead of 5+ minutes into warmup behind a generic error.
 
 **Cell 3 — load secrets into environment.** Reads each provider's key straight from its
 own small Kaggle Secret into `os.environ` — **no `.env` file is ever written to disk**.
