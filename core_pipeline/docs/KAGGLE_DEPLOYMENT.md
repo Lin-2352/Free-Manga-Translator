@@ -415,7 +415,7 @@ If GPU output is empty instead, the accelerator setting wasn't applied — fix i
 side panel and restart the session before continuing.
 
 **Cell 2 — copy code, fonts, CORS hot-patch, smart dependency install.** The biggest
-cell in the notebook, doing ten things in a load-bearing order (`fmt-cell2-v5` in
+cell in the notebook, doing ten things in a load-bearing order (`fmt-cell2-v6` in
 the notebook):
 
 1. **Copy** `DATASET_DIR/core_pipeline` → `/kaggle/working/core_pipeline` (`/kaggle/input`
@@ -453,11 +453,23 @@ the notebook):
    torch/torchvision lines dropped (when keeping the preinstalled build) and
    `opencv-python` swapped for `opencv-python-headless`, then installs it, then
    `backend_api/requirements.txt`, then `pyngrok`.
-7. **`sentencepiece`** — found via a live run: the NLLB local-translator tokenizer
-   (`facebook/nllb-200-distilled-600M`) needs it and `transformers` raises "Couldn't
-   instantiate the backend tokenizer" without it. It was genuinely missing from
-   `python/requirements.txt` (now fixed there too), installed directly here so the
-   fix doesn't wait on a new dataset version.
+7. **`sentencepiece` + `protobuf` alignment** — found via two live rounds, not
+   guessed. Round one added bare `sentencepiece` after NLLB's tokenizer needed it;
+   the smoke test confirmed it imports fine, but warmup still failed with the
+   identical "Couldn't instantiate the backend tokenizer... need sentencepiece or
+   tiktoken" error. Round two traced the *actual* source directly from magi's own
+   code on the HF Hub: `ragavsachdeva/magi`'s `processing_magi.py` loads
+   `TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")` — whose
+   `tokenizer_class` is `RobertaTokenizer`, not sentencepiece-based at all. This is
+   a known class of `transformers` bug (e.g. `huggingface/transformers#36322`):
+   the generic tokenizer error fires when `sentencepiece` and `protobuf` versions
+   don't line up, even for tokenizer classes that don't use sentencepiece
+   themselves, because the fast-tokenizer-conversion machinery's availability
+   checks share one import point. Force-reinstalls `sentencepiece` and `protobuf`
+   **together** (not `--no-deps`, unlike the other pins above) so pip resolves a
+   mutually compatible pair instead of pairing a fresh `sentencepiece` against
+   whatever `protobuf` Kaggle happened to preinstall for an unrelated package.
+   Both are now pinned in `python/requirements.txt` too.
 8. **Post-install cleanup**: `ultralytics` and `paddleocr`/`paddlex`
    transitively pull non-headless `opencv-python` back in even after the filtered
    install — this cell uninstalls it again and force-reinstalls
@@ -485,6 +497,11 @@ the notebook):
    with `providers=['CUDAExecutionProvider']`, asserting CUDA is the active provider —
    `get_available_providers()` alone would only prove the wheel *compiled with* CUDA
    support, not that it can actually *initialize* it on this VM's driver/cuDNN stack.
+   It also actually loads `AutoTokenizer.from_pretrained("microsoft/trocr-base-printed")`
+   — the exact call that was failing during warmup — rather than just checking that
+   `sentencepiece` imports, which turned out not to be sufficient evidence (see step 7).
+   A real failure here surfaces in Cell 2, in seconds, instead of 5+ minutes into
+   warmup with a generic error and no indication of which tokenizer actually broke.
 
 **Cell 3 — load secrets into environment.** Reads each provider's key straight from its
 own small Kaggle Secret into `os.environ` — **no `.env` file is ever written to disk**.
@@ -810,7 +827,7 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 | Cell 2's smoke test fails with `session.get_providers()[0] != 'CUDAExecutionProvider'` (or an ORT provider/cuDNN error) | A CPU `onnxruntime` package shadowed `onnxruntime-gpu`, or the CUDA/cuDNN stack didn't initialize | Re-run cell 2 (idempotent — it uninstalls onnxruntime variants before reinstalling); if it persists, restart the session and re-run cells 1-2 fresh |
 | `onnxruntime` import fails with `libcudart.so.13: cannot open shared object file` | `onnxruntime-gpu` resolved to 1.27.0+, which switched its default CUDA build from 12 to 13 — Kaggle's box only has CUDA 12.4 | Cell 2 already pins `onnxruntime-gpu==1.26.0` (step 6b) specifically for this; if a future Kaggle image ships a newer CUDA, that pin may need bumping — check `torch.version.cuda` in Cell 1's preflight output first |
 | Warmup fails with `libtorchaudio.so: undefined symbol: aoti_torch_abi_version` | A transitive dependency (transformers/easyocr audio extras) pulled in a `torchaudio` build that doesn't match the active torch | Cell 2 already force-reinstalls a matching `torchaudio` build from the same CUDA index as the active torch (step 10) — determined dynamically, not hardcoded, specifically for this |
-| Warmup fails with `Couldn't instantiate the backend tokenizer... You need to have sentencepiece or tiktoken installed` | The NLLB local-translator tokenizer needs `sentencepiece`, which was genuinely missing from `python/requirements.txt` | Cell 2 already installs it explicitly (step 7); if you're on an older notebook version, re-import the current `.ipynb` |
+| Cell 2's smoke test fails loading `microsoft/trocr-base-printed`'s tokenizer, or warmup fails with `Couldn't instantiate the backend tokenizer... You need to have sentencepiece or tiktoken installed` | A `sentencepiece`/`protobuf` version mismatch — this is magi's bundled TrOCR/RobertaTokenizer dependency, not NLLB, traced directly from magi's own HF Hub source (step 7) | Cell 2 already force-reinstalls `sentencepiece` and `protobuf` together (not `--no-deps`, so pip picks a mutually compatible pair); if it still fails, the smoke test's traceback now shows the real underlying exception instead of this generic message — paste that, not this row |
 | Cell 6 gets `ERR_NGROK_313` / "Only paid plans may create endpoints with custom subdomains" even though the domain is reserved to your account | A known quirk with newer `.ngrok-free.dev` dev-domains and explicit `domain=` requests | Cell 6 already catches this specific error and retries with no domain argument, letting ngrok auto-assign your account's dev domain instead of failing |
 | Cell 2's smoke test fails with a stray-opencv-dist assertion, or `cv2` import errors mentioning `cv2.dnn`/missing attributes | Two opencv variants installed simultaneously (dual-`cv2` corruption) — usually `ultralytics` or `paddleocr` re-pulling non-headless `opencv-python` | Re-run cell 2 — its post-install cleanup step force-reinstalls `opencv-python-headless` last with `--no-deps` specifically to fix this |
 | Any import error mentioning `_ARRAY_API not found` or "compiled using NumPy 1.x" | numpy ABI mismatch — something upgraded numpy without recompiling against it | Restart the Kaggle session and re-run cells 1-2 fresh; don't `pip install --upgrade numpy` manually mid-session |

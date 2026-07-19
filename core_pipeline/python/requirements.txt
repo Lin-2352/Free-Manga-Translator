@@ -18,12 +18,16 @@ opencv-python>=4.10.0
 numpy>=2.3.0,<3.0.0
 Pillow>=12.0.0
 transformers>=5.12.0
-# Required by the NLLB local-translator tokenizer (facebook/nllb-200-distilled-600M) --
-# transformers raises "Couldn't instantiate the backend tokenizer" without it. Genuinely
-# undeclared until now; likely present incidentally in existing local .venvs as a
-# transitive dependency of something else, which is exactly the kind of gap this file's
-# own header warns about avoiding.
+# sentencepiece: needed directly by the NLLB local-translator tokenizer
+# (facebook/nllb-200-distilled-600M). protobuf: sentencepiece needs a compatible protobuf
+# to actually convert a slow tokenizer to fast at runtime -- without a matching pair,
+# transformers raises "Couldn't instantiate the backend tokenizer... need sentencepiece
+# or tiktoken installed" even with sentencepiece present and importable (a known
+# transformers issue class, e.g. huggingface/transformers#36322). Confirmed live: this
+# exact error also hits magi's bundled TrOCR/RobertaTokenizer dependency
+# (microsoft/trocr-base-printed), not just NLLB -- pin both together, not just one.
 sentencepiece>=0.2.0
+protobuf>=3.20.0,<6
 easyocr>=1.7.2
 manga-ocr>=0.1.14
 requests>=2.34.0
