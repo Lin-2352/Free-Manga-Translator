@@ -414,7 +414,7 @@ If GPU output is empty instead, the accelerator setting wasn't applied — fix i
 side panel and restart the session before continuing.
 
 **Cell 2 — copy code, fonts, CORS hot-patch, smart dependency install.** The biggest
-cell in the notebook, doing nine things in a load-bearing order (`fmt-cell2-v3` in
+cell in the notebook, doing nine things in a load-bearing order (`fmt-cell2-v4` in
 the notebook):
 
 1. **Copy** `DATASET_DIR/core_pipeline` → `/kaggle/working/core_pipeline` (`/kaggle/input`
@@ -433,9 +433,13 @@ the notebook):
    text later), and deletes anything that fails validation. It only raises if
    ComicNeue failed **and** the DejaVu fallback is also absent — otherwise you get a
    working font, just possibly not the intended comic-style one.
-4. **Torch**: keeps the preinstalled build if it's already CUDA-capable ≥ 2.6 (Kaggle's
-   2025-era image shipped torch 2.6.0+cu124 preinstalled), otherwise installs the
-   pinned `cu124` wheels.
+4. **Torch**: keeps the preinstalled build if it's already CUDA-capable ≥ 2.6, otherwise
+   installs the pinned `cu124` wheels. The version check compares `(major, minor)` as
+   integers, not a string prefix — Kaggle's image drifts over time (observed
+   torch 2.6.0+cu124 one session, 2.10.0+cu128 the next on a fresh container), and an
+   earlier string-`.startswith()` version of this check silently broke on "2.10" and
+   triggered an unwanted downgrade to 2.6.0, which is what caused the `torchaudio`
+   mismatch below in the first place.
 5. **Uninstall-first**: removes any preinstalled `onnxruntime` (CPU build), and every
    `opencv-*` variant, before installing anything — a CPU `onnxruntime` package can
    **silently shadow** `onnxruntime-gpu` (the pipeline's ONNX text detector and LaMa
@@ -460,10 +464,12 @@ the notebook):
    `onnxruntime-gpu==1.26.0`, the last version still defaulting to CUDA 12.
 9. **`torchaudio` version pin** — also found via a live run: some transitive dependency
    (transformers/easyocr audio extras) pulls in a `torchaudio` build mismatched with
-   the reused `torch==2.6.0+cu124`, breaking with an `undefined symbol` error the
-   first time anything imports it (during warmup, not at install time — so this one
-   doesn't surface until Cell 5). Force-reinstalls a matching `torchaudio==2.6.0` from
-   the same `cu124` index used for torch/torchvision.
+   the active torch, breaking with an `undefined symbol` error the first time anything
+   imports it (during warmup, not at install time — so this one doesn't surface until
+   Cell 5). Rather than hardcode a torch version here (which broke once already — see
+   step 4's note), this queries the *actual* active torch version via a fresh
+   subprocess and force-reinstalls a `torchaudio` build matching that exact
+   version+CUDA combo.
 10. **Smoke test**: in a **fresh subprocess** (this kernel may still hold stale
    imports of packages just uninstalled), scans installed distributions (exactly
    one opencv variant, `onnxruntime-gpu` present and plain `onnxruntime` absent) and
