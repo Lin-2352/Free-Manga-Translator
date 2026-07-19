@@ -13,24 +13,33 @@ torchvision==0.21.0
 # raises RuntimeError rather than silently falling back to CPU for the core detection models) --
 # install from the PyTorch CUDA 12.4 index, not plain PyPI, e.g.:
 #   pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
-onnxruntime-gpu>=1.26.0
+onnxruntime-gpu==1.26.0
+# Exact pin, not a floor: >=1.26.0 resolves to 1.27.0+, which switched its default
+# build from CUDA 12 to CUDA 13 (needs libcudart.so.13, absent on any Kaggle CUDA-12.x
+# box) -- an unbounded range let a Kaggle cold install grab the broken 1.27.0 first
+# (a 220MB wasted download) before a separate re-pin step had to undo it. Exact-pinning
+# here means the FIRST install pass gets it right instead of a second pass fixing it.
 opencv-python>=4.10.0
 numpy>=2.3.0,<3.0.0
 Pillow>=12.0.0
-transformers>=5.12.0,<5.13
-# Upper bound is load-bearing, not cosmetic: transformers 5.13.0 registers TrOCR's
-# model_type ("vision-encoder-decoder", loaded internally by magi via TrOCRProcessor)
-# in TOKENIZER_MAPPING_NAMES pointing at the generic TokenizersBackend class, which can
+transformers==5.12.0
+# Exact pin, not a floor: transformers 5.13.0 registers TrOCR's model_type
+# ("vision-encoder-decoder", loaded internally by magi via TrOCRProcessor) in
+# TOKENIZER_MAPPING_NAMES pointing at the generic TokenizersBackend class, which can
 # only build from a tokenizer.json -- and microsoft/trocr-base-printed has never shipped
 # one (only vocab.json+merges.txt). AutoTokenizer.from_pretrained then raises a
 # misleading "need sentencepiece or tiktoken" ValueError that has nothing to do with
 # sentencepiece (verified: neither package is the cause). Confirmed present through at
 # least 5.14.1 and unfixed on transformers main as of 2026-07; no known upper bound
-# where it's resolved. ml_region_lib.py's load_semantic_model() also carries a runtime
-# shim (re-registers the mapping entry to RobertaTokenizer) as a second, independent
-# layer for any environment where this upper bound can't be guaranteed -- e.g. the
-# Kaggle deployment notebook, which pins its own transformers version separately from
-# this file. Either fix alone is sufficient; both verified locally against the actual
+# where it's resolved. Exact-pinning (not just an upper bound) matters on Kaggle
+# specifically: an open range let a cold install grab 5.14.1 first, forcing a separate
+# re-pin step to uninstall it and its dependents (tokenizers, huggingface-hub) and
+# reinstall 5.12.0 from scratch -- a measured 76s of fully redundant work on a real
+# cold run. ml_region_lib.py's load_semantic_model() also carries a runtime shim
+# (re-registers the mapping entry to RobertaTokenizer) as a second, independent layer
+# for any environment where this exact pin can't be guaranteed -- e.g. the Kaggle
+# deployment notebook, which pins its own transformers version separately from this
+# file. Either fix alone is sufficient; both verified locally against the actual
 # failing call on both a pre- and post-regression version before shipping.
 # sentencepiece + protobuf: needed by the NLLB local-translator tokenizer
 # (facebook/nllb-200-distilled-600M) -- unrelated to the TrOCR issue above.

@@ -841,25 +841,48 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 
 ## 11. Cold-start timing
 
-As of `fmt-cell2-v8`/`fmt-cell5b-v3`, every cell from Cell 1 through Cell 6 prints
+As of `fmt-cell2-v9`/`fmt-cell5b-v3`, every cell from Cell 1 through Cell 6 prints
 `[TIMING]` lines: Cell 2 breaks its own runtime down by step (repo copy, hot-patches,
 fonts, torch check, each pip install/reinstall, the smoke test), and Cells 4/5/5b/6
 each print elapsed time since Cell 1 started, so `Run All` on a genuinely fresh
 Kaggle session (not a resumed one — resumed sessions reuse a warm pip/HF cache and
 give misleadingly fast numbers) tells you exactly where the time goes instead of
-guessing. This is purely additive instrumentation — no installs, pins, or hot-patches
-changed.
+guessing.
 
-What to do with the numbers: the pipeline bundles most of its models directly in the
-dataset (`core_pipeline/models/`) — only `manga-ocr` (~450MB) and `magi` (~1-1.2GB)
-download from Hugging Face during warmup on a cold cache, and `facebook/nllb-200-
-distilled-600M` (~2.4GB) downloads separately, and only if Cell 5b's translate falls
-back to the local translator because no configured API provider succeeded (Cell 5b's
-`[TIMING]` line now also prints which provider was actually used, so you know whether
-that download happened on this run). If Cell 2's step-by-step total dominates the
-overall time, the pip install/dependency-resolution path is the bottleneck; if
-warmup/Cell 5b dominates instead, it's model download or GPU load. Whichever it is,
-that's the number to optimize next — don't guess.
+**What a real cold run showed (2026-07-19):** total time to a working public URL was
+370.7s (~6.2 min). Warmup itself was fast (60.6s — manga-ocr + magi together are only
+~1.3-1.5GB, well within Kaggle's bandwidth), and Cell 5b's full translate took 88.4s.
+The dominant cost was Cell 2 (220.1s), and *within* Cell 2 the single biggest line item
+wasn't the large necessary installs (paddlepaddle/paddleocr/easyocr/ultralytics, 79.1s)
+— it was the `transformers` pin step doing a **fully redundant 76.3s round-trip**:
+the main install grabbed `transformers==5.14.1` (the broken version) because the
+*Kaggle dataset* still shipped the old, unbounded `requirements.txt`, then the pin
+step had to uninstall it and its dependents (tokenizers, huggingface-hub) and
+reinstall 5.12.0 from scratch. The same pattern, smaller, hit `onnxruntime-gpu`: the
+main install grabbed the wrong `1.27.0` (a 220MB CUDA-13 wheel Kaggle's CUDA-12.x boxes
+can't use) before the pin step undid it.
+
+**Fix shipped in response:** `requirements.txt` now exact-pins both
+(`onnxruntime-gpu==1.26.0`, `transformers==5.12.0`) instead of open ranges, so a
+*refreshed* Kaggle dataset lets the main install get it right on the first pass; and
+Cell 2's pin steps (6b, 6d) now check the installed version first and skip the
+`--force-reinstall` subprocess entirely if it's already correct — so even before the
+dataset is refreshed, once these versions happen to be right, the steps cost ~0s
+instead of 11s/76s. **The one piece that needs a manual action, not code:** the Kaggle
+`fmt-core-pipeline` dataset needs a new version uploaded from the current repo state
+(Add-ons → Data → your dataset → ⋮ → "New Version", re-zip `core_pipeline/` from this
+repo) — until that happens, the main install still grabs the old unbounded versions
+and the pin steps still do real (though now version-checked) work.
+
+General guidance for future rounds: if Cell 2's step-by-step total dominates the
+overall time, the pip install/dependency-resolution path is the bottleneck — check
+first whether it's the same "wrong version installed twice" pattern (an unpinned or
+under-pinned line in `requirements.txt`) before reaching for a wheelhouse or model-
+cache dataset. If warmup/Cell 5b dominates instead, it's model download or GPU load,
+and a model-cache dataset (a Kaggle Dataset pre-populated with `~/.cache/huggingface`
+for manga-ocr + magi, mounted read-only and copied into `HF_HOME` with
+`HF_HUB_OFFLINE=1`) is the next lever to consider — but don't build it speculatively;
+confirm with real timing first.
 
 For when you've already read the above once and just need the checklist:
 
