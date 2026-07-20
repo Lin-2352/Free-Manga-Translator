@@ -837,19 +837,31 @@ document.addEventListener('DOMContentLoaded', () => {
 
   saveLocalPipelineBtn.addEventListener('click', async () => {
     try {
+      // Captured once, up front, before any `await` below -- loadSettings() runs
+      // fire-and-forget from page init (never awaited by anything) and can still be
+      // mid-flight the first time a user interacts with the popup; if it resolves
+      // mid-save it would otherwise blow away whatever was just typed into these
+      // fields between reads. Reading once here means the save is atomic with
+      // respect to that race, regardless of how slow the background load is.
+      const value = normalizePipelineUrl(localPipelineUrl.value);
+      const authToken = localPipelineAuthToken ? localPipelineAuthToken.value.trim() : '';
       await withButton(saveLocalPipelineBtn, async () => {
-        const value = normalizePipelineUrl(localPipelineUrl.value);
         localPipelineUrl.value = value; // show what was actually stored, e.g. an appended /v1/translate-image
         updatePipelineModeBadge(value);
         await chrome.storage.local.set({
           localPipelineUrl: value,
           localPipelineLanguage: localPipelineLanguage.value || 'ja',
-          localPipelineAuthToken: localPipelineAuthToken ? localPipelineAuthToken.value.trim() : '',
+          localPipelineAuthToken: authToken,
         });
         await runtimeMessage({ kind: 'clearCache' });
       });
       flashSaved(saveLocalPipelineBtn);
-      statusText.textContent = 'Local pipeline settings saved';
+      // Never show the token itself -- just enough to eyeball-confirm a paste actually
+      // landed (a remote/Kaggle 403 is otherwise indistinguishable from "nothing saved"
+      // vs. "saved the wrong value", see docs/KAGGLE_USER_MANUAL.md section 10).
+      statusText.textContent = authToken
+        ? `Local pipeline settings saved (auth token: ${authToken.length} chars)`
+        : 'Local pipeline settings saved (no auth token set)';
       checkServerHealth();
     } catch (error) {
       reportPopupError(error);

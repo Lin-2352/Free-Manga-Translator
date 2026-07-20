@@ -307,11 +307,28 @@ re-save it with the full path. As of this manual, saving a bare origin
 auto-appends the correct path for you — if you're on an older extension build, add it
 by hand.
 
-### Every translation returns a 403 / "Offline" with no other explanation
+### Every translation returns a 403 ("Missing or invalid auth token")
 
-The auth token doesn't match. Re-check the popup's **Backend auth token** field
-against the exact `FMT_AUTH_TOKEN` secret value — copy-paste both ends rather than
-retyping, since a single wrong character produces this same generic failure.
+The value the extension is sending doesn't match what the backend actually has in
+memory right now. This one error covers two different real causes — both worth
+checking, since the error text can't tell you which:
+
+1. **The backend hasn't picked up a token you changed.** `FMT_AUTH_TOKEN` is read
+   once, when the backend process starts (Cell 4) — editing the Kaggle Secret
+   afterward does nothing to a process that's already running. If you ever created or
+   changed this secret after Cell 4 had already launched once this session, **re-run
+   Cell 4** (or Run All) so the new value actually takes effect, then re-save the same
+   value in the popup.
+2. **You don't have the exact value on both ends.** Kaggle Secrets are write-only
+   after you save them — there is no way to open the Secrets panel later and see what
+   you typed. If the token wasn't written down somewhere durable *before* it went into
+   the Kaggle secret, there's no way to confirm the popup has the same string. The
+   only reliable fix is to generate a brand new token, write it down first, set it as
+   the `FMT_AUTH_TOKEN` secret, restart the backend (point 1 above), and paste that
+   same fresh value into the popup.
+
+Copy-paste both ends rather than retyping either — a single wrong character produces
+this exact same generic failure with no more specific hint.
 
 ### The response looks like an HTML page instead of a translation
 

@@ -324,12 +324,30 @@ assert.equal(
   true,
   'Save trims and persists the auth token alongside the pipeline URL/language',
 );
+// The status line after Save must give the user something to eyeball-confirm a paste
+// landed (a remote 403 is otherwise indistinguishable from "nothing saved" vs. "saved
+// the wrong value") -- but it must NEVER include the token's actual characters.
+assert.equal(
+  elements.get('statusText').textContent,
+  'Local pipeline settings saved (auth token: 15 chars)',
+  'save confirmation reports the trimmed token length, not the raw value',
+);
+assert.equal(
+  elements.get('statusText').textContent.includes('my-tunnel-token'),
+  false,
+  'the save confirmation never contains the actual token value',
+);
 elements.get('localPipelineAuthToken').value = '';
 await elements.get('saveLocalPipelineBtn').listeners.click();
 assert.equal(
   storageWrites.some((payload) => payload.localPipelineAuthToken === ''),
   true,
   'clearing the field and saving again persists an empty token, not the stale previous value',
+);
+assert.equal(
+  elements.get('statusText').textContent,
+  'Local pipeline settings saved (no auth token set)',
+  'save confirmation reflects an empty token distinctly from a set one',
 );
 
 // ===== URL normalization (the bare-origin trap): a bare origin with no path passed health
