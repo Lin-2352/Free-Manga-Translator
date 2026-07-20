@@ -52,6 +52,7 @@ function makeContext(sessionStore) {
 
   const sandbox = {
     console,
+    URL,
     setTimeout,
     clearTimeout,
     AbortController,

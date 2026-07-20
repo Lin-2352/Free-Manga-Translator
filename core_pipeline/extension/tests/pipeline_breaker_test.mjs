@@ -30,6 +30,7 @@ class MockDate {
 
 const sandbox = {
   console,
+  URL,
   Date: MockDate,
   setTimeout,
   clearTimeout,

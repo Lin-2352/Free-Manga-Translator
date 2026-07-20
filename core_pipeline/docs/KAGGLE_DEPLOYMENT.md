@@ -8,6 +8,10 @@ today. The extension talks to the Kaggle-hosted backend over an HTTPS tunnel ins
 the popup once, and everything else (queue, cache, auto-translate, quota dashboard, the
 offline circuit breaker) works unmodified.
 
+**Just want the walkthrough, not the deep technical reference?** See
+`docs/KAGGLE_USER_MANUAL.md` — that's the step-by-step guide; this document is the
+"why" behind each step, plus security analysis and full troubleshooting.
+
 If you only want the short version: skip to [Quick start](#quick-start). Everything
 after that is the "extreme detail" the rest of this document promises — read it before
 you put real API keys anywhere.
@@ -26,7 +30,8 @@ you put real API keys anywhere.
 8. [Security & leak analysis](#8-security--leak-analysis)
 9. [Cloudflare Tunnel — the zero-account fallback](#9-cloudflare-tunnel--the-zero-account-fallback)
 10. [Troubleshooting](#10-troubleshooting)
-11. [Quick start](#quick-start)
+11. [Cold-start timing](#11-cold-start-timing)
+12. [Quick start](#quick-start)
 
 ---
 
@@ -602,9 +607,10 @@ Once cell 6 has printed your public URL:
 1. Open the extension popup → **Local Pipeline URL** field.
 2. Paste the **full endpoint path**, not just the domain:
    `https://yourname-something.ngrok-free.app/v1/translate-image`
-   (the field has **no validation** — a bare domain without `/v1/translate-image` will
-   save without error but silently fail on the first real translate request, so get
-   this exact).
+   (saving now auto-appends `/v1/translate-image` if you paste a bare domain with no
+   path — `popup.js`'s `normalizePipelineUrl()` — but a URL that already has a
+   *different* path is left untouched, so it's still worth pasting the exact line
+   Cell 6 prints rather than relying on the auto-fix).
 3. Paste your `FMT_AUTH_TOKEN` value into the **Backend auth token** field (same popup
    panel, just below the URL field).
 4. Click **Save**. This automatically re-runs the health check (`checkServerHealth()`)
@@ -632,7 +638,7 @@ built into the extension itself, not something this deployment adds.
 | VRAM dashboard (`/v1/vram-status`) | Yes — shows the actual T4's memory, via `nvidia-smi` on the Kaggle VM |
 | Offline "will resume automatically" badge | Yes — see §7 for tunnel-blip behavior |
 | "Open Quota/VRAM Log" buttons | **No** — spawns a PowerShell window on the backend host, meaningless on headless Kaggle; fails gracefully with a status message, no crash |
-| "Start it from PowerShell" hint text | Not applicable — you started it from the notebook, not PowerShell |
+| "Start Engine" failure guidance | Remote-aware: `background.js` detects a non-loopback URL and shows Kaggle/tunnel-specific steps (check the session, re-run Cell 6) instead of the local "open PowerShell" instructions |
 
 ---
 
@@ -656,22 +662,24 @@ an unattended session alive for hours.
 run executes headless to completion and its tunnel URL isn't reachable the way you
 need — always run this as a live interactive session, not a scheduled/committed one.
 
-**Cold-start timing** (first run on a fresh session, nothing cached):
-- pip installs (cell 2): **5-10 minutes**, most of it Paddle/PaddleOCR and (if
-  needed) the pinned CUDA torch wheel.
-- Model downloads on first warmup (magi, manga-ocr, EasyOCR/PaddleOCR packs from
-  HuggingFace/package caches): **5-15 minutes**, network-dependent.
-- Warmup itself once weights are on disk: **2-5 minutes**, this session's own
-  local verification measured **~100 seconds** with weights already cached on disk —
-  budget for the higher end (or more) on a truly fresh Kaggle session downloading
-  everything for the first time.
+**Cold-start timing — real measured numbers, not estimates** (see §11 for the full
+breakdown and methodology): a genuinely fresh Kaggle session's `Run All` measured
+**370.7s (~6.2 min)** total to a working public URL — Cell 2 (dependency install)
+211.0s, warmup 60.6s, Cell 5b's full translate 88.4s. Model downloads (manga-ocr +
+magi, the only two that fetch from Hugging Face on a cold cache) are a modest
+~1.3-1.5GB and were not the bottleneck; the dominant cost was pip resolving/installing
+packages, and — until fixed (§11) — a fully redundant double-install of `transformers`
+and `onnxruntime-gpu` caused by underspecified version ranges. After that fix, expect
+somewhere around **4.7-4.8 minutes** on a genuinely cold session, assuming your
+dataset carries the current `requirements.txt`.
 
-**Speeding up subsequent sessions:** after your first successful run, you can bake the
-downloaded HuggingFace/EasyOCR/PaddleOCR caches into a **new version of your Kaggle
-dataset** (zip `~/.cache/huggingface`, `~/.EasyOCR`, `~/.paddleocr` from
-`/kaggle/working` alongside the code, re-upload as dataset v2). Every session after
-that skips the 5-15 minute download step entirely — this is the single biggest
-speed-up available and worth doing once you're past initial setup.
+**Speeding up further, if still needed:** a Kaggle Dataset pre-populated with
+`~/.cache/huggingface` for manga-ocr + magi, mounted read-only and copied into
+`HF_HOME` with `HF_HUB_OFFLINE=1`, would shave the warmup download time further. This
+was researched but **not built** — the measured bottleneck turned out to be the
+double-install issue above, not model downloads, so this lever wasn't needed to hit
+the sub-5-minute target. Revisit only if a future measured run shows model download
+time dominating again.
 
 **Per-page latency:** pipeline processing time (same as your local machine, likely
 faster — a T4 is a real datacenter GPU) **plus** the round-trip over the tunnel for the
@@ -679,12 +687,23 @@ image upload and translated-image download. For typical manga page sizes this tu
 overhead is small compared to pipeline time, but it is not zero — expect slightly
 higher latency than a purely local setup, especially on a slower home connection.
 
-**ngrok free-tier egress cap: 1GB/month.** Every translated page comes back as a
-base64 data URL (≈1.33× the raw image bytes), so realistically budget **~400-700
-translated pages per month** on the free tier before you hit the cap (depends heavily
-on page resolution). For light personal reading this is unlikely to matter; for heavy
-use, switch to the `cloudflared` fallback in §9, which has no such bandwidth cap
-(trading away the static-domain convenience — see §9 for that trade-off).
+**ngrok free tier — verified against ngrok's own docs, 2026:** 1GB/month bandwidth and
+**20,000 HTTP requests/month**, up to 3 simultaneous online endpoints. Every
+translated page comes back as a base64 data URL (≈1.33× the raw image bytes), so
+realistically budget **~400-700 translated pages per month** on the bandwidth cap
+before the request cap becomes the binding constraint (depends heavily on page
+resolution). For light personal reading this is unlikely to matter; for heavy use,
+switch to the `cloudflared` fallback in §9, which has no such bandwidth cap (trading
+away the static-domain convenience — see §9 for that trade-off).
+
+**No session/endpoint timeout on the free tier** — a claimed static domain (§2) stays
+reachable for as long as the Kaggle notebook session itself is alive; there is no
+separate 2-hour or similar ngrok-side cutoff (an earlier secondhand summary claimed
+one — that claim is wrong and has been corrected here after checking ngrok's own
+documentation directly). Combined with the claimed static domain being **stable
+across sessions** (confirmed empirically: two separate notebook runs both received the
+same `*.ngrok-free.dev` hostname), the extension only needs to be pointed at the URL
+**once** — not re-configured every time you start a new session.
 
 **Tunnel blips and the offline circuit breaker:** the extension's circuit breaker
 (`background.js`) trips on a genuine network-level failure (`TypeError` from a failed

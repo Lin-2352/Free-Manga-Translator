@@ -1,5 +1,8 @@
 ﻿# User Guide
 
+No GPU, or want to skip keeping a local server open? See `docs/KAGGLE_USER_MANUAL.md`
+for running the backend on Kaggle's free GPU instead.
+
 ## Start
 
 ```powershell

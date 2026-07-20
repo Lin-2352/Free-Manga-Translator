@@ -143,6 +143,7 @@ async function mockFetch(url, options = {}) {
 
 const sandbox = {
   console,
+  URL,
   setTimeout,
   clearTimeout,
   AbortController,

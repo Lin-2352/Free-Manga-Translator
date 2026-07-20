@@ -97,6 +97,8 @@ curl http://127.0.0.1:8766/health
 6. Open a manga page, open the extension popup, and click **Start Engine** to confirm the backend
    is reachable — then **Translate Page** or enable **Auto Translate**.
 
+No GPU? Run the backend on Kaggle's free T4 instead — see `docs/KAGGLE_USER_MANUAL.md`.
+
 ## Examples
 
 ### Sample 1

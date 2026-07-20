@@ -54,6 +54,7 @@ const elementIds = [
   'engineStatusText',
   'hoverHelp',
   'versionBadge',
+  'pipelineModeBadge',
   'themeToggleBtn',
 ];
 
@@ -329,6 +330,52 @@ assert.equal(
   storageWrites.some((payload) => payload.localPipelineAuthToken === ''),
   true,
   'clearing the field and saving again persists an empty token, not the stale previous value',
+);
+
+// ===== URL normalization (the bare-origin trap): a bare origin with no path passed health
+// checks (which rewrite to /v1/health) while every real translate request 404'd, since the
+// translate POST uses the saved URL verbatim. Saving must append /v1/translate-image when
+// the path is empty, and must never touch a URL that already has a real path. =====
+elements.get('localPipelineUrl').value = 'https://example-test.ngrok-free.app';
+await elements.get('saveLocalPipelineBtn').listeners.click();
+assert.equal(
+  storageWrites.at(-1).localPipelineUrl,
+  'https://example-test.ngrok-free.app/v1/translate-image',
+  'a bare origin with no path gets /v1/translate-image appended on save',
+);
+assert.equal(
+  elements.get('localPipelineUrl').value,
+  'https://example-test.ngrok-free.app/v1/translate-image',
+  'the visible field is updated to show what was actually stored',
+);
+assert.equal(
+  elements.get('pipelineModeBadge').textContent,
+  'REMOTE',
+  'the header badge flips to REMOTE when the saved backend is not loopback',
+);
+
+elements.get('localPipelineUrl').value = 'https://example-test.ngrok-free.app/v1/translate-image';
+await elements.get('saveLocalPipelineBtn').listeners.click();
+assert.equal(
+  storageWrites.at(-1).localPipelineUrl,
+  'https://example-test.ngrok-free.app/v1/translate-image',
+  'a URL that already has the correct path is left untouched',
+);
+
+elements.get('localPipelineUrl').value = 'not a valid url at all';
+await elements.get('saveLocalPipelineBtn').listeners.click();
+assert.equal(
+  storageWrites.at(-1).localPipelineUrl,
+  'not a valid url at all',
+  'an unparseable value is saved exactly as typed, never mangled or guessed at',
+);
+
+elements.get('localPipelineUrl').value = 'http://127.0.0.1:8766/v1/translate-image';
+await elements.get('saveLocalPipelineBtn').listeners.click();
+assert.equal(
+  elements.get('pipelineModeBadge').textContent,
+  'LOCAL',
+  'the header badge flips back to LOCAL when the saved backend is loopback again',
 );
 
 await elements.get('startEngineBtn').listeners.click();

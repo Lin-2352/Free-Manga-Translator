@@ -13,6 +13,9 @@ let fetchedUrl = '';
 let fetchedBody = null;
 let fetchedHeaders = null;
 let fetchCount = 0;
+let healthCheckHeaders = null;
+let simulateHealthFailure = false;
+let localPipelineUrlSetting = 'http://127.0.0.1:8766/v1/translate-image';
 let localPipelineAuthTokenSetting = '';
 let contentInjected = false;
 const contentMessages = [];
@@ -33,6 +36,7 @@ class MockFileReader {
 
 const sandbox = {
   console,
+  URL,
   setTimeout,
   clearTimeout,
   AbortController,
@@ -41,7 +45,7 @@ const sandbox = {
     storage: {
       local: {
         get: async () => ({
-          localPipelineUrl: 'http://127.0.0.1:8766/v1/translate-image',
+          localPipelineUrl: localPipelineUrlSetting,
           localPipelineLanguage: localPipelineLanguageSetting,
           localPipelineAuthToken: localPipelineAuthTokenSetting,
           translationCachePages: 12,
@@ -145,6 +149,10 @@ const sandbox = {
       };
     }
     if (String(url).includes('/v1/health')) {
+      healthCheckHeaders = options.headers || {};
+      if (simulateHealthFailure) {
+        return { ok: false, status: 503, json: async () => ({ ok: false }) };
+      }
       return {
         ok: true,
         json: async () => ({ ok: true }),
@@ -242,6 +250,11 @@ assert.equal(
   false,
   'no auth token configured -- X-Fmt-Auth is never sent (byte-identical to every existing local deployment)',
 );
+assert.equal(
+  fetchedHeaders['ngrok-skip-browser-warning'],
+  '1',
+  'the ngrok interstitial-bypass header is always sent, even against a plain loopback backend',
+);
 
 // ===== Optional auth-token hardening (docs/KAGGLE_DEPLOYMENT.md): when the user configures a
 // token in the popup, every backend fetch must carry it; when they don't, it must never appear. =====
@@ -264,6 +277,7 @@ await new Promise((resolve) => {
 });
 assert.equal(fetchedHeaders['X-Fmt-Auth'], 'super-secret-tunnel-token', 'translate-image request carries the configured auth token');
 assert.equal(fetchedHeaders['X-Fmt-Client'], 'free-manga-translator-extension', 'the client-id header is still sent alongside the auth token');
+assert.equal(fetchedHeaders['ngrok-skip-browser-warning'], '1', 'the ngrok bypass header is also sent alongside the auth token');
 
 const quotaResponse = await new Promise((resolve) => {
   messageListener({ kind: 'getQuotaStatus' }, { tab: { id: 1 } }, resolve);
@@ -374,6 +388,38 @@ const startEngineResponse = await new Promise((resolve) => {
 });
 assert.equal(startEngineResponse.ok, true, 'background can health-check and warm up the local engine');
 assert.equal(startEngineResponse.warmup.ok, true, 'start engine requests backend warmup');
+assert.equal(
+  healthCheckHeaders?.['ngrok-skip-browser-warning'],
+  '1',
+  'the health check (the one request that decides the badge state) also carries the ngrok bypass header',
+);
+assert.equal(
+  healthCheckHeaders?.['X-Fmt-Client'],
+  'free-manga-translator-extension',
+  'the health check also carries the client-id header',
+);
+
+// ===== Remote-backend (Kaggle + ngrok) awareness: when the configured URL is not loopback and
+// the backend is unreachable, Start Engine must not tell the user to open PowerShell -- that
+// guidance is actively wrong for a tunnel-based backend. =====
+localPipelineUrlSetting = 'https://example-test.ngrok-free.app/v1/translate-image';
+simulateHealthFailure = true;
+const remoteStartEngineResponse = await new Promise((resolve) => {
+  messageListener({ kind: 'startEngine' }, { tab: { id: 1 } }, resolve);
+});
+assert.equal(remoteStartEngineResponse.ok, false, 'start engine reports failure when the remote backend is unreachable');
+assert.equal(
+  remoteStartEngineResponse.manualStartSteps.some((step) => /powershell/i.test(step)),
+  false,
+  'a remote/tunnel backend must not be told to start a local PowerShell server',
+);
+assert.equal(
+  remoteStartEngineResponse.manualStartSteps.some((step) => /kaggle|tunnel/i.test(step)),
+  true,
+  'a remote/tunnel backend gets Kaggle/tunnel-specific guidance instead',
+);
+simulateHealthFailure = false;
+localPipelineUrlSetting = 'http://127.0.0.1:8766/v1/translate-image';
 
 const releaseGpuResponse = await new Promise((resolve) => {
   messageListener({ kind: 'releaseGpu' }, { tab: { id: 1 } }, resolve);

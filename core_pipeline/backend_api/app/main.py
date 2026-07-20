@@ -42,7 +42,7 @@ app.add_middleware(
     allow_origin_regex=r"^(chrome-extension://.*|http://127\.0\.0\.1(:\d+)?|http://localhost(:\d+)?)$",
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Fmt-Client", "X-Fmt-Auth"],
+    allow_headers=["Content-Type", "Authorization", "X-Fmt-Client", "X-Fmt-Auth", "ngrok-skip-browser-warning"],
 )
 
 # Every route except the bare health check requires this header. It buys two things cheaply:

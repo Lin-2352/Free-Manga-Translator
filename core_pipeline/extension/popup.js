@@ -47,9 +47,45 @@ document.addEventListener('DOMContentLoaded', () => {
   const engineStatusText = document.getElementById('engineStatusText');
   const hoverHelp = document.getElementById('hoverHelp');
   const versionBadge = document.getElementById('versionBadge');
+  const pipelineModeBadge = document.getElementById('pipelineModeBadge');
   const themeToggleBtn = document.getElementById('themeToggleBtn');
 
   const DEFAULT_LOCAL_PIPELINE_URL = 'http://127.0.0.1:8766/v1/translate-image';
+  // The saved URL is used verbatim for the translate POST but every OTHER endpoint
+  // (health, warmup, quota, vram) is derived from it by pathname rewriting -- so a
+  // bare origin (e.g. "https://foo.ngrok-free.dev" with no path) passes the health
+  // check (which rewrites to /v1/health) while every real translate request 404s.
+  // This was the single most likely way to misconfigure a remote/Kaggle backend.
+  // Conservative fix: only touch URLs that actually parse; anything that doesn't
+  // parse is saved exactly as typed, same as before this existed.
+  function normalizePipelineUrl(rawValue) {
+    const trimmed = (rawValue || '').trim();
+    if (!trimmed) return DEFAULT_LOCAL_PIPELINE_URL;
+    let url;
+    try {
+      url = new URL(trimmed);
+    } catch {
+      return trimmed; // unparseable -- leave it alone, don't guess
+    }
+    if (url.pathname === '' || url.pathname === '/') {
+      url.pathname = '/v1/translate-image';
+    } else if (url.pathname.length > 1 && url.pathname.endsWith('/')) {
+      url.pathname = url.pathname.replace(/\/+$/, '');
+    }
+    return url.toString();
+  }
+
+  function updatePipelineModeBadge(pipelineUrl) {
+    if (!pipelineModeBadge) return;
+    let isLoopback = true;
+    try {
+      const host = new URL(pipelineUrl).hostname;
+      isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '[::1]';
+    } catch {
+      isLoopback = true;
+    }
+    pipelineModeBadge.textContent = isLoopback ? 'LOCAL' : 'REMOTE';
+  }
   // Must match background.js's own DEFAULT_CACHE_LIMIT: a cache smaller than the
   // queue-ahead depth LRU-evicts the page you started reading before you're done
   // with it. A prior mismatch here (12 vs background's 24, and 24 wasn't even a
@@ -118,6 +154,7 @@ document.addEventListener('DOMContentLoaded', () => {
     localPipelineUrl.value = result.localPipelineUrl || DEFAULT_LOCAL_PIPELINE_URL;
     localPipelineLanguage.value = result.localPipelineLanguage || 'ja';
     if (localPipelineAuthToken) localPipelineAuthToken.value = result.localPipelineAuthToken || '';
+    updatePipelineModeBadge(localPipelineUrl.value);
     translationCachePages.value = String(result.translationCachePages ?? DEFAULT_CACHE_LIMIT);
     translationQueuePages.value = String(result.translationQueuePages ?? DEFAULT_QUEUE_LIMIT);
     translationParallelPages.value = String(result.translationParallelPages ?? DEFAULT_PARALLEL_LIMIT);
@@ -801,7 +838,9 @@ document.addEventListener('DOMContentLoaded', () => {
   saveLocalPipelineBtn.addEventListener('click', async () => {
     try {
       await withButton(saveLocalPipelineBtn, async () => {
-        const value = localPipelineUrl.value.trim() || DEFAULT_LOCAL_PIPELINE_URL;
+        const value = normalizePipelineUrl(localPipelineUrl.value);
+        localPipelineUrl.value = value; // show what was actually stored, e.g. an appended /v1/translate-image
+        updatePipelineModeBadge(value);
         await chrome.storage.local.set({
           localPipelineUrl: value,
           localPipelineLanguage: localPipelineLanguage.value || 'ja',

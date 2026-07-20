@@ -9,12 +9,21 @@ const APP_VERSION = '1.1.15';
 const FMT_CLIENT_HEADER = 'X-Fmt-Client';
 const FMT_CLIENT_VALUE = 'free-manga-translator-extension';
 // Optional second header, only sent when the user has set a token in the popup (e.g. the backend
-// is reachable over a public tunnel rather than loopback -- see docs/KAGGLE_DEPLOYMENT.md). Empty
-// or unset locally means this never gets added, so every existing local deployment is unaffected.
+// is reachable over a public tunnel rather than loopback -- see
+// core_pipeline/docs/KAGGLE_DEPLOYMENT.md and docs/KAGGLE_USER_MANUAL.md). Empty or unset locally
+// means this never gets added, so every existing local deployment is unaffected.
 const FMT_AUTH_HEADER = 'X-Fmt-Auth';
+// Bypasses ngrok's free-tier browser-warning interstitial (ERR_NGROK_6024), which can otherwise
+// return an HTML page instead of the real JSON response on a free *.ngrok-free.app tunnel. Sent
+// unconditionally -- harmless against a plain loopback backend, which just ignores an extra header.
+const NGROK_SKIP_WARNING_HEADER = 'ngrok-skip-browser-warning';
 
 function fmtHeaders(settings, extra = {}) {
-  const headers = { ...extra, [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE };
+  const headers = {
+    ...extra,
+    [FMT_CLIENT_HEADER]: FMT_CLIENT_VALUE,
+    [NGROK_SKIP_WARNING_HEADER]: '1',
+  };
   if (settings?.localPipelineAuthToken) headers[FMT_AUTH_HEADER] = settings.localPipelineAuthToken;
   return headers;
 }
@@ -445,6 +454,12 @@ async function checkPipelineHealth(settings, options = {}) {
     const response = await fetch(healthUrlForPipeline(settings.localPipelineUrl), {
       method: 'GET',
       cache: 'no-store',
+      // Was missing: /v1/health is the ONE request that decides "is the backend up" for
+      // the badge/Start Engine, and it was the only fmtHeaders() caller sending no headers
+      // at all -- so it never carried the ngrok interstitial-bypass header, meaning a free
+      // ngrok tunnel could hand back its HTML warning page here (and fail this check) while
+      // every other request correctly bypassed it.
+      headers: fmtHeaders(settings),
     });
     if (!response.ok) throw new Error(`HEALTH_${response.status}`);
     requestPipelineWarmup(settings).catch(() => {});
@@ -455,7 +470,29 @@ async function checkPipelineHealth(settings, options = {}) {
   }
 }
 
-function manualStartStepsForEngine() {
+// A configured pipeline URL that isn't loopback is a remote backend (Kaggle+ngrok being the
+// only supported case today) -- used to swap the "start a local server" guidance for tunnel
+// guidance, since telling a Kaggle user to open PowerShell and run uvicorn is actively wrong.
+function isLoopbackPipelineUrl(pipelineUrl) {
+  try {
+    const host = new URL(pipelineUrl).hostname;
+    return host === '127.0.0.1' || host === 'localhost' || host === '[::1]';
+  } catch {
+    return true; // unparseable -- assume local, the historical default, rather than guess remote
+  }
+}
+
+function manualStartStepsForEngine(pipelineUrl) {
+  if (!isLoopbackPipelineUrl(pipelineUrl)) {
+    return [
+      'This URL points at a remote backend (Kaggle + ngrok), not a local server -- Chrome cannot start that for you.',
+      'Confirm the Kaggle notebook session is still running (Kaggle sessions end after ~60 min idle or a 9-hour max).',
+      'If the session ended, re-run the notebook (Run All) and wait for Cell 6 to print a public URL.',
+      'If the session is running but this still fails, re-run Cell 6 -- the ngrok URL may have changed if the tunnel restarted.',
+      'Confirm the URL saved here still ends in /v1/translate-image and the auth token matches the notebook\'s FMT_AUTH_TOKEN secret.',
+      'See docs/KAGGLE_USER_MANUAL.md for the full walkthrough.',
+    ];
+  }
   return [
     'Chrome and Brave extensions cannot directly launch Python for every user without a native messaging host.',
     'Open PowerShell in the app core_pipeline folder.',
@@ -472,8 +509,10 @@ async function startPipelineEngine() {
       ok: false,
       available: false,
       needsManualStart: true,
-      message: 'Local backend is not running. Start it from PowerShell, then retry.',
-      manualStartSteps: manualStartStepsForEngine(),
+      message: isLoopbackPipelineUrl(settings.localPipelineUrl)
+        ? 'Local backend is not running. Start it from PowerShell, then retry.'
+        : 'Remote backend is not reachable. Check the Kaggle session and tunnel, then retry.',
+      manualStartSteps: manualStartStepsForEngine(settings.localPipelineUrl),
     };
   }
   const warmup = await requestPipelineWarmup(settings, true);
