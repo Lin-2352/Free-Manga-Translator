@@ -1226,15 +1226,17 @@
           // retry path below, this does NOT count against MAX_RETRIES and never shows an error
           // badge on the page -- the outage could last arbitrarily long, and the offline state is
           // only surfaced in the extension popup, not on every image on the page.
-          // cleanupProcessing already hid this image's spinner (fast short-circuit, not a hang);
-          // just reschedule silently and let the breaker's own recovery probe resume it.
+          // Spinner stays visible through the retry wait (same as the retryable-error path
+          // below) instead of being hidden now and reappearing PIPELINE_OFFLINE_RETRY_DELAY_MS
+          // later -- a flapping tunnel under heavy Kaggle OCR load repeatedly tripping this
+          // path made the spinner look like it was randomly stopping, when it was actually
+          // just hidden for the entire duration of every silent retry wait.
           setTimeout(() => {
             img.removeAttribute(PROCESSING_ATTR);
             pendingSrcs.delete(cacheKey);
             translateImage(img, { force: options.force === true, originalSrc, cacheKey });
           }, PIPELINE_OFFLINE_RETRY_DELAY_MS);
-          cleanupProcessing(img, cacheKey);
-          return;
+          return; // spinner stays during retry
         }
         if (response.error === 'FullQueue' || response.error === 'QueueFull' || response.error === 'RATE_LIMITED' || response.error === 'PIPELINE_TIMEOUT') {
           const retryCount = (retryCountMap.get(cacheKey) || 0) + 1;

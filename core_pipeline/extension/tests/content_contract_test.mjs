@@ -869,8 +869,12 @@ assert.equal(translateRequests.length, requestsBeforeError + 2, 'clicking the ba
 assert.equal(badgeNode.removed, true, 'the badge is removed as soon as it is clicked');
 assert.equal(translatedAttrs.get('data-fmt-translated'), 'true', 'the retried translation succeeded and applied normally');
 
-// ===== PIPELINE_OFFLINE (background.js's circuit breaker) must be silent on the page -- no
-// spinner left showing, no error badge -- unlike every other terminal/retryable error above. =====
+// ===== PIPELINE_OFFLINE (background.js's circuit breaker) must never show an error badge on
+// the page -- unlike every other terminal/retryable error above, the outage could last
+// arbitrarily long and is only surfaced in the popup. The spinner, however, must STAY visible
+// through the silent retry wait (same as the retryable-error path) rather than disappearing
+// immediately and reappearing 12s later -- that flicker previously made a flapping backend
+// look like the spinner was randomly stopping. =====
 fakeImages = [fakeImage];
 translatedAttrs.clear();
 removedAttrs.length = 0;
@@ -885,7 +889,7 @@ contentListener({ kind: 'translatePageOnce' }, {}, () => {});
 await new Promise((resolve) => setTimeout(resolve, 10));
 
 assert.equal(translateRequests.length, requestsBeforeOffline + 1, 'exactly one attempt was sent for the offline response');
-assert.equal(translatedAttrs.has('data-fmt-processing'), false, 'the processing marker (and its spinner) is cleared immediately, not left spinning');
+assert.equal(translatedAttrs.get('data-fmt-processing'), 'true', 'the processing marker (and its spinner) stays visible through the silent retry wait, not hidden immediately');
 const offlineBadge = appendedNodes.slice(appendedBeforeOffline).find((node) => node.className === 'fmt-img-error-badge');
 assert.equal(offlineBadge, undefined, 'PIPELINE_OFFLINE never shows a visible error badge on the page -- the offline state only surfaces in the popup');
 // The resume retry is scheduled with a 12s delay; this harness's setTimeout mock only fires
