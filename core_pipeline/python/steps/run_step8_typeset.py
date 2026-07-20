@@ -97,8 +97,13 @@ if not os.path.exists(FLOATING_FONT_PATH):
 
 NARROW_FLOATING_FONT_PATH = "C:/Windows/Fonts/arialnb.ttf"
 if not os.path.exists(NARROW_FLOATING_FONT_PATH):
-    NARROW_FLOATING_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-if not os.path.exists(NARROW_FLOATING_FONT_PATH):
+    # Was falling straight to plain DejaVu here, unlike every other font role in this
+    # file (FONT_PATH/MODERN_REFERENCE_FONT_PATH/FLOATING_FONT_PATH all try the bundled
+    # ComicNeue before DejaVu) -- on Linux/Kaggle, arialnb.ttf never exists but DejaVu
+    # always does, so this landed on plain DejaVu deterministically for every tall/narrow
+    # floating caption box while ordinary bubbles on the same page correctly used
+    # ComicNeue. FLOATING_FONT_PATH already resolves to the bundled ComicNeue-Bold on
+    # Linux (via its own fallback to FONT_PATH), so route through it instead.
     NARROW_FLOATING_FONT_PATH = FLOATING_FONT_PATH
 
 DENSE_FONT_PATH = "C:/Windows/Fonts/arial.ttf"
