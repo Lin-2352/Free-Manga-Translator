@@ -268,7 +268,15 @@ def _load_anime_lama_model(model_path: Path = ANIME_LAMA_PATH):
         return None, None
 
     device = torch.device("cuda")
-    model = torch.jit.load(str(model_path), map_location="cpu").to(device).eval()
+    try:
+        model = torch.jit.load(str(model_path), map_location="cpu").to(device).eval()
+    except Exception as error:
+        # Mirrors the sibling manga-cleaner loader's guard below. A corrupt/bad
+        # checkpoint must fail once and be remembered (see _ANIME_LAMA_LOAD_ATTEMPTED
+        # in _get_anime_lama_model, set BEFORE this call is attempted), not retried
+        # on every single request forever.
+        print(f"  [AnimeLaMa] load failed; floating text will use ONNX LaMa fallback. {str(error)[:160]}")
+        return None, None
     print(f"  [AnimeLaMa] floating-text inpainter: CUDA LOCKED ({model_path})")
     return model, device
 
@@ -287,8 +295,12 @@ def _get_anime_lama_model():
     if not _ANIME_LAMA_LOAD_ATTEMPTED:
         with _MODEL_LOAD_LOCK:
             if not _ANIME_LAMA_LOAD_ATTEMPTED:
-                _ANIME_LAMA_MODEL, _ANIME_LAMA_DEVICE = _load_anime_lama_model()
+                # Set the attempted-flag BEFORE attempting the load (not after
+                # success) so that even an exception escaping _load_anime_lama_model
+                # (belt-and-suspenders on top of its own try/except) is remembered
+                # as "already tried" instead of retrying the load on every request.
                 _ANIME_LAMA_LOAD_ATTEMPTED = True
+                _ANIME_LAMA_MODEL, _ANIME_LAMA_DEVICE = _load_anime_lama_model()
     return _ANIME_LAMA_MODEL, _ANIME_LAMA_DEVICE
 
 
@@ -729,14 +741,27 @@ def _external_inpaint_command_local_crop(
             )
             for token in template_tokens
         ]
-        completed = subprocess.run(
-            argv,
-            shell=False,
-            cwd=str(EXTERNAL_INPAINT_CWD),
-            capture_output=True,
-            text=True,
-            timeout=float(os.getenv("MANGA_INPAINT_COMMAND_TIMEOUT", "180")),
-        )
+        try:
+            completed = subprocess.run(
+                argv,
+                shell=False,
+                cwd=str(EXTERNAL_INPAINT_CWD),
+                capture_output=True,
+                text=True,
+                timeout=float(os.getenv("MANGA_INPAINT_COMMAND_TIMEOUT", "180")),
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                "  [ExternalInpaint] command timed out; using local fallback.",
+                flush=True,
+            )
+            return False
+        except OSError as error:
+            print(
+                f"  [ExternalInpaint] command failed to launch ({error}); using local fallback.",
+                flush=True,
+            )
+            return False
         if completed.returncode != 0:
             print(
                 "  [ExternalInpaint] command failed; using local fallback. "
@@ -1022,9 +1047,22 @@ def _maybe_fill_screentone_background(reference, image, x1, y1, x2, y2, padding:
     return True
 
 
-def _clean_white_bubble_residue(image: np.ndarray, region_mask: np.ndarray, bubble_mask: np.ndarray) -> np.ndarray:
+def _clean_white_bubble_residue(
+    image: np.ndarray,
+    region_mask: np.ndarray,
+    bubble_mask: np.ndarray,
+    source: np.ndarray | None = None,
+) -> np.ndarray:
+    """`image` is the paint target (the progressively-mutated working canvas -- the fill is
+    written into it). `source` is the PRISTINE page, used only for the gate and the sampled
+    fill color -- reading `image` for those would test/sample pixels a prior model pass has
+    already smudged, so the rescue would decline (or sample a smudged color) exactly when a
+    prior pass damaged the interior enough to matter. Falls back to `image` when `source` is
+    not supplied, matching the historical (buggy) behavior for any other caller."""
     if bubble_mask is None or not np.any(region_mask > 0):
         return np.zeros(region_mask.shape, dtype=np.uint8)
+    if source is None:
+        source = image
 
     kernel_3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     safe_bubble = cv2.erode(bubble_mask, kernel_3, iterations=2)
@@ -1034,7 +1072,7 @@ def _clean_white_bubble_residue(image: np.ndarray, region_mask: np.ndarray, bubb
     if np.count_nonzero(cleanup_mask) < 20:
         return np.zeros(region_mask.shape, dtype=np.uint8)
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
     bubble_pixels = gray[safe_bubble > 0]
     if bubble_pixels.size < 100:
         return np.zeros(region_mask.shape, dtype=np.uint8)
@@ -1048,7 +1086,7 @@ def _clean_white_bubble_residue(image: np.ndarray, region_mask: np.ndarray, bubb
     if np.count_nonzero(background_area) < 50:
         return np.zeros(region_mask.shape, dtype=np.uint8)
 
-    fill_color = np.median(image[background_area], axis=0).astype(np.uint8)
+    fill_color = np.median(source[background_area], axis=0).astype(np.uint8)
     image[cleanup_mask > 0] = fill_color
     return cleanup_mask
 
@@ -10841,8 +10879,24 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
 
         print(f"\nProcessing {sample_name}")
         image = cv2.imread(str(img_path))
+        if image is None:
+            raise ValueError(
+                f"cv2.imread() could not read {img_path} -- the file is missing, truncated, or "
+                "not a valid image. This surfaces here as a clear error instead of the cryptic "
+                "'NoneType' object has no attribute 'shape'."
+            )
         img_h, img_w = image.shape[:2]
         seg_mask = _imread_grayscale_2d(seg_mask_path)
+        if seg_mask is None:
+            # seg_mask_path.exists() was already confirmed above, but exists()
+            # doesn't guarantee the file is decodable -- a truncated/corrupt
+            # seg_mask.png yields None here. Every downstream use of seg_mask
+            # in this function assumes a valid array (subscripting it directly),
+            # so treat this exactly like the "file missing" case above instead
+            # of letting a later `seg_mask[y1:y2, x1:x2]` crash the whole page
+            # with an uncaught 'NoneType' object is not subscriptable.
+            print(f"  SKIP {sample_name}: seg_mask.png exists but failed to decode (corrupt/truncated)")
+            continue
 
         with open(layout_path, "r", encoding="utf-8") as layout_file:
             layout_data = json.load(layout_file)
@@ -10912,8 +10966,16 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
                             sy2 = max(0, min(img_h, int(sfx_box[3])))
                             if sx2 > sx1 and sy2 > sy1:
                                 sfx_preserved_mask[sy1:sy2, sx1:sx2] = 255
-            except (json.JSONDecodeError, OSError, ValueError, TypeError):
-                pass
+            except (json.JSONDecodeError, OSError, ValueError, TypeError) as _sfx_load_error:
+                # A failed load here silently drops onomatopoeia protection --
+                # the inpainter can then erase the artist's own SFX lettering
+                # thinking it's translatable text. Log loudly; this is
+                # deliberately log-only (no behavior change) to avoid pixel
+                # risk in the inpainting path itself.
+                print(
+                    f"  [step4-warn] failed to load sfx_artwork_regions.json ({sfx_regions_path}): "
+                    f"{_sfx_load_error!r} -- SFX/onomatopoeia protection is DISABLED for this page"
+                )
         page_dialogue_hue = _page_dialogue_lettering_hue(
             image,
             seg_mask,
@@ -11072,7 +11134,8 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
                         img_h, img_w, x1, y1, x2, y2,
                     )
                     grown = _reinpaint_ghost_residue(
-                        anime_model, anime_device, result, (x1, y1, x2, y2), grown
+                        anime_model, anime_device, result, (x1, y1, x2, y2), grown,
+                        container_mask=bubble_mask,
                     )
                     tinted_mask[y1:y2, x1:x2] = grown
                     final_mask = cv2.bitwise_or(final_mask, tinted_mask)
@@ -11094,7 +11157,7 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
                     cleanup_y2 = min(img_h, y2 + cleanup_pad)
                     box_cleanup_mask[cleanup_y1:cleanup_y2, cleanup_x1:cleanup_x2] = 255
                     cleanup_input = cv2.bitwise_or(cleanup_input, box_cleanup_mask)
-                cleanup_mask = _clean_white_bubble_residue(result, cleanup_input, bubble_mask)
+                cleanup_mask = _clean_white_bubble_residue(result, cleanup_input, bubble_mask, source=image)
                 region_mask = cv2.bitwise_or(region_mask, cleanup_mask)
                 if precise_layout_mask:
                     fill_coords = (x1, y1, x2, y2)
