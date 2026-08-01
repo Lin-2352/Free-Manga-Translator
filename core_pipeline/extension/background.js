@@ -28,6 +28,11 @@ function fmtHeaders(settings, extra = {}) {
   return headers;
 }
 const CACHE_VERSION = `local-8-step-v13-quality-performance-hardening-v${APP_VERSION}`;
+// Each cache entry is its own chrome.storage.local item under this prefix (fmtCacheV1:<cacheId>),
+// not one giant blob under a single key. cacheId already embeds CACHE_VERSION (buildCacheId), so
+// a stale-version key self-identifies without needing a separate prefix per version.
+const CACHE_ENTRY_PREFIX = 'fmtCacheV1:';
+const LEGACY_SESSION_CACHE_KEY = 'translationCacheEntries';
 const DEFAULT_PARALLEL_LIMIT = 2;
 const MAX_PARALLEL_LIMIT = 3;
 // Must stay >= content.js's DEFAULT_AUTO_QUEUE_LIMIT (20): navigating across
@@ -44,6 +49,17 @@ const MAX_QUEUE_LIMIT = 50;
 const DEFAULT_FETCH_TIMEOUT_MS = 360_000;
 const MIN_FETCH_TIMEOUT_MS = 30_000;
 const MAX_FETCH_TIMEOUT_MS = 900_000;
+// A busy backend already waited out its own gpu_scheduler.py max_wait_seconds (60s by
+// default) before returning PIPELINE_BUSY -- that request lost a race that wasn't its fault,
+// so it gets a bounded number of background-owned retries instead of being handed back to
+// content.js, whose own node-anchored retry silently no-ops on a single-<img> page viewer
+// once the node has moved on to a later page (see requeueIfBusy()).
+const MAX_BUSY_REQUEUE_ATTEMPTS = 3;
+const BUSY_REQUEUE_BASE_DELAY_MS = 2000; // 2s, 4s, 6s across the 3 attempts
+// How long a learned backend capacity reading stays trusted before falling back to the
+// user's configured parallelLimit -- long enough to survive normal polling gaps, short
+// enough that a backend restart (capacity can change with free VRAM) is noticed quickly.
+const BACKEND_CAPACITY_TTL_MS = 120_000;
 
 const outgoingRequests = new Map();
 // Parallel to outgoingRequests, keyed the same way: outgoingRequests only ever stored the raw
@@ -103,6 +119,33 @@ chrome.alarms?.onAlarm?.addListener((alarm) => {
 // await), so every admission check sees in-flight-but-not-yet-registered dispatches too.
 let reservedSlots = 0;
 
+// The backend's real GPU-slot capacity, learned opportunistically -- never queried for on
+// its own. Two write sites: checkPipelineHealth() (scheduler.capacity, from an already-made
+// /v1/health fetch) and processTranslation()'s success path (report.scheduler.capacityAtAcquire,
+// from an already-made translate response). Latest-write-wins by design: capacityAtAcquire
+// reads low during a burst of admissions (gpu_scheduler.py's admission grace window
+// deliberately discounts recent admissions), so latching a running minimum would get
+// permanently stuck low after any burst. A stale/unknown reading (backendCapacity === 0, or
+// older than BACKEND_CAPACITY_TTL_MS) falls back to the user's configured parallelLimit --
+// i.e. today's exact behavior -- so this can only ever narrow concurrency, never widen it
+// past what the user asked for.
+let backendCapacity = 0;
+let backendCapacityAt = 0;
+
+function noteBackendCapacity(capacity) {
+  const value = Number(capacity);
+  if (!Number.isFinite(value) || value < 1) return;
+  backendCapacity = Math.floor(value);
+  backendCapacityAt = nowMs();
+}
+
+function effectiveParallelLimit(settings) {
+  const configured = settings?.parallelLimit ?? DEFAULT_PARALLEL_LIMIT;
+  if (backendCapacity < 1) return configured;
+  if (nowMs() - backendCapacityAt > BACKEND_CAPACITY_TTL_MS) return configured;
+  return Math.max(1, Math.min(configured, backendCapacity));
+}
+
 // Tripped only by a fetch()-level rejection inside callLocalPipeline's own await -- the ONLY
 // place callLocalPipeline throws a TypeError; every other throw there (!response.ok branch,
 // LOCAL_PIPELINE_EMPTY_RESPONSE) is a plain Error, proving the server DID respond. So
@@ -140,9 +183,23 @@ function shouldAttemptDispatch() {
 }
 
 let cacheLoaded = false;
+// Set only after loadCacheFromStorage()'s awaits fully resolve (see ensureCacheLoaded) --
+// memoizes the in-flight LOAD, not just a "loaded" flag, so a second caller arriving while the
+// first is still awaiting chrome.storage.local.get() joins the same promise instead of racing
+// ahead against a still-empty translationCache.
+let cacheLoadPromise = null;
 let isPaused = false;
+// Mirrors queueActivitySinceBoot below: a real pause/resume action (via setTranslationPaused,
+// stopTranslationRuntime, or a storage.onChanged event reflecting one from another context) can
+// land BEFORE this boot-time storage.local.get resolves. Without this flag, that still-pending
+// read finishing late clobbers the just-applied real state back to whatever was persisted before
+// boot -- observed as the extension silently re-pausing (or un-pausing) itself moments after the
+// user acted, for no visible reason. Any real pause-state write, from any source, sets this so the
+// stale boot read can no longer overwrite isPaused.
+let pauseStateSetSinceBoot = false;
 
 chrome.storage.local.get(['translationPaused']).then((result) => {
+  if (pauseStateSetSinceBoot) return;
   isPaused = result.translationPaused === true;
 }).catch(() => {});
 
@@ -268,10 +325,19 @@ function buildQueueStats(settings) {
   return {
     cacheSize: translationCache.size,
     cacheLimit: settings?.cacheLimit ?? DEFAULT_CACHE_LIMIT,
+    cachePersistFailures,
     activeRequests: activeCount,
     queueLength: queuedCount,
     queueLimit,
     parallelLimit,
+    // Read-only: the learned backend capacity and the resulting effective dispatch limit.
+    // Deliberately NOT folded into parallelLimit itself -- popup.js echoes parallelLimit back
+    // after a Save, and the queue stress-test suite asserts activeRequests === parallelLimit;
+    // both would spuriously disagree with a live poll if this clamp were applied upstream.
+    backendCapacity: backendCapacity > 0 && (nowMs() - backendCapacityAt <= BACKEND_CAPACITY_TTL_MS)
+      ? backendCapacity
+      : null,
+    effectiveParallelLimit: effectiveParallelLimit(settings),
     queuedUnique: queuedRequests.size,
     items,
     isPaused,
@@ -462,6 +528,10 @@ async function checkPipelineHealth(settings, options = {}) {
       headers: fmtHeaders(settings),
     });
     if (!response.ok) throw new Error(`HEALTH_${response.status}`);
+    // /v1/health already carries the scheduler's live capacity (gpu_scheduler.py's VRAM-based
+    // admission estimate) -- read it here rather than adding a dedicated fetch elsewhere.
+    const payload = await response.json().catch(() => null);
+    noteBackendCapacity(payload?.scheduler?.capacity);
     requestPipelineWarmup(settings).catch(() => {});
     return true;
   } catch {
@@ -603,94 +673,155 @@ function blobToDataUrl(blob) {
   });
 }
 
+// Errors thrown here are tagged isImageSourceError so the catch block in processTranslation can
+// tell "the target image URL itself is broken/unreachable" apart from "the local pipeline backend
+// is unreachable" -- both can surface as a fetch()-level TypeError, but only the latter is real
+// evidence the backend is down. Without this tag a single broken/dead image src on a page (a
+// common, harmless occurrence) would trip the same circuit breaker as an actual backend outage,
+// short-circuiting every OTHER image on the page with a false PIPELINE_OFFLINE.
+function taggedImageSourceError(message) {
+  const error = new Error(message);
+  error.isImageSourceError = true;
+  return error;
+}
+
 async function fetchImageAsDataUrl(imageUrl) {
   if (!imageUrl || !/^https?:|^file:|^data:/i.test(imageUrl)) {
-    throw new Error('IMAGE_URL_UNSUPPORTED');
+    throw taggedImageSourceError('IMAGE_URL_UNSUPPORTED');
   }
   if (imageUrl.startsWith('data:')) return imageUrl;
-  const response = await fetch(imageUrl, { credentials: 'omit', cache: 'force-cache' });
-  if (!response.ok) throw new Error(`IMAGE_FETCH_${response.status}`);
+  let response;
+  try {
+    response = await fetch(imageUrl, { credentials: 'omit', cache: 'force-cache' });
+  } catch (fetchError) {
+    // A network-level failure fetching the IMAGE (DNS/connection-refused/CORS) throws the exact
+    // same TypeError shape as a failed backend fetch -- rethrow as a plain, tagged Error so it
+    // can never be mistaken for "the backend pipeline itself is unreachable".
+    throw taggedImageSourceError(`IMAGE_FETCH_NETWORK_ERROR: ${fetchError?.message || fetchError}`);
+  }
+  if (!response.ok) throw taggedImageSourceError(`IMAGE_FETCH_${response.status}`);
   const blob = await response.blob();
   return blobToDataUrl(blob);
 }
 
-async function ensureCacheLoaded() {
-  if (cacheLoaded) return;
-  cacheLoaded = true;
-  if (!chrome.storage.session?.get) return;
+// Failures here were previously invisible (a bare catch {} on the old persistCache) -- surfaced
+// in buildQueueStats so the popup/diagnostics can show a real signal instead of a silently
+// diverging count.
+let cachePersistFailures = 0;
+
+function ensureCacheLoaded() {
+  if (cacheLoaded) return Promise.resolve();
+  if (!cacheLoadPromise) cacheLoadPromise = loadCacheFromStorage();
+  return cacheLoadPromise;
+}
+
+async function loadCacheFromStorage() {
+  if (!chrome.storage.local?.get) {
+    cacheLoaded = true;
+    return;
+  }
   try {
-    const result = await chrome.storage.session.get(['translationCacheEntries']);
-    const entries = result.translationCacheEntries || {};
-    Object.keys(entries)
-      .sort((a, b) => (entries[a].lastUsed || 0) - (entries[b].lastUsed || 0))
-      .forEach((key) => {
-        const entry = entries[key];
-        // Mirrors putCachedResult's own storage criteria (hasImage OR non-empty
-        // translations) -- rehydrating only image entries silently dropped every
-        // overlay-only (translations-only) entry from the displayed count on every
-        // service-worker restart. The CACHE_VERSION prefix check discards entries from
-        // a previous extension version so a version bump can't inflate the count with
-        // entries nothing can actually serve (buildCacheId always embeds CACHE_VERSION,
-        // so a stale-version key could never be looked up again anyway).
+    // chrome.storage.local.get(null) returns EVERY key in local storage, including unrelated
+    // settings (localPipelineUrl, translationCachePages, ...) -- the CACHE_ENTRY_PREFIX filter
+    // below is load-bearing, not cosmetic.
+    const all = await chrome.storage.local.get(null);
+    const staleKeys = [];
+    const liveEntries = [];
+    for (const key of Object.keys(all)) {
+      if (!key.startsWith(CACHE_ENTRY_PREFIX)) continue;
+      const entry = all[key];
+      const cacheId = key.slice(CACHE_ENTRY_PREFIX.length);
+      // Mirrors putCachedResult's own storage criteria (hasImage OR non-empty translations).
+      // The CACHE_VERSION prefix check discards entries from a previous extension version so a
+      // version bump can't inflate the count with entries nothing can actually serve
+      // (buildCacheId always embeds CACHE_VERSION, so a stale-version key could never be looked
+      // up again anyway) -- and since chrome.storage.local is durable (unlike the old session
+      // storage, which self-wiped on browser close), those dead entries must be explicitly
+      // removed here or they leak forever.
+      const hasImage = Boolean(entry?.result?.translatedImageDataUrl);
+      const hasTranslations = Array.isArray(entry?.result?.translations) && entry.result.translations.length > 0;
+      if ((hasImage || hasTranslations) && cacheId.startsWith(`${CACHE_VERSION}:`)) {
+        liveEntries.push([cacheId, entry]);
+      } else {
+        staleKeys.push(key);
+      }
+    }
+    // Sort ascending by lastUsed so Map insertion order below IS LRU order (trimCache relies on
+    // this: it evicts translationCache.keys().next().value as "the oldest").
+    liveEntries.sort((a, b) => (a[1].lastUsed || 0) - (b[1].lastUsed || 0));
+    liveEntries.forEach(([cacheId, entry]) => translationCache.set(cacheId, entry));
+    if (staleKeys.length) chrome.storage.local.remove?.(staleKeys).catch(() => {});
+
+    // Best-effort migration from the old single-key chrome.storage.session store (pre-Fix-B).
+    // Session storage is memory-backed, so this only ever matters once per browser session --
+    // after a successful migration the legacy key is gone and this branch is a no-op forever.
+    const legacy = await chrome.storage.session?.get?.([LEGACY_SESSION_CACHE_KEY]).catch(() => null);
+    const legacyEntries = legacy?.[LEGACY_SESSION_CACHE_KEY];
+    if (legacyEntries && typeof legacyEntries === 'object') {
+      for (const [cacheId, entry] of Object.entries(legacyEntries)) {
         const hasImage = Boolean(entry?.result?.translatedImageDataUrl);
         const hasTranslations = Array.isArray(entry?.result?.translations) && entry.result.translations.length > 0;
-        if ((hasImage || hasTranslations) && key.startsWith(`${CACHE_VERSION}:`)) {
-          translationCache.set(key, entry);
-        }
-      });
-  } catch {
-    translationCache.clear();
+        if (!(hasImage || hasTranslations) || !cacheId.startsWith(`${CACHE_VERSION}:`)) continue;
+        if (!translationCache.has(cacheId)) translationCache.set(cacheId, entry);
+        await writeCacheEntry(cacheId, translationCache.get(cacheId));
+      }
+      await chrome.storage.session.remove([LEGACY_SESSION_CACHE_KEY]).catch(() => {});
+    }
+
+    cacheLoaded = true;
+  } catch (error) {
+    // Deliberately NOT clearing translationCache and NOT setting cacheLoaded here -- a
+    // transient storage failure must be retried on the next access, not permanently treated as
+    // "loaded empty" for the rest of this service-worker's lifetime.
+    console.warn('[FMT] cache load failed; will retry on next access:', error?.message || error);
+    cacheLoadPromise = null;
   }
 }
 
-async function persistCache() {
-  if (!chrome.storage.session?.set) return;
-  const orderedKeys = Array.from(translationCache.keys());
-  let survivorKeys = orderedKeys;
-  // Large translated pages are data-URLs; a handful can exceed the session-storage
-  // quota. Previously a set() failure here just silently gave up, leaving the
-  // persisted store frozen at whatever it last held -- so after a service-worker
-  // restart the displayed count would inexplicably diverge from the truth. Retrying
-  // with progressively less of the (serialized copy only -- the real in-memory
-  // translationCache is never touched) oldest-first content means the persisted
-  // store always reflects an honest subset of what's actually cached, even under
-  // quota pressure.
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const entries = {};
-    for (const key of survivorKeys) entries[key] = translationCache.get(key);
-    try {
-      await chrome.storage.session.set({ translationCacheEntries: entries });
-      return;
-    } catch {
-      if (survivorKeys.length === 0) break;
-      survivorKeys = survivorKeys.slice(Math.ceil(survivorKeys.length / 2));
-    }
-  }
-  if (!chrome.storage.session?.remove) return;
+async function writeCacheEntry(cacheId, entry) {
+  if (!chrome.storage.local?.set) return;
   try {
-    await chrome.storage.session.remove(['translationCacheEntries']);
-  } catch {
-    // Nothing more can be done; the in-memory cache remains the source of truth
-    // for the rest of this service-worker's lifetime.
+    await chrome.storage.local.set({ [CACHE_ENTRY_PREFIX + cacheId]: entry });
+  } catch (error) {
+    cachePersistFailures += 1;
+    console.warn('[FMT] cache entry persist failed', cacheId, error?.message || error);
+  }
+}
+
+async function removeCacheEntries(cacheIds) {
+  if (!cacheIds.length || !chrome.storage.local?.remove) return;
+  try {
+    await chrome.storage.local.remove(cacheIds.map((id) => CACHE_ENTRY_PREFIX + id));
+  } catch (error) {
+    cachePersistFailures += 1;
+    console.warn('[FMT] cache entry removal failed', error?.message || error);
   }
 }
 
 async function trimCache(limit) {
   const safeLimit = Math.max(0, Math.min(MAX_CACHE_LIMIT, Number(limit) || 0));
-  if (safeLimit === 0) translationCache.clear();
-  while (translationCache.size > safeLimit) {
-    const oldestKey = translationCache.keys().next().value;
-    if (!oldestKey) break;
-    translationCache.delete(oldestKey);
+  const evicted = [];
+  if (safeLimit === 0) {
+    evicted.push(...translationCache.keys());
+    translationCache.clear();
+  } else {
+    while (translationCache.size > safeLimit) {
+      const oldestKey = translationCache.keys().next().value;
+      if (!oldestKey) break;
+      translationCache.delete(oldestKey);
+      evicted.push(oldestKey);
+    }
   }
-  await persistCache();
+  await removeCacheEntries(evicted);
 }
 
 async function clearTranslationCache() {
+  const allKeys = Array.from(translationCache.keys());
   translationCache.clear();
+  await removeCacheEntries(allKeys);
   if (chrome.storage.session?.remove) {
     try {
-      await chrome.storage.session.remove(['translationCacheEntries']);
+      await chrome.storage.session.remove([LEGACY_SESSION_CACHE_KEY]);
     } catch {
       // no-op
     }
@@ -715,14 +846,25 @@ function buildCacheId(message, settings) {
   ].join(':');
 }
 
+// A cache HIT bumping lastUsed used to persist the ENTIRE cache (await persistCache()) on every
+// single hit, purely to save one timestamp -- multi-megabyte re-serialization on the hottest
+// read path, and (before Fix B) the trigger for the quota-truncation loop running on almost
+// every request. lastUsed is only persisted past this threshold, so gallery ordering
+// (getRecentTranslations sorts on it) survives a restart with a small bounded drift instead of
+// costing a full entry write every time.
+const LAST_USED_PERSIST_INTERVAL_MS = 60_000;
+
 async function getCachedResult(cacheId, settings) {
   await ensureCacheLoaded();
   if (settings.cacheLimit <= 0 || !translationCache.has(cacheId)) return null;
   const entry = translationCache.get(cacheId);
   translationCache.delete(cacheId);
+  const previousLastUsed = entry.lastUsed || 0;
   entry.lastUsed = Date.now();
   translationCache.set(cacheId, entry);
-  await persistCache();
+  if (entry.lastUsed - previousLastUsed > LAST_USED_PERSIST_INTERVAL_MS) {
+    writeCacheEntry(cacheId, entry).catch(() => {});
+  }
   return entry.result;
 }
 
@@ -734,16 +876,56 @@ function pageHostFromUrl(pageUrl) {
   }
 }
 
+// The popup's recent-translations gallery previously reused the FULL-SIZE translated PNG as its
+// own "thumbnail" field, and polled up to 40 of them every couple seconds -- multi-megabyte data
+// URLs decoded and repainted on a timer for a ~100px preview. Generating a small thumbnail ONCE
+// here, at cache-write time, means the (potentially large) full image is decoded to pixels exactly
+// once per translation, not once per gallery poll.
+const THUMBNAIL_MAX_DIMENSION = 112;
+
+async function generateThumbnailDataUrl(fullDataUrl) {
+  // A service-worker context always has OffscreenCanvas/createImageBitmap in real Chrome; this
+  // guard only matters for older test/sandbox environments -- falling back to the full image there
+  // keeps the gallery working (just not shrunk) instead of throwing.
+  if (!fullDataUrl || typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap !== 'function') {
+    return fullDataUrl || null;
+  }
+  let bitmap;
+  try {
+    const blob = await (await fetch(fullDataUrl)).blob();
+    bitmap = await createImageBitmap(blob);
+    const scale = Math.min(1, THUMBNAIL_MAX_DIMENSION / Math.max(bitmap.width || 1, bitmap.height || 1));
+    const width = Math.max(1, Math.round((bitmap.width || THUMBNAIL_MAX_DIMENSION) * scale));
+    const height = Math.max(1, Math.round((bitmap.height || THUMBNAIL_MAX_DIMENSION) * scale));
+    const canvas = new OffscreenCanvas(width, height);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return fullDataUrl;
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    const thumbBlob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.72 });
+    return await blobToDataUrl(thumbBlob);
+  } catch {
+    // Thumbnail generation failing (corrupt image, canvas unavailable, quota, ...) must never
+    // block caching the real translation -- just fall back to the full image for the gallery.
+    return fullDataUrl;
+  } finally {
+    bitmap?.close?.();
+  }
+}
+
 async function putCachedResult(cacheId, result, settings, pageUrl = '') {
   await ensureCacheLoaded();
   const hasImage = Boolean(result?.translatedImageDataUrl);
   const hasTranslations = Array.isArray(result?.translations) && result.translations.length > 0;
   if (settings.cacheLimit <= 0 || !(hasImage || hasTranslations)) return;
-  translationCache.set(cacheId, {
+  const thumbnail = hasImage ? await generateThumbnailDataUrl(result.translatedImageDataUrl) : null;
+  const entry = {
     result,
+    thumbnail,
     lastUsed: Date.now(),
     pageHost: pageHostFromUrl(pageUrl),
-  });
+  };
+  translationCache.set(cacheId, entry);
+  await writeCacheEntry(cacheId, entry);
   await trimCache(settings.cacheLimit);
 }
 
@@ -783,9 +965,11 @@ async function callLocalPipeline(base64Data, width, height, settings, metadata =
 
   if (!response.ok) {
     let detail = '';
+    let errorCode = '';
     try {
       const payload = await response.json();
       detail = responseErrorDetail(payload);
+      errorCode = typeof payload?.detail?.code === 'string' ? payload.detail.code : '';
     } catch {
       detail = await response.text().catch(() => '');
     }
@@ -795,6 +979,14 @@ async function callLocalPipeline(base64Data, width, height, settings, metadata =
       detail,
       metadata,
     }, settings);
+    // The backend tags a saturated-scheduler 503 with a machine-readable code so the caller can
+    // tell "try again, a slot will free up" apart from a genuine failure -- normalize it to a
+    // stable PIPELINE_BUSY code (same pattern as AbortError -> PIPELINE_TIMEOUT below) so
+    // content.js can route it to its patient retry path instead of the human message, which
+    // matches no entry in content.js's retryable-error allowlist and was being treated as terminal.
+    if (response.status === 503 && errorCode === 'SCHEDULER_BUSY') {
+      throw new Error('PIPELINE_BUSY');
+    }
     throw new Error(detail || `LOCAL_PIPELINE_${response.status}`);
   }
 
@@ -855,12 +1047,13 @@ async function processTranslation(message, options = {}) {
       return { error: error.message };
     }
   }
-  if (!options.bypassQueueCheck && outgoingRequests.size >= settings.parallelLimit) {
+  if (!options.bypassQueueCheck && outgoingRequests.size >= effectiveParallelLimit(settings)) {
     sendDiagnosticLog('background.translate.deferred_to_queue', {
       traceId,
       cacheId,
       activeRequests: outgoingRequests.size,
       parallelLimit: settings.parallelLimit,
+      effectiveParallelLimit: effectiveParallelLimit(settings),
     }, settings).catch(() => {});
     return queueTranslation(message);
   }
@@ -924,6 +1117,7 @@ async function processTranslation(message, options = {}) {
         cacheId,
       }, controller.signal);
       resetBreaker(); // a real attempt reached the server and got a real answer -- clearly back up
+      noteBackendCapacity(result.pipelineReport?.scheduler?.capacityAtAcquire);
       if (isPaused) throw new Error('TranslationPaused');
       await putCachedResult(cacheId, result, settings, message.pageUrl);
       console.log(`[FMT] local pipeline done trace=${traceId} ${cacheId} in ${Math.round(nowMs() - startedAt)}ms`);
@@ -945,7 +1139,11 @@ async function processTranslation(message, options = {}) {
       }, settings);
       return result;
     } catch (error) {
-      if (error?.name === 'TypeError') {
+      if (error?.isImageSourceError) {
+        // The IMAGE URL itself is broken/unreachable, not the backend -- leave breaker state
+        // completely untouched (neither trip nor reset) so a single dead image src on a page
+        // can't falsely short-circuit every OTHER image, nor mask a genuinely open breaker.
+      } else if (error?.name === 'TypeError') {
         // fetch() itself could not reach the server -- connection refused / offline / DNS fail.
         tripBreaker();
       } else if (error?.name !== 'AbortError') {
@@ -955,12 +1153,14 @@ async function processTranslation(message, options = {}) {
       }
       // AbortError (our own fetchTimeoutMs timeout) intentionally leaves breaker state untouched
       // -- one slow request is not proof the whole backend is down.
-      const messageText = error?.name === 'TypeError'
-        // Normalize so the request that TRIPS the breaker reports the same code as every
-        // subsequent short-circuited request -- otherwise the first offline image would show a
-        // raw "Failed to fetch" while every later one shows PIPELINE_OFFLINE.
-        ? 'PIPELINE_OFFLINE'
-        : (error.name === 'AbortError' ? (timedOut ? 'PIPELINE_TIMEOUT' : 'TranslationPaused') : error.message);
+      const messageText = error?.isImageSourceError
+        ? error.message
+        : (error?.name === 'TypeError'
+          // Normalize so the request that TRIPS the breaker reports the same code as every
+          // subsequent short-circuited request -- otherwise the first offline image would show a
+          // raw "Failed to fetch" while every later one shows PIPELINE_OFFLINE.
+          ? 'PIPELINE_OFFLINE'
+          : (error.name === 'AbortError' ? (timedOut ? 'PIPELINE_TIMEOUT' : 'TranslationPaused') : error.message));
       if (messageText !== 'TranslationPaused') console.error('[FMT] Local pipeline error:', messageText);
       await sendDiagnosticLog('background.translate.error', {
         traceId,
@@ -1016,7 +1216,7 @@ function scheduleQueueDrain() {
 // trigger a drain: a queued item dispatched into a cache-hit or in-flight-join releases its
 // slot without ever entering processTranslation's own finally, and without this the rest of
 // the queue would stall behind it even though the slot is free again.
-function dispatchTranslation(message) {
+function dispatchTranslation(message, cacheId) {
   reservedSlots += 1;
   let released = false;
   const release = () => {
@@ -1027,17 +1227,51 @@ function dispatchTranslation(message) {
   };
   const result = processTranslation(message, { bypassQueueCheck: true, onDispatched: release });
   result.then(release, release);
-  return result;
+  return result.then((value) => requeueIfBusy(message, value, cacheId));
+}
+
+// A PIPELINE_BUSY response means the backend's own gpu_scheduler.py already waited out its
+// full max_wait_seconds (60s by default) for a GPU slot and gave up -- the request lost a
+// race that had nothing to do with it. Retrying it HERE (background.js), rather than leaving
+// it to content.js's per-image retry, matters for one concrete reason: putCachedResult() is
+// awaited (see processTranslation) before this promise ever resolves, so a retry that
+// eventually succeeds is durably cached even if the page has since navigated away and would
+// have discarded the result for display. content.js's own retry is node-anchored and silently
+// no-ops once a page's <img> node has moved on (single-<img> viewers reuse one DOM node for
+// every page) -- that dead-end is exactly what left pages permanently untranslated.
+function requeueIfBusy(message, value, cacheId) {
+  if (value?.error !== 'PIPELINE_BUSY') return value;
+  const attempt = (message.busyAttempts || 0) + 1;
+  if (attempt > MAX_BUSY_REQUEUE_ATTEMPTS) return value;
+  message.busyAttempts = attempt;
+  // During the backoff below this item holds no reservedSlots and is not sitting in
+  // requestQueue, so maybeClearKeepAliveAlarm() would see both empty and let Chrome idle-kill
+  // the service worker mid-backoff -- silently evaporating the very retry this exists for, on
+  // exactly the slow/contended backend where it's needed most.
+  ensureKeepAliveAlarm();
+  console.warn(`[FMT] busy requeue attempt ${attempt}/${MAX_BUSY_REQUEUE_ATTEMPTS} ${cacheId || ''}`);
+  sendDiagnosticLog('background.translate.busy_requeue', { cacheId, attempt }).catch(() => {});
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      resolve(queueTranslation(message, { front: true, bypassQueueLimit: true }));
+    }, BUSY_REQUEUE_BASE_DELAY_MS * attempt);
+  });
 }
 
 function processQueue() {
   if (isPaused) return;
   getSettings().then((settings) => {
     let shifted = false;
-    while (requestQueue.length > 0 && (outgoingRequests.size + reservedSlots) < settings.parallelLimit) {
+    while (requestQueue.length > 0 && (outgoingRequests.size + reservedSlots) < effectiveParallelLimit(settings)) {
       const { message, resolve, cacheId } = requestQueue.shift();
       if (cacheId) queuedRequests.delete(cacheId);
-      dispatchTranslation(message).then(resolve);
+      // processTranslation() normally resolves with an {error} object rather than rejecting,
+      // but it CAN reject before its own try block (e.g. the awaited getSettings()/
+      // getCachedResult() calls, or the queueTranslation re-entry). Without this .catch, that
+      // rejection left `resolve` never called -- the promise queueTranslation handed back to
+      // the content script's sendResponse would never settle, keeping that image's message
+      // port (and its spinner) open forever.
+      dispatchTranslation(message, cacheId).then(resolve, (error) => resolve({ error: error?.message || 'DISPATCH_FAILED' }));
       shifted = true;
     }
     if (shifted) persistQueueDescriptors();
@@ -1057,7 +1291,7 @@ function clearQueuedTranslations(reason = 'QueueCleared') {
   return dropped.length;
 }
 
-async function queueTranslation(message) {
+async function queueTranslation(message, options = {}) {
   if (isPaused) return { error: 'TranslationPaused' };
   // The popup's restart-lost warning explicitly tells the user to "re-run Translate Page" --
   // this is that re-run actually happening, so the stale warning must clear here too, not only
@@ -1089,11 +1323,15 @@ async function queueTranslation(message) {
     return queuedRequests.get(cacheId);
   }
 
-  if ((outgoingRequests.size + reservedSlots) < settings.parallelLimit) {
-    return dispatchTranslation(message);
+  if ((outgoingRequests.size + reservedSlots) < effectiveParallelLimit(settings)) {
+    return dispatchTranslation(message, cacheId);
   }
 
-  if (requestQueue.length >= settings.queueLimit) {
+  // bypassQueueLimit is set only by requeueIfBusy(): this item already consumed one full
+  // admission cycle (it dispatched, ran, and lost a real backend race) -- it is not new work
+  // competing for a queue slot, so a queue that happens to be full at retry time must not
+  // convert it into a QueueFull error and hand it back to content.js's dead-end retry.
+  if (!options.bypassQueueLimit && requestQueue.length >= settings.queueLimit) {
     console.warn(`[FMT] queue full ${requestQueue.length}/${settings.queueLimit}`);
     return {
       error: 'QueueFull',
@@ -1103,7 +1341,11 @@ async function queueTranslation(message) {
   }
 
   const queuedPromise = new Promise((resolve) => {
-    requestQueue.push({ message, resolve, cacheId });
+    // front is set only by requeueIfBusy(): this item already waited out the backend's full
+    // gpu_scheduler.py wait window once through no fault of its own -- placing it at the tail
+    // of a deep queue (at capacity 1 with a 20-deep queue, ~26 minutes) penalizes it twice.
+    if (options.front) requestQueue.unshift({ message, resolve, cacheId });
+    else requestQueue.push({ message, resolve, cacheId });
   });
   queuedRequests.set(cacheId, queuedPromise);
   queuedPromise.finally(() => queuedRequests.delete(cacheId));
@@ -1119,6 +1361,7 @@ async function queueTranslation(message) {
 }
 
 async function setTranslationPaused(paused) {
+  pauseStateSetSinceBoot = true;
   isPaused = paused === true;
   await chrome.storage.local.set({ translationPaused: isPaused });
 
@@ -1133,6 +1376,7 @@ async function setTranslationPaused(paused) {
 }
 
 async function stopTranslationRuntime(mode, tabId) {
+  pauseStateSetSinceBoot = true;
   isPaused = true;
   await chrome.storage.local.set({ translationPaused: true });
   const dropped = clearQueuedTranslations(mode === 'hard' ? 'HardStopped' : 'SoftStopped');
@@ -1300,22 +1544,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     ensureCacheLoaded().then(async () => {
       const settings = await getSettings();
       sendResponse(buildQueueStats(settings));
+    }).catch((error) => {
+      // Without this, a storage failure here left the popup's stats poll waiting on a
+      // message port that would never receive a response -- the Active/Queued/Cache
+      // numbers silently froze at their last values with no indication anything failed.
+      sendResponse({ error: error?.message || String(error) });
     });
     return true;
   }
   if (message.kind === 'getRecentTranslations') {
     ensureCacheLoaded().then(() => {
-      const limit = Math.max(1, Math.min(12, Number(message.limit) || 6));
+      // Upper bound matches the popup's own max selectable cache size (see
+      // popup.html's translationCachePages options, up to 40) -- the previous hardcoded
+      // cap of 12 silently truncated the gallery even when the popup correctly asked for
+      // more (e.g. passing the real configured cacheLimit of 15-40), so a user who chose
+      // to keep 20+ images cached still only ever saw 12 of them.
+      const limit = Math.max(1, Math.min(40, Number(message.limit) || 6));
       const entries = Array.from(translationCache.values())
         .filter((entry) => entry?.result?.translatedImageDataUrl)
         .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0))
         .slice(0, limit)
         .map((entry) => ({
-          thumbnail: entry.result.translatedImageDataUrl,
+          // entry.thumbnail is the small (~112px) preview generated once at cache-write time;
+          // entries rehydrated from a pre-thumbnail session or an environment where generation
+          // failed fall back to the full-size image rather than showing nothing.
+          thumbnail: entry.thumbnail || entry.result.translatedImageDataUrl,
           pageHost: entry.pageHost || '',
           lastUsed: entry.lastUsed || 0,
         }));
       sendResponse({ entries });
+    }).catch((error) => {
+      sendResponse({ error: error?.message || String(error), entries: [] });
     });
     return true;
   }
@@ -1327,6 +1586,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // Cache action (and a genuine pipeline URL/language change) clears it.
       const ok = await checkPipelineHealth(settings, { clearCacheOnFailure: false });
       sendResponse({ ok, cacheSize: translationCache.size });
+    }).catch((error) => {
+      sendResponse({ ok: false, error: error?.message || String(error), cacheSize: translationCache.size });
     });
     return true;
   }
@@ -1507,7 +1768,10 @@ chrome.storage.onChanged.addListener((changes) => {
     updateIcon();
   }
   if (changes.localPipelineLanguage) clearTranslationCache();
-  if (changes.translationPaused) isPaused = changes.translationPaused.newValue === true;
+  if (changes.translationPaused) {
+    pauseStateSetSinceBoot = true;
+    isPaused = changes.translationPaused.newValue === true;
+  }
 });
 
 updateIcon();

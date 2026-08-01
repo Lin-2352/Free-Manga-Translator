@@ -1052,6 +1052,7 @@ def _clean_white_bubble_residue(
     region_mask: np.ndarray,
     bubble_mask: np.ndarray,
     source: np.ndarray | None = None,
+    debug_label: object = None,
 ) -> np.ndarray:
     """`image` is the paint target (the progressively-mutated working canvas -- the fill is
     written into it). `source` is the PRISTINE page, used only for the gate and the sampled
@@ -1069,10 +1070,55 @@ def _clean_white_bubble_residue(
     cleanup_mask = cv2.dilate(region_mask, kernel_3, iterations=2)
     cleanup_mask = cv2.bitwise_and(cleanup_mask, safe_bubble)
 
+    # F-1b: never flatten a pixel that is dark in the pristine source and
+    # falls outside a small halo around a detected glyph stroke (region_mask
+    # is already the stroke-dilated ∩ container mask F-1a passes in). Without
+    # this, lifting F-1a's early-out lets cleanup run in cases where it never
+    # ran before, and its flat-fill footprint can still clip adjacent
+    # non-glyph ink (bubble tail marks, small art) that happens to sit inside
+    # the same dilated-stroke area -- confirmed on original/sample2 id=1.
+    gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+    # NOTE: cleanup_mask above is dilate(region_mask, iterations=2) & safe_bubble.
+    # wall_protect_radius must be < 2 or stroke_halo becomes a superset of
+    # cleanup_mask and this subtraction is a no-op by construction -- caught by
+    # rerunning and finding r=2 changed zero pixels across all 34 samples.
+    wall_protect_radius = int(os.getenv("MANGA_WALL_PROTECT_RADIUS", "1"))
+    stroke_halo = cv2.dilate(region_mask, kernel_3, iterations=wall_protect_radius) if wall_protect_radius > 0 else region_mask
+    # Task #206: stroke_halo's only signal is "far from a detected text stroke" -- in a small
+    # enough bubble the OCR text bbox is tangent to the wall itself (confirmed on
+    # original/sample2 id=1: red_box x2=117 vs wall x~117), so wall ink within
+    # wall_protect_radius of a stroke can NEVER be protected by that signal alone, no matter how
+    # the radius is tuned (r=2 was tried and made stroke_halo a superset of cleanup_mask,
+    # collapsing protection to nothing everywhere -- see the note above; do not touch that
+    # constant again). Add a second, independent signal instead: wall ink is, by definition,
+    # close to the bubble's own traced boundary, regardless of its distance to text -- manga
+    # lettering is conventionally set with interior clearance from the wall, so this does not
+    # widen protection over genuine glyph ink away from the edge.
+    # Measured (original/sample2 id=1, MANGA_DEBUG_WALL_PROTECT=1): edge_px=3 protected 0 of the
+    # wall pixels this fix targets -- the traced outline sits ~4-6px outside the true wall (see
+    # comment above), so a 3px search radius from the outline never reaches it. edge_px=6 closes
+    # that gap and was confirmed to fully resolve id=1's wall gap by direct crop comparison, with
+    # newly-protected-pixel counts (not just guessed) checked across every constraint in the
+    # sample before landing on this value.
+    edge_protect_px = int(os.getenv("MANGA_WALL_EDGE_PROTECT_PX", "6"))
+    if edge_protect_px > 0:
+        dist_from_edge = cv2.distanceTransform((bubble_mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+        near_bubble_edge = dist_from_edge <= edge_protect_px
+    else:
+        near_bubble_edge = np.zeros(region_mask.shape, dtype=bool)
+    protected_ink = (gray < 110) & ((stroke_halo == 0) | near_bubble_edge)
+    if os.getenv("MANGA_DEBUG_WALL_PROTECT") == "1":
+        n_before = int(np.count_nonzero(cleanup_mask))
+        n_prot = int(np.count_nonzero(cleanup_mask.astype(bool) & protected_ink))
+        n_edge_only = int(np.count_nonzero(cleanup_mask.astype(bool) & (gray < 110) & near_bubble_edge & (stroke_halo != 0)))
+        print(f"    [wall-protect-debug] id={debug_label} r={wall_protect_radius} edge_px={edge_protect_px} "
+              f"cleanup_mask_before={n_before} overlap_with_protected={n_prot} "
+              f"newly_protected_by_edge_signal={n_edge_only}", flush=True)
+    cleanup_mask[protected_ink] = 0
+
     if np.count_nonzero(cleanup_mask) < 20:
         return np.zeros(region_mask.shape, dtype=np.uint8)
 
-    gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
     bubble_pixels = gray[safe_bubble > 0]
     if bubble_pixels.size < 100:
         return np.zeros(region_mask.shape, dtype=np.uint8)
@@ -5728,6 +5774,7 @@ def _precise_floating_text_local_cleanup(
     allowed_mask: np.ndarray | None = None,
     seg_mask: np.ndarray | None = None,
     container_mask: np.ndarray | None = None,
+    clip_mask: np.ndarray | None = None,
 ) -> np.ndarray | None:
     x1, y1, x2, y2 = coords
     source_roi = source[y1:y2, x1:x2]
@@ -5929,6 +5976,29 @@ def _precise_floating_text_local_cleanup(
             if int(np.count_nonzero(commit > 0)) < 10:
                 return None
 
+    if clip_mask is not None:
+        # Per-constraint hard bound (Step 6's semantic_rescue_region). Applied at
+        # the same point, and for the same reason, as the container clip above.
+        #
+        # Unlike container_mask there is deliberately NO `if np.any(...)` escape:
+        # container_mask is a page-level union that may legitimately not cover a
+        # given region, so it has to no-op when absent. clip_mask is passed only
+        # for a constraint that exists BECAUSE step 1's semantic detector vouched
+        # for that specific region -- outside it there is nothing this cleanup is
+        # entitled to repaint, so an empty intersection must fail closed, not
+        # silently paint unbounded.
+        region_clip = clip_mask[y1:y2, x1:x2]
+        # Provably-flat interior needs no generative reconstruction -- take the
+        # deterministic fill and skip the model entirely (see the helper's docstring
+        # for why the clip alone is not enough on a small bubble in dense art).
+        if seg_mask is not None:
+            flat = _semantic_clip_flat_fill(source, target, coords, region_clip, seg_mask)
+            if flat is not None:
+                return flat
+        commit = cv2.bitwise_and(commit, region_clip)
+        if int(np.count_nonzero(commit > 0)) < 10:
+            return None
+
     # A confirmed-flat background (near-zero luma std, no edges at all) needs
     # no generative reconstruction -- the planar fit already computed above
     # is both correct and seam-free. Dense multi-character text (a narration
@@ -5973,7 +6043,11 @@ def _precise_floating_text_local_cleanup(
         changed = np.any(before != target[y1:y2, x1:x2], axis=2)
         if int(np.count_nonzero(changed & (commit > 0))) >= max(8, int(np.count_nonzero(commit > 0) * 0.08)):
             commit = _reinpaint_ghost_residue(
-                anime_model, anime_device, target, coords, commit
+                anime_model, anime_device, target, coords, commit,
+                # The one path that can still GROW the mask and repaint after the
+                # clip above, so it has to inherit the same bound. None here keeps
+                # today's behaviour exactly when no clip is in play.
+                container_mask=clip_mask,
             )
             return commit
         target[y1:y2, x1:x2] = before
@@ -9870,6 +9944,60 @@ def _rowwise_textured_caption_repair(
     return changed
 
 
+def _semantic_clip_flat_fill(
+    source: np.ndarray,
+    target: np.ndarray,
+    coords: tuple[int, int, int, int],
+    region_clip: np.ndarray,
+    seg_mask: np.ndarray,
+) -> np.ndarray | None:
+    """Deterministic fill for a semantically-rescued region with a flat interior.
+
+    Same principle as the bubble path's flat_fill_uniform_interior (and the same
+    measured thresholds): when the pristine interior around the glyphs is provably
+    uniform and bright, skip the ML inpainter entirely -- it prevents invention at
+    the source rather than trying to bound it afterwards.
+
+    Clipping alone is not sufficient for these constraints. The clip stops the model
+    painting OUTSIDE the text region, but inside it the model still fills from a
+    +-256..512px context window, so on a small bubble surrounded by dense art it
+    reconstructs that art inside the bubble (measured: external_ja_2 id 1, where the
+    clip restored the outline but left character hair painted across the interior).
+    A flat white bubble interior needs no reconstruction at all.
+
+    Returns the committed mask, or None to fall through to the normal cascade.
+    """
+    x1, y1, x2, y2 = coords
+    src_roi = source[y1:y2, x1:x2]
+    if src_roi.size == 0:
+        return None
+    glyph = _refined_floating_source_mask(source, seg_mask, coords)
+    if glyph is None:
+        return None
+    glyph = cv2.bitwise_and(glyph, region_clip)
+    if int(np.count_nonzero(glyph > 0)) < 6:
+        return None
+
+    gray = cv2.cvtColor(src_roi, cv2.COLOR_BGR2GRAY)
+    kernel_5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Judge "is the interior flat" on pixels clear of the glyphs AND their
+    # anti-aliased halo, so the ink itself cannot drag the statistics down.
+    grown = cv2.dilate(glyph, kernel_5, iterations=2)
+    interior = (region_clip > 0) & (grown == 0)
+    vals = gray[interior]
+    if vals.size < 40:
+        return None
+    if not (float(np.percentile(vals, 30)) >= 225.0 and float(np.std(vals)) <= 12.0):
+        return None
+
+    commit = cv2.bitwise_and(cv2.dilate(glyph, kernel_5, iterations=2), region_clip)
+    if int(np.count_nonzero(commit > 0)) < 10:
+        return None
+    fill_bgr = np.median(src_roi[interior].reshape(-1, 3), axis=0)
+    target[y1:y2, x1:x2][commit > 0] = fill_bgr.astype(np.uint8)
+    return commit
+
+
 def _tight_floating_stroke_repair(
     source: np.ndarray,
     target: np.ndarray,
@@ -9877,9 +10005,69 @@ def _tight_floating_stroke_repair(
     coords: tuple[int, int, int, int],
     anime_model,
     anime_device,
+    clip_mask: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Clip wrapper around the repair cascade below.
+
+    Threading a bound through each of the cascade's ~25 branches is not
+    reviewable: several helpers paint through their own grown masks and some use
+    padded context crops that write outside `coords` entirely. So a caller-supplied
+    clip is enforced twice -- the body clips its SEED (so the model never sees an
+    oversized hole), and this wrapper reverts every page pixel the cascade touched
+    outside the clip. With clip_mask=None both are inert and behaviour is
+    byte-identical to before.
+
+    Clipping the returned mask is load-bearing, not cosmetic: the caller writes it
+    into the page-level floating mask that later drives the residual sweep, which
+    must not be told more was cleaned than actually was.
+    """
+    if clip_mask is None:
+        return _tight_floating_stroke_repair_body(
+            source, target, seg_mask, coords, anime_model, anime_device
+        )
+    x1, y1, x2, y2 = coords
+    region_clip = clip_mask[y1:y2, x1:x2]
+    if region_clip.size == 0 or int(np.count_nonzero(region_clip)) < 10:
+        return None
+    flat = _semantic_clip_flat_fill(source, target, coords, region_clip, seg_mask)
+    if flat is not None:
+        return flat
+    before = target.copy()
+    mask_roi = _tight_floating_stroke_repair_body(
+        source, target, seg_mask, coords, anime_model, anime_device,
+        clip_mask=clip_mask,
+    )
+    keep = np.zeros(target.shape[:2], dtype=bool)
+    keep[y1:y2, x1:x2] = region_clip > 0
+    target[~keep] = before[~keep]
+    if mask_roi is None:
+        return None
+    mask_roi = cv2.bitwise_and(mask_roi, region_clip)
+    if int(np.count_nonzero(mask_roi > 0)) < 10:
+        target[y1:y2, x1:x2] = before[y1:y2, x1:x2]
+        return None
+    return mask_roi
+
+
+def _tight_floating_stroke_repair_body(
+    source: np.ndarray,
+    target: np.ndarray,
+    seg_mask: np.ndarray,
+    coords: tuple[int, int, int, int],
+    anime_model,
+    anime_device,
+    clip_mask: np.ndarray | None = None,
 ) -> np.ndarray | None:
     x1, y1, x2, y2 = coords
     mask_roi = _refined_floating_source_mask(source, seg_mask, coords)
+    if clip_mask is not None:
+        # Clip the SEED, not just the result. Every branch below derives its repair
+        # mask from mask_roi, and several hand it to AnimeLaMa -- which fills the
+        # hole from a +-256..512px context window. Reverting out-of-clip pixels
+        # afterwards would still leave surrounding artwork painted INSIDE the clip.
+        # Bounding the hole up front is what makes the fill correct, not merely
+        # contained. The seed can itself be far larger than the glyph strokes.
+        mask_roi = cv2.bitwise_and(mask_roi, clip_mask[y1:y2, x1:x2])
     if np.count_nonzero(mask_roi > 0) < 6:
         return None
     mask_density = float(np.count_nonzero(mask_roi > 0)) / float(max(1, mask_roi.size))
@@ -10998,6 +11186,24 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
             force_bubble_cleanup = bool(constraint.get("force_bubble_cleanup", False))
             is_bubble = constraint.get("bubble_idx", -1) != -1 or force_bubble_cleanup
             precise_layout_mask = constraint.get("mask_mode") == "svg_text"
+            # Hard bound for constraints Step 6 kept ONLY on the semantic detector's
+            # word (its floating_too_small rescue). They have bubble_idx == -1 and no
+            # traced outline, so they contribute nothing to container_mask below and
+            # the floating paths would otherwise grow unbounded into the surrounding
+            # art -- see the semantic_rescue_region comment in run_step6_layout.py.
+            # Unioned with red_box so a later Step-6 red_box change can never leave
+            # real glyph ink outside the bound.
+            semantic_clip_mask = None
+            _rescue_region = constraint.get("semantic_rescue_region")
+            if _rescue_region and len(_rescue_region) >= 4:
+                _sr = [int(v) for v in _rescue_region[:4]]
+                _cx1 = max(0, min(img_w, min(_sr[0], red_box[0])))
+                _cy1 = max(0, min(img_h, min(_sr[1], red_box[1])))
+                _cx2 = max(0, min(img_w, max(_sr[2], red_box[2])))
+                _cy2 = max(0, min(img_h, max(_sr[3], red_box[3])))
+                if _cx2 > _cx1 and _cy2 > _cy1:
+                    semantic_clip_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                    semantic_clip_mask[_cy1:_cy2, _cx1:_cx2] = 255
             # red_box is display-tight (glyph bbox +4px, Step 6 refinement);
             # cleanup must work from a padded window so halo and edge glyph
             # pixels just outside the tight box are still captured. Without
@@ -11037,13 +11243,47 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
             roi_seg = seg_mask[y1:y2, x1:x2]
             _, roi_seg_bin = cv2.threshold(roi_seg, 127, 255, cv2.THRESH_BINARY)
 
+            # seg_mask can under-segment a bubble's own text (miss most of the
+            # glyphs) while still clearing the `< 20` floor below -- 770px of
+            # detected stroke looks non-trivial until you compare it to the box's
+            # actual ink. Measured (34-sample sweep, 2026-07-27): for bubble
+            # constraints, seg_coverage / an independent Otsu dark-pixel estimate
+            # of the same box is bimodal with an >8x gap -- genuine detections
+            # cluster at ratio>=1.1, under-segmented ones sit below 0.15. A box
+            # past that gap gets the same independent-detector fallback the `<20`
+            # branch already uses for a fully-empty mask. Scoped to is_bubble only
+            # -- that's what was measured; floating text can legitimately have a
+            # dark background where this dark-pixel estimate isn't meaningful.
+            # Without this, region_mask/dilated stays sparse and
+            # _clean_white_bubble_residue can only flatten a thin halo around the
+            # fragments seg_mask did find, leaving the rest of the source text
+            # completely uncleaned (confirmed: new_sample_10_(chi) id=3,
+            # ratio=0.134, left 5237px of legible source text once F-1a stopped
+            # compensating with a solid rectangle).
+            seg_looks_unreliable = False
+            if is_bubble:
+                roi_gray_for_coverage = cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+                dark_estimate = int(np.count_nonzero(roi_gray_for_coverage < 150))
+                seg_looks_unreliable = (
+                    200 <= dark_estimate < roi_gray_for_coverage.size * 0.5
+                    and np.count_nonzero(roi_seg_bin) < dark_estimate * 0.5
+                )
+                # The upper bound above excludes a genuinely dark-interior bubble
+                # (light text on a black background): there, dark_estimate is
+                # most of the box by construction, the ratio would look just as
+                # "sparse", and _extract_text_strokes(is_bubble=True) assumes the
+                # opposite polarity (Otsu inverted for dark-on-light) -- it would
+                # return the background, not the text. No such bubble exists in
+                # the 34-sample sweep this threshold was measured on, so this
+                # guard is structural, not evidenced by a counterexample.
+
             if force_bubble_cleanup:
                 roi_mask = _extract_dark_text_strokes(
                     image,
                     (x1, y1, x2, y2),
                     constraint.get("source_colors") or None,
                 )
-            elif np.count_nonzero(roi_seg_bin) < 20:
+            elif np.count_nonzero(roi_seg_bin) < 20 or seg_looks_unreliable:
                 roi_mask = _extract_text_strokes(image, (x1, y1, x2, y2), is_bubble=is_bubble)
             else:
                 roi_mask = roi_seg_bin
@@ -11107,15 +11347,52 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
                         roi_bgr = image[y1:y2, x1:x2]
                         gray_int = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
                         hsv_int = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-                        # Percentiles, not medians: a tinted interior mixed
-                        # with bright glyph halos can push the median above a
-                        # pure-white bubble's, hiding the tint. A meaningful
-                        # tinted share shows up at the 30th luma / 70th sat
-                        # percentile regardless of how much halo is present.
-                        tinted_interior = (
-                            float(np.percentile(gray_int[interior_np], 30)) <= 244.0
-                            or float(np.percentile(hsv_int[:, :, 1][interior_np], 70)) >= 12.0
-                        )
+                        # A round/curved bubble's OWN border wall is tangent to
+                        # its rectangular bbox at the extremes, so the bbox-based
+                        # interior_np above samples border ink at its corners --
+                        # that ink is foreground art, not background tint, and
+                        # dragging it into the percentile below makes plain white
+                        # bubbles misread as "tinted" (confirmed: external_ja_1
+                        # id=1 measured p30=239 <=244 from border contamination
+                        # alone, routing a plain bubble into the anime-model
+                        # tinted-fill path instead of a flat white fill). Exclude
+                        # clearly-dark pixels (border/art ink, not tint) from the
+                        # sample; a genuine translucent tint is midtone, not
+                        # near-black, so this doesn't defeat real tint detection.
+                        tint_sample = interior_np & (gray_int >= 80)
+                        if int(np.count_nonzero(tint_sample)) >= 60:
+                            # Percentiles, not medians: a tinted interior mixed
+                            # with bright glyph halos can push the median above a
+                            # pure-white bubble's, hiding the tint. A meaningful
+                            # tinted share shows up at the 30th luma / 70th sat
+                            # percentile regardless of how much halo is present.
+                            tinted_interior = (
+                                float(np.percentile(gray_int[tint_sample], 30)) <= 244.0
+                                or float(np.percentile(hsv_int[:, :, 1][tint_sample], 70)) >= 12.0
+                            )
+                        if os.getenv("MANGA_DEBUG_TINT_FLIP") == "1":
+                            # Regression-tracking instrument, not live logic: old_verdict
+                            # recomputes the HISTORICAL (pre-border-ink-exclusion) formula
+                            # on unfiltered interior_np purely so a future change here can be
+                            # diffed against what shipped. Compare against the pre-fix predicate
+                            # to find flips the fix caused. Two distinct
+                            # mechanisms can flip the verdict -- starvation (n_tint_sample
+                            # < 60 leaves tinted_interior at its False initializer, never
+                            # evaluated at all -- the unintended one) versus a valid
+                            # filtered sample simply reading differently (the intended
+                            # effect of excluding border ink). Log both so they aren't
+                            # conflated in the count.
+                            old_verdict = (
+                                float(np.percentile(gray_int[interior_np], 30)) <= 244.0
+                                or float(np.percentile(hsv_int[:, :, 1][interior_np], 70)) >= 12.0
+                            )
+                            n_tint = int(np.count_nonzero(tint_sample))
+                            print(
+                                f"    [tint-flip-debug] id={constraint_id} "
+                                f"n_interior={int(np.count_nonzero(interior_np))} n_tint_sample={n_tint} "
+                                f"starved={n_tint < 60} old={old_verdict} new={tinted_interior}",
+                                flush=True,
+                            )
                 if tinted_interior and anime_model is not None:
                     roi_bgr = image[y1:y2, x1:x2]
                     gray_int = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
@@ -11146,18 +11423,92 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
                     }
                     continue
 
+                # F-2: skip the ML inpainter entirely when the pristine interior
+                # (excluding glyph strokes) is provably flat -- prevents invention
+                # at the source instead of cleaning it up after the fact. Strict,
+                # AND'd gate (not tinted_interior's loose OR) since committing to
+                # skip the model is the bigger decision; must not fire on
+                # screentoned/textured interiors. p30 (not median) so a handful of
+                # halo/antialiasing pixels near strokes can't hide real texture.
+                interior_uniform = False
+                if (
+                    os.getenv("MANGA_FLAT_FILL_UNIFORM", "on").strip().lower() in {"1", "true", "yes", "on"}
+                    and not tinted_interior
+                    and bubble_mask is not None
+                    and np.any(roi_bubble_mask > 0)
+                ):
+                    # NOT interior_np (raw bbox of roi_bubble_mask minus strokes) --
+                    # a round/curved bubble's own border wall is tangent to its own
+                    # bbox at the extremes, so interior_np's corners sample border
+                    # ink and make every real bubble read as high-variance. Use the
+                    # already-eroded interior instead (eroded_bubble, computed
+                    # above for the stroke-clip), which stays inside the wall.
+                    flat_fill_interior = (eroded_bubble > 0) & (dilated == 0)
+                    if int(np.count_nonzero(flat_fill_interior)) >= 60:
+                        roi_bgr_src = image[y1:y2, x1:x2]
+                        gray_src = cv2.cvtColor(roi_bgr_src, cv2.COLOR_BGR2GRAY)
+                        interior_vals = gray_src[flat_fill_interior]
+                        interior_uniform = (
+                            float(np.percentile(interior_vals, 30)) >= 225.0
+                            and float(np.std(interior_vals)) <= 12.0
+                        )
+                if interior_uniform:
+                    box_fill_mask = _fill_bubble_text_box_with_local_background(
+                        image, result, (x1, y1, x2, y2), bubble_mask, dilated,
+                    )
+                    # _fill_bubble_text_box_with_local_background can itself
+                    # return an all-zero mask (its own background_area gate
+                    # starves on small bubbles -- the same box-starvation shape
+                    # as F-1a's bug, in a different function). Only take this
+                    # path if the fill actually painted something; otherwise
+                    # fall through to the normal LaMa path below rather than
+                    # abandoning the region with zero cleanup (confirmed: an
+                    # unconditional `continue` here left external_ja_1 id=1's
+                    # source Japanese text completely untranslated/uncleaned).
+                    if np.count_nonzero(box_fill_mask) > 0:
+                        region_mask = cv2.bitwise_or(region_mask, box_fill_mask)
+                        # Verify the fill actually removed the source glyphs
+                        # before marking this region clean -- same check the
+                        # ordinary LaMa path below runs (:11279-11291). An
+                        # unconditional cleaned=True here would silently
+                        # bypass step 8's overlay/transparency fallback
+                        # (run_step8_typeset.py:3183-3196), which was
+                        # deliberately widened to bubble mode specifically
+                        # because step 4 stopped hardcoding this flag.
+                        residual_ink_ratio = 0.0
+                        stroke_roi = dilated > 0
+                        if np.count_nonzero(stroke_roi) >= 10:
+                            roi_after_gray = cv2.cvtColor(result[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+                            residual_ink_ratio = float(np.mean(roi_after_gray[stroke_roi] < 100))
+                        if residual_ink_ratio > 0.20:
+                            cleanup_status[constraint_id] = {
+                                "cleaned": False,
+                                "mode": "bubble",
+                                "reason": "unsafe_art_preserved",
+                            }
+                        else:
+                            cleanup_status[constraint_id] = {
+                                "cleaned": True,
+                                "mode": "bubble",
+                                "reason": "flat_fill_uniform_interior",
+                            }
+                        final_mask = cv2.bitwise_or(final_mask, region_mask)
+                        continue
+
                 _lama_local_crop(lama_session, result, region_mask, img_h, img_w, x1, y1, x2, y2)
+                # F-1a: residue cleanup must stay stroke-local (region_mask = dilated
+                # glyph-stroke mask intersected with the container). A solid
+                # red_box-derived rectangle used to be OR'd in here; it either
+                # swallowed the whole eroded container (starving the paper-color
+                # sampler in _clean_white_bubble_residue so cleanup silently
+                # no-op'd, letting invented ML texture survive -- external_ja_1,
+                # original/sample2) or, when it did run, flattened every pixel in
+                # the box to one median color including bubble-wall/spike ink
+                # crossing it (external_ja_2 id=4's burst wall). Measured: removing
+                # it drops wall-damage to 0 on every tested sample while the
+                # existing stroke-local region_mask still handles ordinary residue.
                 cleanup_input = region_mask
-                if not precise_layout_mask:
-                    box_cleanup_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-                    cleanup_pad = 2
-                    cleanup_x1 = max(0, x1 - cleanup_pad)
-                    cleanup_y1 = max(0, y1 - cleanup_pad)
-                    cleanup_x2 = min(img_w, x2 + cleanup_pad)
-                    cleanup_y2 = min(img_h, y2 + cleanup_pad)
-                    box_cleanup_mask[cleanup_y1:cleanup_y2, cleanup_x1:cleanup_x2] = 255
-                    cleanup_input = cv2.bitwise_or(cleanup_input, box_cleanup_mask)
-                cleanup_mask = _clean_white_bubble_residue(result, cleanup_input, bubble_mask, source=image)
+                cleanup_mask = _clean_white_bubble_residue(result, cleanup_input, bubble_mask, source=image, debug_label=constraint_id)
                 region_mask = cv2.bitwise_or(region_mask, cleanup_mask)
                 if precise_layout_mask:
                     fill_coords = (x1, y1, x2, y2)
@@ -11251,6 +11602,7 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
                         allowed_mask=inferred_allowed_mask,
                         seg_mask=seg_mask,
                         container_mask=container_mask,
+                        clip_mask=semantic_clip_mask,
                     )
                     if precise_first is not None:
                         precise_full = np.zeros((img_h, img_w), dtype=np.uint8)
@@ -11544,6 +11896,7 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
                                 green_coords,
                                 anime_model,
                                 anime_device,
+                                clip_mask=semantic_clip_mask,
                             )
                             if routed_repair_mask is not None:
                                 rgx1, rgy1, rgx2, rgy2 = green_coords
@@ -11672,6 +12025,7 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
                         allowed_mask=union_allowed_mask,
                         seg_mask=seg_mask,
                         container_mask=container_mask,
+                        clip_mask=semantic_clip_mask,
                     )
                 if precise_cleanup_mask is not None:
                     region_mask[union_y1:union_y2, union_x1:union_x2] = cv2.bitwise_or(
@@ -11773,6 +12127,7 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
                             (ex1, ey1, ex2, ey2),
                             anime_model,
                             anime_device,
+                            clip_mask=semantic_clip_mask,
                         )
                         if tight_repair_mask is not None:
                             tight_repair_density = float(np.count_nonzero(tight_repair_mask > 0)) / float(
@@ -12455,6 +12810,7 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
                             anime_model,
                             anime_device,
                             seg_mask=seg_mask,
+                            clip_mask=semantic_clip_mask,
                         )
                         if candidate_precise_mask is not None:
                             smooth_panel_coords = candidate_smooth_panel_coords
@@ -12626,6 +12982,7 @@ def run_step4_inpaint(sample_map: dict[str, str] | None = None, samples_dir: Pat
                         candidate_coords,
                         anime_model,
                         anime_device,
+                        clip_mask=semantic_clip_mask,
                     )
                     if candidate_mask is not None:
                         tight_coords = candidate_coords

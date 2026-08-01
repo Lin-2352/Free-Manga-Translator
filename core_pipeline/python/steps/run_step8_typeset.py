@@ -412,29 +412,62 @@ def _wrap_standard(
     return lines
 
 
-def _render_text_block(
+_MEASURE_IMG = Image.new("L", (1, 1), 0)
+_MEASURE_DRAW = ImageDraw.Draw(_MEASURE_IMG)
+
+
+def _measure_text_block(
     lines: list[str],
     font: ImageFont.FreeTypeFont,
     size: int,
     outline_width: int,
-    fill_color: tuple[int, int, int, int] = (0, 0, 0, 255),
-    stroke_color: tuple[int, int, int, int] = (255, 255, 255, 255),
-) -> tuple[Image.Image, np.ndarray, dict]:
-    measure_img = Image.new("L", (1, 1), 0)
-    measure_draw = ImageDraw.Draw(measure_img)
+) -> dict:
+    """Compute block layout/dimensions ONLY -- no glyph rasterization. Used to reject
+    oversized candidates before paying for _render_text_block_from_measurement's FreeType
+    render+stroke pass, which profiling showed is the dominant cost of step 8 (~70% of wall
+    time). Every value here is identical to what _render_text_block used to compute inline
+    before rendering, so this changes nothing about which candidate wins or what it looks like."""
     line_boxes = []
     line_widths = []
     line_heights = []
     spacing = _line_spacing_for_size(size)
 
     for line in lines:
-        bbox = measure_draw.textbbox((0, 0), line or " ", font=font, stroke_width=outline_width)
+        bbox = _MEASURE_DRAW.textbbox((0, 0), line or " ", font=font, stroke_width=outline_width)
         line_boxes.append(bbox)
         line_widths.append(max(1, bbox[2] - bbox[0]))
         line_heights.append(max(1, bbox[3] - bbox[1]))
 
     block_width = max(1, max(line_widths, default=1))
     block_height = max(1, sum(line_heights) + spacing * max(0, len(lines) - 1))
+    return {
+        "block_width": block_width,
+        "block_height": block_height,
+        "line_boxes": line_boxes,
+        "line_widths": line_widths,
+        "line_heights": line_heights,
+        "spacing": spacing,
+    }
+
+
+def _render_text_block_from_measurement(
+    lines: list[str],
+    font: ImageFont.FreeTypeFont,
+    measurement: dict,
+    outline_width: int,
+    fill_color: tuple[int, int, int, int] = (0, 0, 0, 255),
+    stroke_color: tuple[int, int, int, int] = (255, 255, 255, 255),
+) -> tuple[Image.Image, np.ndarray, dict]:
+    """Rasterize using a measurement already computed by _measure_text_block -- the actual
+    FreeType render+stroke pass, only reached for candidates that already passed the bounds
+    check the caller runs against the cheap measurement."""
+    block_width = measurement["block_width"]
+    block_height = measurement["block_height"]
+    line_boxes = measurement["line_boxes"]
+    line_widths = measurement["line_widths"]
+    line_heights = measurement["line_heights"]
+    spacing = measurement["spacing"]
+
     block = Image.new("RGBA", (block_width + 2, block_height + 2), (0, 0, 0, 0))
     block_draw = ImageDraw.Draw(block)
 
@@ -460,6 +493,25 @@ def _render_text_block(
         "outline_width": outline_width,
     }
     return block, alpha, metrics
+
+
+def _render_text_block(
+    lines: list[str],
+    font: ImageFont.FreeTypeFont,
+    size: int,
+    outline_width: int,
+    fill_color: tuple[int, int, int, int] = (0, 0, 0, 255),
+    stroke_color: tuple[int, int, int, int] = (255, 255, 255, 255),
+) -> tuple[Image.Image, np.ndarray, dict]:
+    """Measure + render in one call, unchanged behavior -- kept for the fallback call sites
+    (:~2870-3010) that always need the render immediately and have no size-rejection step
+    before it. The hot search loop below calls _measure_text_block /
+    _render_text_block_from_measurement directly instead, to skip rendering oversized
+    candidates entirely."""
+    measurement = _measure_text_block(lines, font, size, outline_width)
+    return _render_text_block_from_measurement(
+        lines, font, measurement, outline_width, fill_color, stroke_color
+    )
 
 
 def _text_style_for_layout(background: Image.Image, allowed_mask: Image.Image) -> dict:
@@ -1706,16 +1758,25 @@ def _structural_art_mask(gray: np.ndarray) -> np.ndarray:
     dark_ink = gray < 124
     seed = (edges | dark_ink).astype(np.uint8)
     component_count, labels, stats, _ = cv2.connectedComponentsWithStats(seed, 8)
-    structural = np.zeros(seed.shape, dtype=bool)
-    for component_idx in range(1, component_count):
-        x, y, width, height, area = stats[component_idx]
-        if (
-            area >= 24
-            or max(width, height) >= 18
-            or (area >= 10 and min(width, height) <= 3 and max(width, height) >= 12)
-        ):
-            structural[labels == component_idx] = True
-    return structural
+    # Vectorized equivalent of the original per-component loop (labels == component_idx over the
+    # full page, once per component -- profiled at 96% of this function's time on a page with
+    # thousands of components). Same predicate, applied to the whole stats array at once, then a
+    # single label lookup (keep[labels]) instead of one full-page comparison per component.
+    widths = stats[:, cv2.CC_STAT_WIDTH]
+    heights = stats[:, cv2.CC_STAT_HEIGHT]
+    areas = stats[:, cv2.CC_STAT_AREA]
+    max_dim = np.maximum(widths, heights)
+    min_dim = np.minimum(widths, heights)
+    keep = (
+        (areas >= 24)
+        | (max_dim >= 18)
+        | ((areas >= 10) & (min_dim <= 3) & (max_dim >= 12))
+    )
+    # Component 0 is the background label (cv2 convention) -- the original loop started at
+    # range(1, component_count), never evaluating it. keep[0] must be forced False or the
+    # background (which trivially has a huge area/max_dim) would flip the entire mask to True.
+    keep[0] = False
+    return keep[labels]
 
 
 def _source_footprint_mask_for_layout(
@@ -2460,7 +2521,11 @@ def _drop_duplicate_overlapping_layouts(
             # heuristic has no way to tell that apart from a genuine
             # same-region duplicate detection, so trust Step 6's explicit
             # sibling tag over the geometry here.
-            if b["id"] in (a.get("touching_container_siblings") or []):
+            # Step 6's writer tags both sides of a sibling pair symmetrically, so this
+            # check is defensive, not a known asymmetry: never let a drop decision
+            # depend on which of two writers happened to run first.
+            if (b["id"] in (a.get("touching_container_siblings") or [])
+                    or a["id"] in (b.get("touching_container_siblings") or [])):
                 continue
             box_a = _coerce_box(a.get("green_box", a.get("red_box")), image_size)
             box_b = _coerce_box(b.get("green_box", b.get("red_box")), image_size)
@@ -2725,10 +2790,24 @@ def _find_mask_aware_layout(
                 if not lines:
                     continue
 
-                block, alpha, metrics = _render_text_block(
+                # Measure first (cheap: textbbox only) and reject oversized candidates before
+                # paying for the FreeType render+stroke pass -- profiling showed that pass is
+                # ~70% of step 8's wall time, and the vast majority of the ~800 candidates
+                # tried per region fail this exact bounds check. block.width/height here are
+                # identical to what the old single-call _render_text_block produced before
+                # rendering, so this is the same decision, just made before instead of after
+                # rasterizing.
+                measurement = _measure_text_block(lines, font, size, outline_width)
+                if (
+                    measurement["block_width"] + 2 > bounds_width
+                    or measurement["block_height"] + 2 > bounds_height
+                ):
+                    continue
+
+                block, alpha, metrics = _render_text_block_from_measurement(
                     lines,
                     font,
-                    size,
+                    measurement,
                     outline_width,
                     text_style["fill_color"],
                     stroke_color,
@@ -3333,6 +3412,14 @@ def run_step8_typeset(sample_map: dict[str, str] | None = None, samples_dir: Pat
             report.append({
                 "id": tid,
                 "text": en_text,
+                # merged_from: the source ids a synthetic (merged/grouped) layout absorbed --
+                # already computed at construction time (member_ids, set at each of the 3 sites
+                # that build a synthetic layout: reverse_dark_bubble x2, merged_caption) but
+                # dropped here before this fix. Without it, a gate checking "did every kept id
+                # reach typeset_report" has no way to know an absorbed id's text still rendered
+                # under a different id -- it looks identical to a real silent drop (measured:
+                # 5 of G2's 6 "silent drops" were this, not real defects; see task #219).
+                "merged_from": layout.get("member_ids") or [],
                 "font_size": fitted["font_size"],
                 "lines": fitted["lines"],
                 "position": [left, top, right, bottom],

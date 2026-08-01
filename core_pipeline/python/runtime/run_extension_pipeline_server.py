@@ -42,6 +42,23 @@ import shutil
 import sys
 import threading
 import time
+
+# Several downstream steps (run_step5_ocr.py, run_step7_translate.py) unconditionally print raw
+# CJK OCR/translation text with no debug gate. start_backend.ps1 sets PYTHONIOENCODING=utf-8
+# before launching uvicorn, which was previously the ONLY thing preventing a UnicodeEncodeError
+# crash on Windows' default cp1252 console encoding -- any OTHER launcher (a Windows service,
+# Task Scheduler, an IDE run config, or uvicorn invoked directly) that imports this module
+# without that env var set had no protection at all, and would 500 on the very first Japanese/
+# Korean/Chinese OCR result. This must run at import time, not inside `if __name__ ==
+# "__main__":` below -- uvicorn imports this module directly and never executes that guard.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    # reconfigure() is unavailable on non-TextIOWrapper stdout/stderr (e.g. some test runners
+    # that replace sys.stdout with a StringIO) -- nothing to fix in that case, and nothing to
+    # crash over either.
+    pass
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -50,6 +67,7 @@ from urllib.parse import urlparse
 
 from PIL import Image
 
+from diagnostic_logger import write_diagnostic_event
 from pipeline_paths import EXTENSION_RUNTIME_ROOT, PROJECT_ROOT
 
 
@@ -249,22 +267,31 @@ def release_runtime_models(reason: str = "manual_release") -> dict[str, Any]:
         modules = sys.modules
         step5 = modules.get("run_step5_ocr")
         if step5 is not None:
-            for name in (
-                "_MANGA_OCR_MODEL",
-                "_TEXT_HANDLE",
-                "_BUBBLE_MODEL",
-                "_BUBBLE_DEVICE",
-                "_SEMANTIC_HANDLE",
-            ):
-                if getattr(step5, name, None) is not None:
-                    setattr(step5, name, None)
-                    released.append(f"run_step5_ocr.{name}")
-            if getattr(step5, "_EASYOCR_READERS", None):
-                step5._EASYOCR_READERS.clear()
-                released.append("run_step5_ocr._EASYOCR_READERS")
-            if getattr(step5, "_PADDLEOCR_READERS", None):
-                step5._PADDLEOCR_READERS.clear()
-                released.append("run_step5_ocr._PADDLEOCR_READERS")
+            # Same lock ordering as the atomic warmup commit above (PIPELINE_LOCK outer,
+            # _STEP5_RUN_LOCK inner -- never reversed anywhere in this codebase, so this
+            # cannot deadlock against it). Without this, clearing these globals here and a
+            # request's step5 reading/reloading them (which only takes _STEP5_RUN_LOCK) are
+            # not mutually exclusive -- a request could observe a partially-cleared set mid
+            # -release. The broadened "any handle is None -> reload all three" guard already
+            # tolerates that in practice (worst case: a spurious extra reload), but taking
+            # the same lock here removes the race outright instead of just tolerating it.
+            with step5._STEP5_RUN_LOCK:
+                for name in (
+                    "_MANGA_OCR_MODEL",
+                    "_TEXT_HANDLE",
+                    "_BUBBLE_MODEL",
+                    "_BUBBLE_DEVICE",
+                    "_SEMANTIC_HANDLE",
+                ):
+                    if getattr(step5, name, None) is not None:
+                        setattr(step5, name, None)
+                        released.append(f"run_step5_ocr.{name}")
+                if getattr(step5, "_EASYOCR_READERS", None):
+                    step5._EASYOCR_READERS.clear()
+                    released.append("run_step5_ocr._EASYOCR_READERS")
+                if getattr(step5, "_PADDLEOCR_READERS", None):
+                    step5._PADDLEOCR_READERS.clear()
+                    released.append("run_step5_ocr._PADDLEOCR_READERS")
 
         step4 = modules.get("run_step4_inpaint")
         if step4 is not None:
@@ -276,6 +303,19 @@ def release_runtime_models(reason: str = "manual_release") -> dict[str, Any]:
                 step4._ANIME_LAMA_LOAD_ATTEMPTED = False
             if hasattr(step4, "_MANGA_CLEANER_LOAD_ATTEMPTED"):
                 step4._MANGA_CLEANER_LOAD_ATTEMPTED = False
+
+        # The local NLLB-200 translator (~2.4 GB on CUDA when LOCAL_NLLB_TRANSLATION is used)
+        # was never included here, so it survived every release path: the popup's Release GPU
+        # button, hard-stop, and the idle-unload timer all freed step5/step4/step8 but left this
+        # model resident, understating how much VRAM a "released" state actually frees.
+        step7 = modules.get("run_step7_translate")
+        if step7 is not None:
+            if getattr(step7, "_LOCAL_TRANSLATOR", None) is not None:
+                step7._LOCAL_TRANSLATOR = None
+                released.append("run_step7_translate._LOCAL_TRANSLATOR")
+            if getattr(step7, "_LOCAL_TOKENIZERS", None):
+                step7._LOCAL_TOKENIZERS.clear()
+                released.append("run_step7_translate._LOCAL_TOKENIZERS")
 
         step8 = modules.get("run_step8_typeset")
         if step8 is not None and hasattr(step8, "_load_font"):
@@ -293,8 +333,19 @@ def release_runtime_models(reason: str = "manual_release") -> dict[str, Any]:
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
                 released.append("torch.cuda.cache")
-        except Exception:
-            pass
+        except Exception as error:
+            # A failed VRAM release previously reported success silently (bare
+            # `except: pass`), understating actual freed memory with zero trace. Failing
+            # the whole release loud is not obviously safe here (models were already
+            # cleared above; only the CUDA cache free step failed) so this logs rather
+            # than propagates -- but it must not vanish without a trace.
+            print(f"[runtime] torch.cuda.empty_cache()/ipc_collect() failed reason={reason}: {error}", flush=True)
+            write_diagnostic_event(
+                "runtime.release.empty_cache_failed",
+                {"reason": reason, "error": str(error), "errorType": type(error).__name__},
+                source="backend",
+                level="error",
+            )
 
     with RUNTIME_ACTIVITY_LOCK:
         RUNTIME_PENDING_RELEASE = False
@@ -398,18 +449,33 @@ def _warm_runtime_models_worker(force: bool = False) -> dict[str, Any]:
                     run_step5_ocr._MANGA_OCR_MODEL = load_ocr_model(force_cpu=False)
                 models["manga_ocr"] = "ready"
 
-                if getattr(run_step5_ocr, "_TEXT_HANDLE", None) is None:
-                    run_step5_ocr._TEXT_HANDLE = load_text_model(cfg.text_model_path)
-                models["text_detector"] = "ready"
-
-                if getattr(run_step5_ocr, "_BUBBLE_MODEL", None) is None:
+                # Detection-model trio (text/bubble/semantic) is committed to run_step5_ocr's
+                # globals atomically, under _STEP5_RUN_LOCK -- not one-by-one as each loads.
+                # A translation request's step5_ocr acquires that same lock before reading
+                # these globals (run_step5_ocr.run_step5_ocr()), so this makes warmup's write
+                # and a concurrent request's read mutually exclusive. Before this fix, warmup
+                # wrote _TEXT_HANDLE, then _BUBBLE_MODEL, then _SEMANTIC_HANDLE one at a time
+                # with no lock shared with the request path at all -- a request arriving mid
+                # -warmup (or a warmup that fails between the text and semantic loads) could
+                # observe _TEXT_HANDLE set but _SEMANTIC_HANDLE still None, which crashed
+                # detect_semantic_text_regions() with an unguarded AttributeError on
+                # 'NoneType' object has no attribute 'predict_detections_and_associations'.
+                needs_detection_trio = (
+                    getattr(run_step5_ocr, "_TEXT_HANDLE", None) is None
+                    or getattr(run_step5_ocr, "_BUBBLE_MODEL", None) is None
+                    or getattr(run_step5_ocr, "_SEMANTIC_HANDLE", None) is None
+                )
+                if needs_detection_trio:
+                    text_handle = load_text_model(cfg.text_model_path)
                     bubble_model, bubble_device = load_bubble_model(cfg.bubble_model_path)
-                    run_step5_ocr._BUBBLE_MODEL = bubble_model
-                    run_step5_ocr._BUBBLE_DEVICE = bubble_device
+                    semantic_handle = load_semantic_model("magi")
+                    with run_step5_ocr._STEP5_RUN_LOCK:
+                        run_step5_ocr._TEXT_HANDLE = text_handle
+                        run_step5_ocr._BUBBLE_MODEL = bubble_model
+                        run_step5_ocr._BUBBLE_DEVICE = bubble_device
+                        run_step5_ocr._SEMANTIC_HANDLE = semantic_handle
+                models["text_detector"] = "ready"
                 models["bubble_segmentor"] = "ready"
-
-                if getattr(run_step5_ocr, "_SEMANTIC_HANDLE", None) is None:
-                    run_step5_ocr._SEMANTIC_HANDLE = load_semantic_model("magi")
                 models["semantic_detector"] = "ready"
 
                 run_step4_inpaint._get_lama_session(cfg.lama_model_path)
@@ -443,6 +509,16 @@ def _warm_runtime_models_worker(force: bool = False) -> dict[str, Any]:
                 "error": str(error),
             }
             print(f"[warmup] local pipeline model warmup failed: {error}", flush=True)
+            # Previously print()-only -- the actual failure reason never reached the durable
+            # diagnostics log, only the terminal. A wedge caused by a mid-warmup load failure
+            # (as opposed to the concurrent-request race Fix 1a/1b also close) was therefore
+            # undiagnosable after the fact from runtime_logs alone.
+            write_diagnostic_event(
+                "pipeline.warmup.failed",
+                {"error": str(error), "errorType": type(error).__name__, "modelsLoaded": dict(models)},
+                source="backend",
+                level="error",
+            )
             with RUNTIME_ACTIVITY_LOCK:
                 release_after_warmup = RUNTIME_PENDING_RELEASE
             if release_after_warmup:
@@ -466,25 +542,45 @@ def warm_runtime_models(force: bool = False, background: bool = True) -> dict[st
     if not background:
         return _warm_runtime_models_worker(force=force)
 
-    if WARMUP_STATE.get("status") == "running":
-        return get_warmup_state()
-    if WARMUP_STATE.get("status") == "pass" and not force:
-        return get_warmup_state()
-
-    WARMUP_STATE = {
-        "status": "running",
-        "models": dict(WARMUP_STATE.get("models") or {}),
-        "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "finishedAt": None,
-        "seconds": None,
-    }
-    WARMUP_THREAD = threading.Thread(
-        target=_warm_runtime_models_worker,
-        kwargs={"force": force},
-        name="fmt-model-warmup",
-        daemon=True,
-    )
-    WARMUP_THREAD.start()
+    # The state-set and the thread creation/start below must be atomic with respect to
+    # release_runtime_models()'s check (_warmup_thread_running(), which reads WARMUP_STATE
+    # and WARMUP_THREAD together): before this lock, WARMUP_STATE was flipped to "running"
+    # here, then WARMUP_THREAD was only reassigned a few lines later when threading.Thread(...)
+    # returned. A release_runtime_models() call landing in that window saw status=="running"
+    # but WARMUP_THREAD still stale (None, or a previous finished thread) -- since
+    # _warmup_thread_running() requires BOTH, it returned False, and release proceeded as if
+    # nothing were in flight: clearing RUNTIME_PENDING_RELEASE and overwriting WARMUP_STATE to
+    # "released", even though this thread was about to start and would overwrite state to
+    # "pass" once it finished, silently orphaning the release the caller thought had happened.
+    # RUNTIME_ACTIVITY_LOCK (not WARMUP_LOCK) is used here deliberately: release_runtime_models
+    # already holds RUNTIME_ACTIVITY_LOCK as its outer lock while calling
+    # _warmup_thread_running() (see its definition above), so reusing it here gives mutual
+    # exclusion with zero risk of reversing lock order against _warm_runtime_models_worker's
+    # own WARMUP_LOCK-outer/RUNTIME_ACTIVITY_LOCK-inner nesting (that worker never runs inside
+    # this function's call stack until AFTER .start() returns, and .start() does not block on
+    # the worker's target function, so this lock is held only for the fast dispatch itself).
+    with RUNTIME_ACTIVITY_LOCK:
+        # get_warmup_state() itself acquires RUNTIME_ACTIVITY_LOCK (it is not reentrant), so
+        # every exit path below must leave this "with" block BEFORE calling it.
+        already_settled = (
+            WARMUP_STATE.get("status") == "running"
+            or (WARMUP_STATE.get("status") == "pass" and not force)
+        )
+        if not already_settled:
+            WARMUP_STATE = {
+                "status": "running",
+                "models": dict(WARMUP_STATE.get("models") or {}),
+                "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "finishedAt": None,
+                "seconds": None,
+            }
+            WARMUP_THREAD = threading.Thread(
+                target=_warm_runtime_models_worker,
+                kwargs={"force": force},
+                name="fmt-model-warmup",
+                daemon=True,
+            )
+            WARMUP_THREAD.start()
     return get_warmup_state()
 
 
@@ -534,8 +630,6 @@ def clear_runtime_output_cache() -> dict[str, Any]:
     removed_meta = 0
     skipped_active: list[str] = []
     with PIPELINE_LOCK:
-        with RUNTIME_ACTIVITY_LOCK:
-            active_samples = set(ACTIVE_RUNTIME_SAMPLES)
         if not SAMPLES_ROOT.exists():
             return {
                 "success": True,
@@ -548,23 +642,34 @@ def clear_runtime_output_cache() -> dict[str, Any]:
         for sample_path in SAMPLES_ROOT.glob("runtime_*"):
             if not sample_path.is_dir():
                 continue
-            if sample_path.name in active_samples:
-                skipped_active.append(sample_path.name)
-                continue
-            touched = False
-            for folder in OUTPUT_FOLDERS:
-                target = sample_path / folder
-                if target.exists():
-                    shutil.rmtree(target)
-                    removed_folders += 1
+            # Hold RUNTIME_ACTIVITY_LOCK across the check AND the actual removal, not just
+            # the check -- a stale snapshot taken once before this loop started (or even a
+            # check-then-release-then-rmtree pattern) leaves a window where a sample can
+            # become active (e.g. a concurrent cache-hit read registers via
+            # _mark_sample_active, which needs this same lock) between the check and the
+            # rmtree, letting this race a read of the same files out from under it. Holding
+            # the lock across both means a concurrent _mark_sample_active for this exact
+            # sample either completes before this check (so it's correctly skipped) or
+            # blocks until this removal finishes (so it correctly hits a clean, already-
+            # handled FileNotFoundError on _read_output_data_url rather than a torn read).
+            with RUNTIME_ACTIVITY_LOCK:
+                if sample_path.name in ACTIVE_RUNTIME_SAMPLES:
+                    skipped_active.append(sample_path.name)
+                    continue
+                touched = False
+                for folder in OUTPUT_FOLDERS:
+                    target = sample_path / folder
+                    if target.exists():
+                        shutil.rmtree(target)
+                        removed_folders += 1
+                        touched = True
+                meta_path = sample_path / RUNTIME_CACHE_META
+                if meta_path.exists():
+                    meta_path.unlink()
+                    removed_meta += 1
                     touched = True
-            meta_path = sample_path / RUNTIME_CACHE_META
-            if meta_path.exists():
-                meta_path.unlink()
-                removed_meta += 1
-                touched = True
-            if touched:
-                cleared_samples += 1
+                if touched:
+                    cleared_samples += 1
     print(
         (
             "[runtime] output cache cleared "
@@ -788,6 +893,22 @@ def _patch_sample_maps(sample_map: dict[str, str]) -> None:
         module.SAMPLE_MAP = sample_map
 
 
+def _read_json_artifact(path: Path) -> list[Any]:
+    # A truncated/corrupt artifact (power loss or a crash mid-write) previously raised
+    # json.JSONDecodeError straight out of _collect_runtime_report, uncaught -- and since a
+    # cache HIT calls this without ever re-running the pipeline, that 500 would repeat on
+    # every subsequent request for the same cached image forever, with no self-heal. Treating
+    # a parse failure the same as a missing file (empty list, matching the existing
+    # `.exists()` fallback just below) makes this the same "degrade gracefully" behavior the
+    # missing-file case already has, instead of a permanent wedge.
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+
+
 def _collect_runtime_report(
     sample_name: str,
     language: str,
@@ -813,11 +934,11 @@ def _collect_runtime_report(
     typeset_report_path = sample_path / "step_8_typeset" / "typeset_report.json"
     vision_rescue_meta_path = sample_path / "step_5_ocr" / "vision_rescue_meta.json"
 
-    ocr_items = json.loads(ocr_path.read_text(encoding="utf-8")) if ocr_path.exists() else []
-    layout = json.loads(layout_path.read_text(encoding="utf-8")) if layout_path.exists() else []
-    rejected_layout = json.loads(rejected_layout_path.read_text(encoding="utf-8")) if rejected_layout_path.exists() else []
-    translations = json.loads(translation_path.read_text(encoding="utf-8")) if translation_path.exists() else []
-    typeset_report = json.loads(typeset_report_path.read_text(encoding="utf-8")) if typeset_report_path.exists() else []
+    ocr_items = _read_json_artifact(ocr_path)
+    layout = _read_json_artifact(layout_path)
+    rejected_layout = _read_json_artifact(rejected_layout_path)
+    translations = _read_json_artifact(translation_path)
+    typeset_report = _read_json_artifact(typeset_report_path)
     layout_ids = {
         int(item["id"])
         for item in layout

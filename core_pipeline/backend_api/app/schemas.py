@@ -27,8 +27,15 @@ class TranslateResponse(BaseModel):
     error: str | None = None
 
 
+# A single batch request spins up work (translation pipeline runs) across a shared
+# executor; an unbounded images list is a resource-exhaustion risk. 20 is a generous cap
+# for a browser-extension "translate visible page" batch while keeping a single request
+# bounded.
+BATCH_MAX_IMAGES = 20
+
+
 class BatchRequest(BaseModel):
-    images: list[TranslateRequest]
+    images: list[TranslateRequest] = Field(max_length=BATCH_MAX_IMAGES)
 
 
 class BatchResponse(BaseModel):
@@ -49,5 +56,6 @@ class HealthResponse(BaseModel):
     service: str
     mode: str
     version: str
+    commit: str | None = None
     warmup: dict[str, Any] = Field(default_factory=dict)
     scheduler: dict[str, Any] = Field(default_factory=dict)

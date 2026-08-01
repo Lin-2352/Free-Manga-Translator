@@ -115,11 +115,13 @@ class ApiProviderUnavailable(RuntimeError):
 
 
 class ApiManager:
+    _DOTENV_LOADED_ONCE = False
+
     def __init__(self, state_path: Path | None = None) -> None:
         self._lock = threading.Lock()
         self._state_path = state_path or PROJECT_ROOT / "runtime_samples" / "api_quota_state.json"
         self._lock_path = self._state_path.with_suffix(".lock")
-        self._state: dict[str, Any] = self._read_state()
+        self._state: dict[str, Any] = self._read_state() or {}
         self._env_path: Path | None = None
         self._missing_env_warning_emitted = False
         self._load_env()
@@ -138,7 +140,11 @@ class ApiManager:
         fh = _acquire_cross_process_file_lock(self._lock_path)
         try:
             with self._lock:
-                self._state = self._read_state()
+                _fresh_state = self._read_state()
+                if _fresh_state is not None:
+                    self._state = _fresh_state
+                # else: transient read failure -- keep the previous in-memory
+                # self._state rather than clobbering it with {}.
                 yield
         finally:
             _release_cross_process_file_lock(fh)
@@ -226,6 +232,14 @@ class ApiManager:
         }
 
     def _load_env(self) -> None:
+        # _csv_env() (the actual key-lookup hot path) calls this on every single
+        # key reservation, so without a once-per-process guard this used to run
+        # load_dotenv() constantly. Combined with override=True that meant a
+        # real operator/CI-set environment variable was stomped back to the
+        # .env file's value on every call, and os.environ was being mutated
+        # from potentially multiple pipeline threads with no lock around it.
+        if ApiManager._DOTENV_LOADED_ONCE:
+            return
         candidates: list[Path] = []
         explicit = os.environ.get("FMT_ENV_FILE", "").strip()
         if explicit:
@@ -251,7 +265,10 @@ class ApiManager:
         self._env_path = env_path
         self._missing_env_warning_emitted = False
         if load_dotenv is not None:
-            load_dotenv(env_path, override=True)
+            # override=False: an operator/CI-set real environment variable must
+            # win over the .env file's value, not be stomped by it.
+            load_dotenv(env_path, override=False)
+            ApiManager._DOTENV_LOADED_ONCE = True
             return
         for raw_line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = raw_line.strip()
@@ -262,15 +279,33 @@ class ApiManager:
             value = value.strip().strip('"').strip("'")
             if key and key not in os.environ:
                 os.environ[key] = value
+        ApiManager._DOTENV_LOADED_ONCE = True
 
-    def _read_state(self) -> dict[str, Any]:
+    def _read_state(self) -> dict[str, Any] | None:
+        """Returns the on-disk state dict, {} for a legitimate cold start (no
+        state file yet), or None if the file exists but couldn't be read/parsed
+        right now (e.g. a transient file-lock from an antivirus scanner or file
+        indexer). None is a "don't know, don't touch" signal -- callers must
+        NOT treat it as {} and overwrite/persist an empty state, or a purely
+        transient hiccup would wipe every provider's quota/usage counters.
+        """
         try:
-            if self._state_path.exists():
-                data = json.loads(self._state_path.read_text(encoding="utf-8"))
-                return data if isinstance(data, dict) else {}
-        except Exception:
+            if not self._state_path.exists():
+                return {}
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            # Legitimate cold-start race (existed a moment ago, gone now, or
+            # never existed): no prior state to preserve, {} is correct.
             return {}
-        return {}
+        except (OSError, json.JSONDecodeError) as error:
+            LOGGER.warning(
+                "Could not read API quota state file %s (%s); leaving in-memory state untouched "
+                "this cycle instead of wiping it.",
+                self._state_path,
+                error,
+            )
+            return None
 
     def _write_state_locked(self) -> None:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -804,6 +839,15 @@ class ApiManager:
         with self._synced():
             provider_state = self._provider_state_locked(lease.provider)
             key_state = self._ensure_key_state(provider_state, lease.key_hash, lease.key_index)
+            # reserve_key/reserve_key_index pre-charge the daily budget with
+            # `lease.reserved_tokens` (an estimate, sized for the worst-case
+            # response length) before the call is even made. A failed call
+            # delivered zero translation, so that reservation must be handed
+            # back -- otherwise every failed call permanently burns budget it
+            # never actually spent, and enough failures alone can exhaust the
+            # daily quota with nothing translated.
+            key_state["tokensUsed"] = max(0, int(key_state.get("tokensUsed", 0)) - lease.reserved_tokens)
+            key_state["requestsUsed"] = max(0, int(key_state.get("requestsUsed", 0)) - 1)
             key_state["lastError"] = error_text[:600]
             key_state["lastFailureAt"] = self._now_iso()
             if terminal or auth_block:

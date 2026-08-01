@@ -15,6 +15,30 @@ DEFAULT_RESERVED_FREE_MB = 2048
 DEFAULT_JOB_VRAM_MB = 3072
 DEFAULT_WAIT_LOG_SECONDS = 8.0
 DEFAULT_ADMISSION_GRACE_SECONDS = 8.0
+DEFAULT_GPU_PROBE_TTL_SECONDS = 1.5
+# 60s was measured to be shorter than a real page's own pipeline runtime (a live end-to-end
+# run measured ~78s: step5_ocr 12.8 + step6_layout 1.4 + step7_translate 5.2 + step4_inpaint
+# 3.6 + step8_typeset 54.8), which made a 2nd concurrent request at capacity=1 (the common case
+# on an 8GB card post-warmup) 503 with SCHEDULER_BUSY deterministically, not occasionally.
+# extension/background.js now clamps its own dispatch concurrency to this server's advertised
+# capacity (effectiveParallelLimit(), fed by /v1/health's scheduler.capacity and this endpoint's
+# own report.scheduler.capacityAtAcquire) and retries a SCHEDULER_BUSY response internally
+# instead of dropping the page, so this wait is now a secondary safety margin rather than the
+# primary defense -- it mainly protects clients that don't do that clamping (a second browser
+# profile, /v1/batch, any other caller). 120s must stay under the extension's own fetch timeout
+# (background.js's DEFAULT_FETCH_TIMEOUT_MS = 360_000) with margin for wait + the run itself:
+# 120 + 180 (documented cold-run ceiling) = 300s, leaving ~60s. 180s would consume the whole
+# 360s budget on a cold run; 240s would exceed it.
+DEFAULT_MAX_WAIT_SECONDS = 120.0
+
+
+class SchedulerBusyError(Exception):
+    """Raised by acquire() when max_wait_seconds elapses before a slot frees up.
+
+    Deliberately NOT a subclass of any pipeline-error type -- callers must be able to
+    catch this specifically and map it to HTTP 503, distinct from the generic 500 used
+    for real pipeline failures.
+    """
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int | None = None) -> int:
@@ -75,10 +99,28 @@ class AdaptiveGpuScheduler:
         # the next gpu_memory() probe yet, so without this a burst of admissions can
         # oversubscribe the GPU before the probe catches up.
         self._admission_times: list[float] = []
+        # Short-TTL cache for gpu_memory(): probing nvidia-smi/torch on every call caused a
+        # measured ~15s stall on /v1/health during model warmup (a busy CUDA context makes
+        # mem_get_info() slow). This is a leaf lock -- only ever held inside gpu_memory()
+        # itself, never nested with _condition or any other lock -- so it cannot introduce
+        # a new lock-ordering hazard.
+        self._gpu_probe_lock = threading.Lock()
+        self._gpu_probe_cache: GpuMemory | None = None
+        self._gpu_probe_cached_at = 0.0
 
     @property
     def max_parallel(self) -> int:
-        return _env_int("FMT_PIPELINE_MAX_PARALLEL", DEFAULT_MAX_PARALLEL, 1, 4)
+        # The ceiling here (8) is not the real safety gate -- _capacity_for_memory()'s live
+        # free-VRAM probe is, and it already refuses to admit more jobs than actual free
+        # memory supports regardless of this value. This ceiling only bounds how high a
+        # deployment CAN opt into via the env var; it was previously hard-clamped to 4, which
+        # meant a machine with genuinely more free VRAM than 4 jobs' worth could never exceed
+        # 4 concurrent jobs even with headroom to spare. The DEFAULT stays 2 (unchanged) --
+        # this only widens what a deployment can explicitly opt into. Kaggle's own notebook
+        # currently sets FMT_PIPELINE_MAX_PARALLEL=3, already close to what its estimated free
+        # VRAM after base models load supports (see Cell 3's own comment) -- this change does
+        # not itself raise that, it only removes the code-level wall below it.
+        return _env_int("FMT_PIPELINE_MAX_PARALLEL", DEFAULT_MAX_PARALLEL, 1, 8)
 
     @property
     def reserved_free_mb(self) -> int:
@@ -91,6 +133,14 @@ class AdaptiveGpuScheduler:
     @property
     def admission_grace_seconds(self) -> float:
         return _env_float("FMT_PIPELINE_ADMISSION_GRACE_SECONDS", DEFAULT_ADMISSION_GRACE_SECONDS, 0.0)
+
+    @property
+    def _gpu_probe_ttl_seconds(self) -> float:
+        return _env_float("FMT_GPU_PROBE_TTL_SECONDS", DEFAULT_GPU_PROBE_TTL_SECONDS, 0.0)
+
+    @property
+    def max_wait_seconds(self) -> float:
+        return _env_float("FMT_PIPELINE_MAX_WAIT_SECONDS", DEFAULT_MAX_WAIT_SECONDS, 0.0)
 
     def _nvidia_smi_memory(self) -> GpuMemory | None:
         executable = shutil.which("nvidia-smi")
@@ -132,7 +182,18 @@ class AdaptiveGpuScheduler:
             return None
 
     def gpu_memory(self) -> GpuMemory | None:
-        return self._nvidia_smi_memory() or self._torch_memory()
+        ttl = self._gpu_probe_ttl_seconds
+        now = time.perf_counter()
+        if ttl > 0:
+            with self._gpu_probe_lock:
+                if now - self._gpu_probe_cached_at < ttl:
+                    return self._gpu_probe_cache
+        result = self._nvidia_smi_memory() or self._torch_memory()
+        if ttl > 0:
+            with self._gpu_probe_lock:
+                self._gpu_probe_cache = result
+                self._gpu_probe_cached_at = time.perf_counter()
+        return result
 
     def _recent_admission_count(self) -> int:
         grace_seconds = self.admission_grace_seconds
@@ -173,9 +234,15 @@ class AdaptiveGpuScheduler:
         }
 
     @contextlib.contextmanager
-    def acquire(self, request_label: str = "") -> Iterator[PipelineSlot]:
+    def acquire(self, request_label: str = "", max_wait_seconds: float | None = None) -> Iterator[PipelineSlot]:
         started = time.perf_counter()
+        wait_limit = self.max_wait_seconds if max_wait_seconds is None else max_wait_seconds
         while True:
+            if wait_limit > 0 and time.perf_counter() - started >= wait_limit:
+                raise SchedulerBusyError(
+                    f"Timed out after {wait_limit:.1f}s waiting for a pipeline slot "
+                    f"(request={request_label})"
+                )
             # gpu_memory() can shell out to nvidia-smi (up to a 2s subprocess timeout) or
             # touch the torch CUDA context. It must run OUTSIDE the condition lock: probing
             # while holding the lock serializes every waiter behind each other's probe,

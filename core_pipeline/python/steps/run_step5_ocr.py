@@ -56,8 +56,9 @@ from pipeline_paths import DEFAULT_SAMPLES_ROOT, sample_root_from_env
 from ml_region_lib import (
     MLConfig, load_ocr_model, load_text_model, load_bubble_model, load_semantic_model,
     detect_text, detect_bubbles, detect_semantic_text_regions,
-    build_step2_routing_state, consolidate_by_bubble, Box, 
-    SAMPLE_MAP, classify_text_by_content
+    build_step2_routing_state, consolidate_by_bubble, Box,
+    SAMPLE_MAP, classify_text_by_content,
+    _safe_bubble_mask, _polygon_from_mask, _bubble_cluster_zones,
 )
 
 _EASYOCR_READERS = {}
@@ -108,7 +109,18 @@ def _paddleocr_reader(language: str):
     if language not in _PADDLEOCR_READERS:
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
         os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
+        # Paddle grows into VRAM on demand instead of grabbing a slab next to torch's.
+        os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
         try:
+            # torch MUST already be imported before paddle in this process: both frameworks
+            # vendor their own cuDNN 9.x sub-DLLs, and Windows resolves DLLs by basename, so
+            # whichever loads second can bind the other's cuDNN siblings at the wrong minor
+            # version (import paddle first here reproducibly raises WinError 127 on
+            # torch\lib\shm.dll). Every real caller already loads torch first (detection/
+            # magi/manga-ocr run before this lazy import), so this is a no-op at runtime and
+            # a guard against a future caller that isn't.
+            import torch  # noqa: F401
+            import paddle
             from paddleocr import PaddleOCR
         except ModuleNotFoundError:
             _PADDLEOCR_UNAVAILABLE.add(language)
@@ -116,12 +128,41 @@ def _paddleocr_reader(language: str):
             return None
 
         paddle_lang = "korean" if language == "ko" else "ch"
-        _PADDLEOCR_READERS[language] = PaddleOCR(
-            lang=paddle_lang,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-        )
+        # Explicit, not left to PaddleOCR's own get_default_device() auto-detection:
+        # that reports "gpu:0" whenever a GPU is physically present, even when the
+        # installed paddlepaddle build has no CUDA kernels at all (e.g. the CPU-only
+        # wheel) -- so it doesn't fail loudly, it silently runs on CPU while claiming
+        # GPU. Deriving this from PADDLE's own compiled-with-cuda flag, not torch's --
+        # torch having working CUDA says nothing about whether THIS installed paddle
+        # build does. Verified directly: on a CPU-only paddle build with a working CUDA
+        # torch, asking PaddleOCR for device="gpu:0" doesn't silently fall back, it
+        # raises ValueError at init ("PaddlePaddle is not compiled with CUDA") -- so the
+        # old torch-derived check could crash OCR init outright on exactly the
+        # mismatched-build case it was trying to protect against.
+        _paddle_device = "gpu:0" if paddle.device.is_compiled_with_cuda() else "cpu"
+        if os.environ.get("MANGA_PADDLE_DEVICE", "").strip().lower() == "cpu":
+            _paddle_device = "cpu"
+        try:
+            _PADDLEOCR_READERS[language] = PaddleOCR(
+                lang=paddle_lang,
+                device=_paddle_device,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+        except Exception as exc:
+            if _paddle_device == "cpu":
+                raise
+            print(f"  [PaddleOCR warn] {language}: GPU init failed ({exc}); falling back to CPU for this process")
+            _paddle_device = "cpu"
+            _PADDLEOCR_READERS[language] = PaddleOCR(
+                lang=paddle_lang,
+                device=_paddle_device,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+        print(f"  [Model D3] PaddleOCR device: {_paddle_device}")
         print(f"  [Model D3] PaddleOCR {paddle_lang}: LOADED")
     return _PADDLEOCR_READERS[language]
 
@@ -1976,69 +2017,6 @@ def _cluster_horizontal_cjk_lines(lines: list[dict]) -> list[list[dict]]:
     return clusters
 
 
-def _safe_bubble_mask(bubble_mask: np.ndarray) -> np.ndarray:
-    ys, xs = np.nonzero(bubble_mask > 0)
-    if len(xs) == 0 or len(ys) == 0:
-        return bubble_mask.copy()
-    bw = int(xs.max() - xs.min() + 1)
-    bh = int(ys.max() - ys.min() + 1)
-    kernel_size = max(3, min(19, int(min(bw, bh) * 0.045)))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    safe = cv2.erode(bubble_mask, kernel, iterations=1)
-    return safe if np.count_nonzero(safe > 0) >= 60 else bubble_mask.copy()
-
-
-def _polygon_from_mask(mask: np.ndarray, fallback_box: Box) -> list[list[int]]:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        epsilon = max(1.5, cv2.arcLength(largest, True) * 0.006)
-        approx = cv2.approxPolyDP(largest, epsilon, True)
-        points = [point[0].astype(int).tolist() for point in approx]
-        if len(points) >= 3:
-            return points
-    return [
-        [fallback_box.x1, fallback_box.y1],
-        [fallback_box.x2, fallback_box.y1],
-        [fallback_box.x2, fallback_box.y2],
-        [fallback_box.x1, fallback_box.y2],
-    ]
-
-
-def _bubble_cluster_zones(cluster_boxes: list[Box], bubble_mask: np.ndarray) -> list[dict]:
-    safe_bubble = _safe_bubble_mask(bubble_mask)
-    h, w = safe_bubble.shape
-    zones: list[dict] = []
-    if not cluster_boxes:
-        return zones
-
-    if len(cluster_boxes) == 1:
-        territory_masks = [safe_bubble]
-    else:
-        dist_maps = []
-        for box in cluster_boxes:
-            seed = np.ones((h, w), dtype=np.uint8) * 255
-            cv2.rectangle(seed, (box.x1, box.y1), (box.x2, box.y2), 0, -1)
-            dist_maps.append(cv2.distanceTransform(seed, cv2.DIST_L2, 5))
-        assignments = np.argmin(np.stack(dist_maps), axis=0)
-        territory_masks = [
-            (((assignments == idx) & (safe_bubble > 0)).astype(np.uint8) * 255)
-            for idx in range(len(cluster_boxes))
-        ]
-
-    for box, territory in zip(cluster_boxes, territory_masks):
-        if np.count_nonzero(territory > 0) < 30:
-            territory = np.zeros_like(safe_bubble)
-            territory[box.y1:box.y2, box.x1:box.x2] = 255
-            territory = cv2.bitwise_and(territory, safe_bubble)
-        points = _polygon_from_mask(territory, box)
-        xs = [int(point[0]) for point in points]
-        ys = [int(point[1]) for point in points]
-        green_box = Box(max(0, min(xs)), max(0, min(ys)), min(w, max(xs) + 1), min(h, max(ys) + 1))
-        zones.append({"green_box": green_box, "green_polygon": points})
-    return zones
-
-
 def _should_merge_chinese_bubble_columns(cluster_boxes: list[Box], img_w: int, img_h: int) -> bool:
     if len(cluster_boxes) < 2:
         return False
@@ -2300,6 +2278,106 @@ def _merge_row_run(
     return out
 
 
+def _semantic_orphan_dialogue_rescue(
+    semantic_result,
+    final_results: list[dict],
+    image: np.ndarray,
+    seg_mask: np.ndarray | None,
+    ocr_runtime,
+    img_w: int,
+    img_h: int,
+) -> list[dict]:
+    # step 1's semantic detector (magi) is a separate, independent pass from
+    # the primary text detector whose seg_mask/detections.json drives the
+    # main consolidation loop above -- it can flag a genuine dialogue region
+    # that the primary detector missed entirely (zero seg_mask coverage), in
+    # which case that region never becomes a candidate for OCR or rejection,
+    # it simply never exists downstream (confirmed: new_sample_8_(ja)'s
+    # "...でも" bubble, 88.8% bright interior, 6% dark ink -- a genuine
+    # bubble signature -- had zero seg_mask pixels and an empty
+    # rejected_layout_items.json). The two vision-rescue paths above exist
+    # for this class of gap but are network-dependent and disabled offline
+    # (USE_API_VISION_OCR=0); this is the offline, deterministic fallback.
+    #
+    # Gate (confidence>=0.55 AND bright_ratio>=0.70) measured against all 16
+    # semantic-dialogue regions suite-wide that don't overlap an existing OCR
+    # box: exactly 1 passes (the target, conf=0.64/bright=0.888); the
+    # next-highest reject is conf=0.45. The false-positive class this must
+    # exclude is the SAME one a prior session reverted for wiring this
+    # detector into a broader gate -- SFX/decorative lettering on artwork
+    # (e.g. new_sample_7_(ko)'s "ぷっ" at conf=0.09) -- which this gate
+    # rejects on confidence alone. compact_text_len alone does NOT separate
+    # these (SFX text can be 2+ chars); confidence+brightness together is the
+    # actual discriminator here, not a redundant belt-and-suspenders.
+    #
+    # NOTE: the 0.55 cut is one-sample-supported (margin to next-highest
+    # reject is 0.45, only one item sits above it). Do not loosen without a
+    # fresh suite-wide sweep.
+    existing_boxes = [
+        _box_from_payload(item["box"])
+        for item in final_results
+        if isinstance(item, dict) and isinstance(item.get("box"), dict)
+    ]
+    next_id = max((int(item.get("id", -1)) for item in final_results), default=-1) + 1
+    new_items: list[dict] = []
+    for region in getattr(semantic_result, "regions", []):
+        if str(getattr(region, "semantic_class", "")) != "dialogue":
+            continue
+        rbox = region.box
+        rarea = max(1, rbox.width * rbox.height)
+        overlap_px = 0
+        for eb in existing_boxes:
+            ix1, iy1 = max(rbox.x1, eb.x1), max(rbox.y1, eb.y1)
+            ix2, iy2 = min(rbox.x2, eb.x2), min(rbox.y2, eb.y2)
+            if ix2 > ix1 and iy2 > iy1:
+                overlap_px += (ix2 - ix1) * (iy2 - iy1)
+        if overlap_px / rarea >= 0.10:
+            continue
+
+        crop = image[rbox.y1:rbox.y2, rbox.x1:rbox.x2]
+        if crop.size == 0:
+            continue
+        gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        bright_ratio = float(np.count_nonzero(gray_crop > 200)) / gray_crop.size
+        confidence = float(getattr(region, "confidence", 0.0) or 0.0)
+        if not (confidence >= 0.55 and bright_ratio >= 0.70):
+            continue
+
+        seg_crop = seg_mask[rbox.y1:rbox.y2, rbox.x1:rbox.x2] if seg_mask is not None else None
+        ocr_meta = _read_ocr_crop(ocr_runtime, crop, seg_crop)
+        ocr_text = str(ocr_meta.get("text") or "").strip()
+        if not ocr_text:
+            continue
+
+        green_box = rbox.expanded(max(10, int(min(rbox.width, rbox.height) * 0.18)), img_w, img_h)
+        new_items.append({
+            "id": next_id,
+            "text": ocr_text,
+            "ocr_provider": ocr_meta.get("provider", "unknown"),
+            "ocr_confidence": ocr_meta.get("confidence"),
+            "box": {k: int(v) for k, v in rbox.to_dict().items()},
+            "green_box": {k: int(v) for k, v in green_box.to_dict().items()},
+            "green_polygon": [
+                [green_box.x1, green_box.y1],
+                [green_box.x2, green_box.y1],
+                [green_box.x2, green_box.y2],
+                [green_box.x1, green_box.y2],
+            ],
+            "route": "floating_dialogue",
+            "bubble_idx": -1,
+            "mask_mode": "stroke",
+            "overlap_collision": False,
+            "fallback_source": "semantic_orphan_rescue",
+            "force_bubble_cleanup": False,
+        })
+        print(
+            f"  [semantic-orphan-rescue] {ocr_text[:30]}... "
+            f"conf={confidence:.2f} bright={bright_ratio:.2f}"
+        )
+        next_id += 1
+    return new_items
+
+
 def _merge_same_line_ocr_fragments(
     final_results: list[dict],
     image: np.ndarray,
@@ -2539,6 +2617,12 @@ def _run_step5_ocr_unlocked(sample_map: dict[str, str] | None = None, samples_di
         sample_ocr_language = _sample_cjk_ocr_language(sample_name) if _local_cjk_mode() else None
         ocr_runtime = get_ocr_runtime(sample_ocr_language)
         image = cv2.imread(str(img_path))
+        if image is None:
+            raise ValueError(
+                f"cv2.imread() could not read {img_path} -- the file is missing, truncated, or "
+                "not a valid image. This surfaces here as a clear error instead of the cryptic "
+                "'NoneType' object has no attribute 'shape'."
+            )
         h, w = image.shape[:2]
         
         # Check for Step 1-3 results
@@ -2559,7 +2643,17 @@ def _run_step5_ocr_unlocked(sample_map: dict[str, str] | None = None, samples_di
                 _clear_stale_step1_outputs(detect_dir)
             else:
                 print(f"  Step 1 results missing. Running detection models...")
-            if text_handle is None:
+            # Reload if ANY of the three is missing, not just text_handle -- a caller (e.g.
+            # the runtime server's startup warmup) can leave a partial trio if it loaded text
+            # detection/bubble segmentation successfully but semantic detection failed or
+            # hadn't committed yet. Keying the reload off one handle as a proxy for "all
+            # loaded" left that partial state permanently un-repaired: every request after it
+            # would reuse the same stale text_handle (non-None) and crash on the still-None
+            # semantic_handle instead of ever reloading it. This whole block already runs
+            # inside _STEP5_RUN_LOCK (acquired by the public run_step5_ocr() wrapper before
+            # calling this function), so this reload is already safely serialized against
+            # concurrent requests and against the runtime server's own atomic warmup commit.
+            if text_handle is None or bubble_model is None or semantic_handle is None:
                 text_handle = load_text_model(cfg.text_model_path)
                 bubble_model, bubble_device = load_bubble_model(cfg.bubble_model_path)
                 semantic_handle = load_semantic_model("magi")
@@ -2764,6 +2858,12 @@ def _run_step5_ocr_unlocked(sample_map: dict[str, str] | None = None, samples_di
             )
         except OSError:
             pass
+
+        orphan_rescued = _semantic_orphan_dialogue_rescue(
+            semantic_result, final_results, image, text_result.seg_mask, ocr_runtime, w, h
+        )
+        if orphan_rescued:
+            final_results = final_results + orphan_rescued
 
         final_results = _merge_same_line_ocr_fragments(
             final_results, image, text_result.seg_mask, ocr_runtime, w, h

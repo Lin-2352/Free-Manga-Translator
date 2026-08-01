@@ -196,6 +196,20 @@ const sandbox = {
       },
       translations: [],
     };
+    if (fetchedBody?.metadata?.cacheKey?.includes('scheduler-busy')) {
+      return {
+        ok: false,
+        status: 503,
+        json: async () => ({ detail: { code: 'SCHEDULER_BUSY', message: 'Server busy: no pipeline slot became available in time.', traceId: 'x' } }),
+      };
+    }
+    if (fetchedBody?.metadata?.cacheKey?.includes('generic-503')) {
+      return {
+        ok: false,
+        status: 503,
+        json: async () => ({ detail: { code: 'SOME_OTHER_ERROR', message: 'Something else entirely.' } }),
+      };
+    }
     if (fetchedBody?.metadata?.cacheKey?.includes('hold')) {
       return new Promise((resolve) => {
         heldFetchResolvers.push(() => resolve({
@@ -515,5 +529,46 @@ await new Promise((resolve) => setTimeout(resolve, 0));
 
 assert.equal(alarmActiveAccordingToMock, false, 'keep-alive alarm cleared once both active and queued work have drained');
 assert.equal(alarmCalls.clear >= 1, true, 'chrome.alarms.clear was actually invoked, not just the in-memory flag');
+
+// ===== A 503 tagged SCHEDULER_BUSY (the backend's GPU-slot scheduler saturated) must be
+// normalized to a stable PIPELINE_BUSY code, not forwarded as the raw human message -- content.js
+// routes on this exact code to its patient retry path instead of treating it as terminal. =====
+const busyResponse = await new Promise((resolve) => {
+  messageListener(
+    {
+      kind: 'translateImage',
+      base64Data: 'data:image/png;base64,YnVzeQ==',
+      cacheKey: 'https://example.test/scheduler-busy.jpg|100x120',
+      originalImageUrl: 'https://example.test/scheduler-busy.jpg',
+      pageCacheKey: 'https://example.test/manga',
+      width: 100,
+      height: 120,
+      pageUrl: 'https://example.test/manga',
+    },
+    { tab: { id: 1 } },
+    resolve,
+  );
+});
+assert.equal(busyResponse.error, 'PIPELINE_BUSY', 'a SCHEDULER_BUSY 503 is normalized to a stable PIPELINE_BUSY code');
+
+// A generic 503 without the SCHEDULER_BUSY code must be unaffected -- still surfaces its own
+// message, not misclassified as PIPELINE_BUSY.
+const genericResponse = await new Promise((resolve) => {
+  messageListener(
+    {
+      kind: 'translateImage',
+      base64Data: 'data:image/png;base64,Z2VuZXJpYw==',
+      cacheKey: 'https://example.test/generic-503.jpg|100x120',
+      originalImageUrl: 'https://example.test/generic-503.jpg',
+      pageCacheKey: 'https://example.test/manga',
+      width: 100,
+      height: 120,
+      pageUrl: 'https://example.test/manga',
+    },
+    { tab: { id: 1 } },
+    resolve,
+  );
+});
+assert.equal(genericResponse.error, 'Something else entirely.', 'a non-SCHEDULER_BUSY 503 still surfaces its own message, not PIPELINE_BUSY');
 
 console.log('extension_background_contract=pass');

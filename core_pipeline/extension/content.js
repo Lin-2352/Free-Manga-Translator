@@ -32,6 +32,15 @@
   const MAX_RETRIES = 3;
   const BASE_RETRY_DELAY = 3000;
   const PIPELINE_OFFLINE_RETRY_DELAY_MS = 12000;
+  // The offline retry loop below is deliberately unbounded (a long backend outage should not spam
+  // a per-image error badge) -- but a per-image SPINNER that keeps visibly animating for the
+  // entire duration of an outage that could last minutes reads as "stuck", not "waiting". After
+  // this many consecutive PIPELINE_OFFLINE responses for the same image, the spinner is switched
+  // to a calm, static state (retry loop itself keeps running unchanged) and resumes its normal
+  // spinning state the moment a later retry gets ANY response other than PIPELINE_OFFLINE --
+  // which only happens once background.js's circuit breaker actually lets a request reach (and
+  // hear back from) the server again.
+  const OFFLINE_SPINNER_CALM_THRESHOLD = 6;
   const DEFAULT_AUTO_QUEUE_LIMIT = 20;
   const MAX_AUTO_QUEUE_LIMIT = 50;
   const EXTENSION_VERSION = '1.1.15';
@@ -55,6 +64,7 @@
   const pendingSrcs = new Set();
   const cacheMissSrcs = new Set();
   const retryCountMap = new Map();
+  const offlineRetryCountMap = new Map();
   const observedImages = new WeakSet();
   const spinnerMap = new Map();
   let spinnerFrame = null;
@@ -201,6 +211,16 @@
         animation: fmt-img-spin 0.8s linear infinite;
         box-sizing: border-box;
       }
+      /* Calm/waiting state: a long backend outage stops looking like visible progress and starts
+         looking like a static "waiting for backend" indicator instead of an endlessly-spinning
+         one that reads as stuck. */
+      .fmt-img-spinner--calm {
+        background: rgba(70, 70, 70, 0.55);
+      }
+      .fmt-img-spinner--calm::after {
+        animation: none;
+        border-top-color: rgba(255,255,255,0.3);
+      }
     `;
     (document.head || document.documentElement).appendChild(style);
   }
@@ -230,6 +250,15 @@
       spinnerMap.delete(img);
     }
     stopSpinnerLoopIfIdle();
+  }
+
+  // Toggles the calm/waiting visual state on an already-shown spinner (see
+  // OFFLINE_SPINNER_CALM_THRESHOLD) without touching whether it is shown at all.
+  function setSpinnerCalm(img, calm) {
+    const spinner = spinnerMap.get(img);
+    if (!spinner?.classList) return;
+    if (calm) spinner.classList.add('fmt-img-spinner--calm');
+    else spinner.classList.remove('fmt-img-spinner--calm');
   }
 
   function imageHasAttr(img, attr) {
@@ -637,6 +666,11 @@
     if (previousCacheKey) {
       pendingSrcs.delete(previousCacheKey);
       retryCountMap.delete(previousCacheKey);
+      // Without this, a reused <img> node's offline-retry count from an abandoned earlier src
+      // (this function's whole purpose is handling exactly that reuse) silently carries over --
+      // a later, genuinely fresh offline streak for the NEW src inherits a partially-consumed
+      // budget and can cross OFFLINE_SPINNER_CALM_THRESHOLD on its first or second response.
+      offlineRetryCountMap.delete(previousCacheKey);
     }
     img.removeAttribute(TRANSLATED_ATTR);
     img.removeAttribute(TRANSLATED_SRC_ATTR);
@@ -1209,6 +1243,12 @@
         return;
       }
 
+      if (response?.error !== 'PIPELINE_OFFLINE' && offlineRetryCountMap.delete(cacheKey)) {
+        // Any response other than PIPELINE_OFFLINE for an image that had been in the offline
+        // retry loop is itself proof the backend answered again (background.js's circuit breaker
+        // only ever returns PIPELINE_OFFLINE while it's tripped) -- resume the normal spinner.
+        setSpinnerCalm(img, false);
+      }
       if (response?.error) {
         console.warn('[MangaTranslator] API error:', response.error);
         emitDiagnostic('content.translate.error_response', traceId, {
@@ -1231,6 +1271,16 @@
           // later -- a flapping tunnel under heavy Kaggle OCR load repeatedly tripping this
           // path made the spinner look like it was randomly stopping, when it was actually
           // just hidden for the entire duration of every silent retry wait.
+          //
+          // Past OFFLINE_SPINNER_CALM_THRESHOLD consecutive offline responses, the outage is no
+          // longer "a moment", so the spinner itself stops looking like active progress and
+          // switches to a calm/static waiting state -- the retry loop below is completely
+          // unaffected and keeps running in the background at the same cadence either way.
+          const offlineCount = (offlineRetryCountMap.get(cacheKey) || 0) + 1;
+          offlineRetryCountMap.set(cacheKey, offlineCount);
+          if (offlineCount > OFFLINE_SPINNER_CALM_THRESHOLD) {
+            setSpinnerCalm(img, true);
+          }
           setTimeout(() => {
             img.removeAttribute(PROCESSING_ATTR);
             pendingSrcs.delete(cacheKey);
@@ -1238,6 +1288,15 @@
           }, PIPELINE_OFFLINE_RETRY_DELAY_MS);
           return; // spinner stays during retry
         }
+        // PIPELINE_BUSY is no longer retried here. background.js's dispatchTranslation() now
+        // retries it internally (requeueIfBusy(), a bounded 3-attempt backoff re-entering its
+        // own src-keyed queue) before ever returning PIPELINE_BUSY to this content script --
+        // that background-owned retry can complete and cache a result even if the page has
+        // since navigated away, which a node-anchored retry here fundamentally cannot: on a
+        // single-<img> viewer the node is reused for later pages, so re-driving translateImage
+        // on it just hits the TRANSLATED_ATTR gate in shouldTranslate() and silently no-ops,
+        // permanently losing the page. If PIPELINE_BUSY reaches here at all, background.js has
+        // already exhausted its own retries -- fall through to the generic badge+cleanup below.
         if (response.error === 'FullQueue' || response.error === 'QueueFull' || response.error === 'RATE_LIMITED' || response.error === 'PIPELINE_TIMEOUT') {
           const retryCount = (retryCountMap.get(cacheKey) || 0) + 1;
           retryCountMap.set(cacheKey, retryCount);

@@ -1030,6 +1030,17 @@ def render_report(summaries: list[ProviderSummary]) -> str:
 
 
 def main() -> int:
+    # This prints live API response text (result.detail below), which can carry non-ASCII
+    # (e.g. the Japanese translation-probe prompt's echoed response) -- on a plain Windows
+    # console (cp1252) that print() raises UnicodeEncodeError and fails this test for a
+    # reason that has nothing to do with the API keys it checks. Every other diagnostics
+    # entrypoint that prints CJK text either imports run_extension_pipeline_server (which
+    # reconfigures stdout to UTF-8 on import) or does this itself; this one did neither.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     print("Testing provider keys without printing secret values...")
     summaries = [
         test_gemini(),

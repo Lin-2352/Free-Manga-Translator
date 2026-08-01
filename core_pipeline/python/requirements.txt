@@ -11,15 +11,29 @@ torch==2.6.0
 torchvision==0.21.0
 # CUDA build: the pipeline requires a CUDA-enabled torch/torchvision wheel (ml_region_lib.py
 # raises RuntimeError rather than silently falling back to CPU for the core detection models) --
-# install from the PyTorch CUDA 12.4 index, not plain PyPI, e.g.:
-#   pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+# install from the PyTorch CUDA index, not plain PyPI. On Windows, use the cu126 index, not
+# cu124: paddle-gpu (below) has no cu124/cu125 wheel for Windows + Python 3.13, and torch cu124's
+# vendored cuDNN (9.1.0.70) collides with paddle-gpu's at the DLL-basename level (WinError 127,
+# see run_step5_ocr.py's _paddleocr_reader() for the full story). cu126 is the minimum torch
+# index that coexists with paddle-gpu on Windows in the same process:
+#   pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu126
+# (Linux/Kaggle has no such collision -- one shared libcudnn.so.9 resolves both frameworks -- so
+# this constraint is Windows-specific; deploy/kaggle/fmt_kaggle_backend.ipynb already detects the
+# active torch CUDA build dynamically and needs no change.)
 onnxruntime-gpu==1.26.0
 # Exact pin, not a floor: >=1.26.0 resolves to 1.27.0+, which switched its default
 # build from CUDA 12 to CUDA 13 (needs libcudart.so.13, absent on any Kaggle CUDA-12.x
 # box) -- an unbounded range let a Kaggle cold install grab the broken 1.27.0 first
 # (a 220MB wasted download) before a separate re-pin step had to undo it. Exact-pinning
 # here means the FIRST install pass gets it right instead of a second pass fixing it.
-opencv-python>=4.10.0
+opencv-python>=4.10.0,<5.0
+# Upper-bounded (2026-07-26): a Kaggle run resolved opencv-python-headless 5.0.0.93 with
+# no explicit bound in play -- a major-version jump the pipeline's ~2500 cv2.* call sites
+# have never been validated against. The Kaggle notebook's requirements filter
+# (_filter_requirements in fmt_kaggle_backend.ipynb) swaps this line's package name to
+# opencv-python-headless but keeps the version spec verbatim, so this bound reaches the
+# headless install too -- kept in sync with the same <5.0 bound the notebook's own
+# post-install cleanup step (6) applies as a second line of defense.
 numpy>=2.3.0,<3.0.0
 Pillow>=12.0.0
 transformers==5.12.0
@@ -50,7 +64,35 @@ manga-ocr>=0.1.14
 requests>=2.34.0
 
 # --- Model-specific runtimes, each backing one of step 1/5's detection/OCR models ---
-paddlepaddle>=3.3.1
+# paddlepaddle is deliberately NOT listed here. Historically (paddleocr <3.7), a plain
+# `pip install -r requirements.txt` resolved it to the CPU-only PyPI wheel, which
+# PaddleOCR's own device auto-detection (get_default_device()) reports "gpu:0" for anyway
+# even when the installed build has no CUDA kernels at all -- so it doesn't fail loudly, it
+# silently runs Korean/Chinese OCR entirely on CPU. That was confirmed concretely on this
+# machine: `pip list` showed both plain `paddlepaddle` (CPU, then pulled in transitively by
+# paddleocr) AND `paddlepaddle-gpu` installed side by side -- the two packages install into
+# the SAME `paddle/` site-packages directory (unlike e.g. onnxruntime/onnxruntime-gpu), so
+# this isn't just "whichever wins": plain `pip uninstall paddlepaddle` deletes files
+# paddlepaddle-gpu also needs (confirmed: this broke `paddle.device` entirely, AttributeError,
+# until paddlepaddle-gpu was force-reinstalled). Correction (2026-07-26): with paddleocr
+# 3.7.0 / paddlex 3.7.2, a Kaggle run showed plain `paddlepaddle` is NOT reliably pulled in
+# transitively anymore -- paddle was wholly absent, ModuleNotFoundError, not CPU-only. Either
+# way (absent or CPU-only), the fix is the same: install paddlepaddle-gpu explicitly from its
+# own CUDA-specific index, which lives ONLY on paddlepaddle.org.cn -- PyPI's own
+# `paddlepaddle-gpu` stops at 2.6.2 and targets CUDA 10.2, unusable here. If a CPU
+# `paddlepaddle` is present, uninstall it first, then FORCE-reinstall the GPU one to restore
+# any shared files it lost:
+#   pip uninstall -y paddlepaddle
+#   pip install --force-reinstall --no-deps paddlepaddle-gpu>=3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+# (matching the Windows cu126 requirement above). Paddle's stable index doesn't publish every
+# CUDA tag at every version -- e.g. cu128 exists but tops out at 3.2.0, so a torch build
+# reporting cu128 needs a different tag for paddlepaddle-gpu>=3.3.0 (confirmed by fetching the
+# index pages directly). The Kaggle deployment notebook
+# (deploy/kaggle/fmt_kaggle_backend.ipynb, step 6e) tries several candidate tags in order and
+# verifies each with a real CUDA check in a fresh subprocess rather than trusting pip's exit
+# code or a single hardcoded tag; if every candidate fails it warns and continues rather than
+# failing the whole deployment, since run_step5_ocr.py already treats paddle as optional and
+# falls back to EasyOCR.
 paddleocr>=3.6.0
 
 # ultralytics (YOLOv11n-seg) backs Model B (manga109-segmentation-bubble), one of the three core

@@ -26,6 +26,7 @@ let resolveHeldUrl = null;
 let noTextRescuedUrl = null;
 let errorTriggerUrl = null;
 let offlineTriggerUrl = null;
+let busyTriggerUrl = null;
 const documentListeners = new Map();
 let fakePanelOverlayPresent = false;
 let elementsFromPointStack = [];
@@ -246,6 +247,9 @@ const sandbox = {
         }
         if (message.kind === 'translateImage' && message.originalImageUrl === offlineTriggerUrl) {
           return { error: 'PIPELINE_OFFLINE' };
+        }
+        if (message.kind === 'translateImage' && message.originalImageUrl === busyTriggerUrl) {
+          return { error: 'PIPELINE_BUSY' };
         }
         if (message.kind === 'translateImage' && message.originalImageUrl === noTextRescuedUrl) {
           return {
@@ -902,6 +906,37 @@ offlineTriggerUrl = null;
 // terminal state before the next section runs. Clear it out of fakeImages so a later section's
 // own setup (e.g. changing the queue limit, which rescans whatever fakeImages currently holds)
 // doesn't accidentally pick up and re-translate this still-pending image as a side effect.
+fakeImages = [];
+
+// ===== PIPELINE_BUSY is now retried entirely inside background.js (requeueIfBusy(), a bounded
+// 3-attempt backoff that re-enters its own src-keyed queue) BEFORE it is ever returned to
+// content.js. content.js's own node-anchored busy retry was removed: on a single-<img> page
+// viewer (one DOM node whose src is swapped per page), re-driving translateImage on that same
+// node once it has moved on to a later, already-translated page just hits the TRANSLATED_ATTR
+// gate in shouldTranslate() and silently no-ops -- which is exactly how pages were previously
+// lost with no visible signal at all. So if PIPELINE_BUSY reaches content.js now, background.js
+// has already exhausted its own retries; it is treated as a genuine terminal error, same as any
+// other exhausted-retry response: a badge IS shown and the processing marker IS cleared.
+// `requestsBeforeBusy + 1` staying exactly 1 is the load-bearing assertion here -- it proves
+// content.js does not re-drive translateImage itself for this response anymore. =====
+fakeImages = [fakeImage];
+translatedAttrs.clear();
+removedAttrs.length = 0;
+const busyUrl = 'https://example.test/busy-page.jpg';
+fakeImage.src = busyUrl;
+fakeImage.currentSrc = busyUrl;
+busyTriggerUrl = busyUrl;
+const appendedBeforeBusy = appendedNodes.length;
+const requestsBeforeBusy = translateRequests.length;
+
+contentListener({ kind: 'translatePageOnce' }, {}, () => {});
+await new Promise((resolve) => setTimeout(resolve, 10));
+
+assert.equal(translateRequests.length, requestsBeforeBusy + 1, 'content.js sends exactly one attempt and does not itself re-drive translateImage for PIPELINE_BUSY');
+assert.equal(translatedAttrs.get('data-fmt-processing'), undefined, 'the processing marker is cleared once background.js reports PIPELINE_BUSY as terminal');
+const busyBadge = appendedNodes.slice(appendedBeforeBusy).find((node) => node.className === 'fmt-img-error-badge');
+assert.notEqual(busyBadge, undefined, 'a PIPELINE_BUSY that reaches content.js means background.js already exhausted its own retries, and must show a visible badge like any other terminal error');
+busyTriggerUrl = null;
 fakeImages = [];
 
 // ===== Panel picker (manual "inspect element"-style target selection) =====

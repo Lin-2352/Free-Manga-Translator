@@ -25,7 +25,7 @@
       <div class="section-header">
         <span class="section-icon">Pipeline</span>
         <span>Local Pipeline</span>
-        <span class="status-dot active" id="apiStatus"></span>
+        <span class="status-dot" id="apiStatus" title="Not checked yet"></span>
       </div>
       <div class="setting-row setting-row-stack">
         <label for="localPipelineUrl">Local Pipeline URL</label>
@@ -126,7 +126,7 @@
           <strong id="parallelJobsText">2</strong>
         </div>
       </div>
-      <div class="queue-meter" aria-label="Translation queue pressure">
+      <div class="queue-meter" id="queueMeter" role="progressbar" aria-label="Translation queue pressure" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
         <span id="queueMeterFill"></span>
       </div>
       <div id="queueItemsList" class="queue-items-list" hidden></div>

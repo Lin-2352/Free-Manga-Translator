@@ -1137,3 +1137,35 @@ input[type="color"] {
   color: var(--text-subtle);
   font-size: 10px;
 }
+
+/* Windows High Contrast / forced-colors mode replaces most custom colors with a small system
+   palette, which can make a subtle box-shadow-based focus-visible ring (like .btn:focus-visible
+   and .theme-toggle:focus-visible above) disappear entirely. This guarantees a real, system-color
+   outline stays visible on every interactive element regardless of what forced-colors does to the
+   rest of the page's styling. */
+@media (forced-colors: active) {
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  .toggle-slider:focus-visible,
+  .info-icon:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+}
+
+/* Respect the OS-level "reduce motion" preference: every transition/animation in this file
+   (button/toggle hover states, the status-dot pulse, queue-meter fill, etc.) collapses to an
+   instant state change instead of an animated one. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

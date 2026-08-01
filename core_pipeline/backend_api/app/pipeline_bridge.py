@@ -34,7 +34,7 @@ from typing import Any, Iterator
 
 import run_extension_pipeline_server as legacy_bridge
 
-from .gpu_scheduler import PIPELINE_SCHEDULER
+from .gpu_scheduler import PIPELINE_SCHEDULER, SchedulerBusyError  # noqa: F401  (re-exported for callers)
 
 
 _SAMPLE_LOCKS: dict[str, threading.Lock] = {}

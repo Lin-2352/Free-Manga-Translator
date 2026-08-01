@@ -94,6 +94,74 @@ class Box:
                 "width": self.width, "height": self.height}
 
 
+# Moved here from run_step5_ocr.py (P1-1, 2026-07-29) -- step 6's per-sibling placement
+# pass needs this same per-cluster Voronoi partition, and run_step6_layout.py should not
+# import run_step5_ocr.py (it would pull in manga-ocr/EasyOCR/Paddle at module scope).
+# Pure relocation, no logic change; re-exported from run_step5_ocr under these same
+# private names so its existing call sites are untouched.
+def _safe_bubble_mask(bubble_mask: np.ndarray) -> np.ndarray:
+    ys, xs = np.nonzero(bubble_mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return bubble_mask.copy()
+    bw = int(xs.max() - xs.min() + 1)
+    bh = int(ys.max() - ys.min() + 1)
+    kernel_size = max(3, min(19, int(min(bw, bh) * 0.045)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    safe = cv2.erode(bubble_mask, kernel, iterations=1)
+    return safe if np.count_nonzero(safe > 0) >= 60 else bubble_mask.copy()
+
+
+def _polygon_from_mask(mask: np.ndarray, fallback_box: Box) -> list[list[int]]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        epsilon = max(1.5, cv2.arcLength(largest, True) * 0.006)
+        approx = cv2.approxPolyDP(largest, epsilon, True)
+        points = [point[0].astype(int).tolist() for point in approx]
+        if len(points) >= 3:
+            return points
+    return [
+        [fallback_box.x1, fallback_box.y1],
+        [fallback_box.x2, fallback_box.y1],
+        [fallback_box.x2, fallback_box.y2],
+        [fallback_box.x1, fallback_box.y2],
+    ]
+
+
+def _bubble_cluster_zones(cluster_boxes: list[Box], bubble_mask: np.ndarray) -> list[dict]:
+    safe_bubble = _safe_bubble_mask(bubble_mask)
+    h, w = safe_bubble.shape
+    zones: list[dict] = []
+    if not cluster_boxes:
+        return zones
+
+    if len(cluster_boxes) == 1:
+        territory_masks = [safe_bubble]
+    else:
+        dist_maps = []
+        for box in cluster_boxes:
+            seed = np.ones((h, w), dtype=np.uint8) * 255
+            cv2.rectangle(seed, (box.x1, box.y1), (box.x2, box.y2), 0, -1)
+            dist_maps.append(cv2.distanceTransform(seed, cv2.DIST_L2, 5))
+        assignments = np.argmin(np.stack(dist_maps), axis=0)
+        territory_masks = [
+            (((assignments == idx) & (safe_bubble > 0)).astype(np.uint8) * 255)
+            for idx in range(len(cluster_boxes))
+        ]
+
+    for box, territory in zip(cluster_boxes, territory_masks):
+        if np.count_nonzero(territory > 0) < 30:
+            territory = np.zeros_like(safe_bubble)
+            territory[box.y1:box.y2, box.x1:box.x2] = 255
+            territory = cv2.bitwise_and(territory, safe_bubble)
+        points = _polygon_from_mask(territory, box)
+        xs = [int(point[0]) for point in points]
+        ys = [int(point[1]) for point in points]
+        green_box = Box(max(0, min(xs)), max(0, min(ys)), min(w, max(xs) + 1), min(h, max(ys) + 1))
+        zones.append({"green_box": green_box, "green_polygon": points})
+    return zones
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -263,7 +331,17 @@ def load_semantic_model(model_path: str, allow_cpu: bool = False):
         
     model.load_state_dict(new_state_dict, strict=False)
     model.to('cuda:0')
-    print("  [Model A-S] Semantic detector (Magi): CUDA:0 LOCKED")
+    # AutoModel.from_config (unlike from_pretrained) does not call .eval() for you,
+    # and magi's own remote code never calls it either -- so without this the model
+    # stayed in training mode. The checkpoint's detection_model_config sets
+    # dropout=0.1, and ConditionalDETR gates every dropout call on self.training, so
+    # every inference was drawing fresh random dropout masks: the same image produced
+    # a different semantic-detection box (by ~1px) on every call, which was enough to
+    # flip downstream threshold checks (e.g. run_step6_layout.py's region_aspect<=2.2)
+    # and silently change classification verdicts between otherwise-identical requests.
+    model.eval()
+    mode = "eval" if not model.training else "TRAIN (BUG)"
+    print(f"  [Model A-S] Semantic detector (Magi): CUDA:0 LOCKED, mode={mode}")
     return model
 
 
@@ -491,9 +569,14 @@ class TextDetectionResult:
 
 @dataclass
 class SemanticModelHandle:
+    # `backend` predates the current magi/transformers loading path (load_semantic_model
+    # returns a bare torch.nn.Module, never wraps it in this dataclass) and documented a
+    # "yolo_pt"/"yolo_onnx" split that path never returns. Live, not dead: still
+    # type-annotated at run_semantic_test_all_samples and run_step2_routing_test below --
+    # the stale part was only this comment, not the dataclass itself.
     model: object
     device: str
-    backend: str  # "yolo_pt" or "yolo_onnx"
+    backend: str
     input_name: Optional[str] = None
     size_input_name: Optional[str] = None
     label_map: Dict[int, str] = field(default_factory=dict)
@@ -573,9 +656,28 @@ def detect_semantic_text_regions(
     import torch
     from PIL import Image
 
+    if semantic_model is None:
+        raise RuntimeError(
+            "detect_semantic_text_regions() called with semantic_model=None -- the Magi "
+            "handle was never loaded or was cleared (e.g. by a GPU release) before this "
+            "call. This is a caller bug, not a transient failure: fix the caller to load "
+            "or reload the handle rather than catching this."
+        )
+
     h, w = image.shape[:2]
     image_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    
+
+    # Seed immediately before the call, not once at import: magi's internal ViT-MAE
+    # crop-embedding step calls random_masking, which draws torch.rand() unconditionally
+    # (even at mask_ratio=0.0) and advances the GLOBAL CUDA RNG on every call. Without a
+    # per-call reset, request N+1's output silently depends on request N having run first
+    # -- "identical" cold requests to the same image were not actually identical in a
+    # long-lived server process. model.eval() above removes the dropout randomness; this
+    # removes the RNG-state coupling between requests, which is a separate source.
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
+
     with torch.no_grad():
         magi_res = semantic_model.predict_detections_and_associations([np.array(image_pil)])[0]
         
@@ -625,6 +727,13 @@ def load_bubble_model(model_path: str, allow_cpu: bool = False):
     model = YOLO(model_path)
     model.to('cuda:0')
     device = 'cuda:0'
+
+    # Ultralytics already constructs YOLO in eval mode (verified: model.model.training is
+    # False immediately after load, before .predict() is ever called) -- but Model A-S
+    # above was silently in training mode for the same reason ("the library surely
+    # handles this"), so assert it here explicitly rather than resting on that same
+    # assumption a second time. No-op today; a guarantee, not a guess.
+    model.model.eval()
 
     print(f"  [Model B] Bubble segmentor: CUDA LOCKED")
     return model, device

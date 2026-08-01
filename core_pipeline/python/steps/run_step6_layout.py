@@ -57,12 +57,21 @@ from api_manager import (
     ApiRateLimited,
 )
 from diagnostic_logger import write_diagnostic_event
-from ml_region_lib import SAMPLE_MAP, classify_text_by_content, classify_text_is_ambiguous
+from ml_region_lib import (
+    SAMPLE_MAP, classify_text_by_content, classify_text_is_ambiguous,
+    Box, _bubble_cluster_zones,
+)
 from pipeline_paths import DEFAULT_SAMPLES_ROOT, sample_root_from_env
 
 
 CREDIT_MARKERS = ("原作", "作画", "漫画", "監修", "キャラクターデザイン")
 DEVICE_LABEL_CHARS = set("0123456789０１２３４５６７８９一二三四五六七八九十零〇")
+
+
+def _debug_images_enabled() -> bool:
+    # Unset/falsy (the default) keeps today's behavior minus the debug writes -- this is a
+    # new env var, no prior convention existed for gating debug-only artifact writes.
+    return os.environ.get("MANGA_PIPELINE_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _coerce_box4(value) -> list[int] | None:
@@ -1403,6 +1412,14 @@ def _merge_adjacent_floating_line_fragments(
         merged_ids = [int(part.get("id", -1)) for _, part in ordered]
         merged["text"] = " ".join(str(part.get("text", "")).strip() for _, part in ordered if str(part.get("text", "")).strip())
         merged["line_fragment_ids"] = merged_ids
+        # Task #191: keep the absorbed items' own dicts (not just their ids) so that IF this
+        # merged primary is itself rejected later, _layout_rejection_with_absorbed can still
+        # build a real rejected_layout_items.json record for each one. Before this, a merged
+        # primary that got rejected took every absorbed member down with it with zero trace in
+        # EITHER output file -- these ids were indistinguishable from a genuine silent drop.
+        # If the primary survives into layout_constraints.json, its own line_fragment_ids
+        # field already documents the absorption; no separate record is needed in that case.
+        merged["_absorbed_line_fragments"] = [part for part_index, part in ordered if part_index != primary_index]
         fallback_source = str(merged.get("fallback_source") or "")
         merged["fallback_source"] = f"{fallback_source}+line_fragment_merge" if fallback_source else "line_fragment_merge"
 
@@ -2052,6 +2069,22 @@ def _layout_rejection(item: dict, reason: str, semantic_role: str | None = None,
     }
 
 
+def _layout_rejection_with_absorbed(
+    item: dict, reason: str, semantic_role: str | None = None, classification: str | None = None
+) -> list[dict]:
+    """Task #191: same as _layout_rejection, but if `item` is a line-fragment-merge primary
+    (carries _absorbed_line_fragments -- set by _merge_adjacent_floating_line_fragments) that
+    is itself being rejected, ALSO emit a rejection record for every id it had absorbed. Before
+    this, a merged primary that got rejected took its absorbed members down with it with zero
+    trace in either layout_constraints.json or rejected_layout_items.json -- those ids were
+    indistinguishable from a genuine silent drop (task #191's confirmed root cause). The reason
+    string names the owner so a reader never mistakes "absorbed" for "lost"."""
+    records = [_layout_rejection(item, reason, semantic_role, classification)]
+    for member in item.get("_absorbed_line_fragments") or []:
+        records.append(_layout_rejection(member, f"merged_into_line_fragment:{item.get('id')}"))
+    return records
+
+
 def _needs_inferred_bubble_cleanup(
     item: dict,
     image_shape,
@@ -2159,6 +2192,7 @@ def _refine_constraint_geometry(
     text_mask: np.ndarray | None,
     image_shape: tuple,
     image: np.ndarray | None = None,
+    detect_dir: Path | None = None,
 ) -> None:
     """Final geometry polish, mutating the constraint in place:
 
@@ -2194,7 +2228,28 @@ def _refine_constraint_geometry(
     # (tight) red box; when a bounded container is found it becomes the blue
     # outline, the green inset, and Step 4's cleanup boundary.
     if constraint.get("bubble_idx", -1) >= 0 and image is not None:
-        refined = _container_flood_outline(image, constraint["red_box"])
+        bubble_hint_mask = None
+        if detect_dir is not None:
+            hint_path = detect_dir / f"bubble_{constraint['bubble_idx']}.png"
+            if hint_path.exists():
+                hint = cv2.imread(str(hint_path), cv2.IMREAD_GRAYSCALE)
+                if hint is not None:
+                    # cv2.IMREAD_GRAYSCALE is documented to always return 2D, but
+                    # through the real chained backend request path (step5->6->7->4->8
+                    # all in one long-lived server process) it can decode a mask PNG
+                    # with a spurious trailing (H, W, 1) channel -- the same quirk
+                    # run_step4_inpaint._imread_grayscale_2d already guards, with the
+                    # torch/cv2 native-DLL load-order explanation. Left unguarded here
+                    # it reached `hint_ys, hint_xs = np.where(...)` below, which then
+                    # unpacked a 3-tuple and raised "too many values to unpack
+                    # (expected 2)" -- crashing step 6 for EVERY image and returning
+                    # HTTP 500 from /translate, while every batch-driver run passed.
+                    if hint.ndim == 3:
+                        hint = hint[:, :, 0]
+                    bubble_hint_mask = hint
+        refined = _container_flood_outline(
+            image, constraint["red_box"], bubble_hint_mask=bubble_hint_mask
+        )
         if refined:
             constraint["refined_bubble_outline"] = refined
 
@@ -2226,6 +2281,63 @@ def _refine_constraint_geometry(
                 constraint["green_polygon"] = [
                     [int(point[0][0]), int(point[0][1])] for point in largest
                 ]
+
+
+def _split_shared_bubble_siblings(
+    constraints: list[dict],
+    detect_dir: Path,
+) -> None:
+    """P1-1: re-split green_box/green_polygon for constraints that share one bubble.
+
+    _refine_constraint_geometry (above) ends by tracing the WHOLE bubble outline and
+    overwriting green_box/green_polygon from it, unconditionally. When two kept
+    constraints share a bubble_idx, both calls flood to the same outline and both end
+    up with IDENTICAL green geometry -- so step 8's duplicate-overlap drop
+    (_drop_duplicate_overlapping_layouts, run_step8_typeset.py) scores them as the
+    same region (intersection-over-min-area == 1.0), trips its 0.70 threshold, and
+    silently drops the shorter translation (measured: original/sample3 id=11 "48か!!"
+    dropped in favor of kept id=8).
+
+    Must run AFTER every _refine_constraint_geometry call for this sample (so it sees
+    final geometry) and BEFORE the layout_constraints.json write. Do not call
+    _refine_constraint_geometry again afterwards -- it would re-trace the whole bubble
+    and undo this split.
+
+    Reuses the working per-cluster Voronoi partition from run_step5_ocr.py
+    (_bubble_cluster_zones, now shared via ml_region_lib.py) rather than reimplementing
+    region-splitting logic here.
+    """
+    by_bubble: dict[int, list[dict]] = {}
+    for c in constraints:
+        bidx = c.get("bubble_idx")
+        if isinstance(bidx, int) and bidx >= 0:
+            by_bubble.setdefault(bidx, []).append(c)
+
+    for bidx, group in by_bubble.items():
+        if len(group) < 2:
+            continue
+        hint_path = detect_dir / f"bubble_{bidx}.png"
+        if not hint_path.exists():
+            continue
+        bubble_mask = cv2.imread(str(hint_path), cv2.IMREAD_GRAYSCALE)
+        if bubble_mask is None:
+            continue
+        # Same spurious-3D-channel guard as _refine_constraint_geometry's hint load above
+        # (run_step4_inpaint._imread_grayscale_2d has the torch/cv2 load-order explanation).
+        if bubble_mask.ndim == 3:
+            bubble_mask = bubble_mask[:, :, 0]
+
+        try:
+            cluster_boxes = [Box(*[int(v) for v in c["red_box"]]) for c in group]
+        except (KeyError, TypeError, ValueError):
+            continue
+        zones = _bubble_cluster_zones(cluster_boxes, bubble_mask)
+        if len(zones) != len(group):
+            continue
+        for c, zone in zip(group, zones):
+            gb = zone["green_box"]
+            c["green_box"] = [gb.x1, gb.y1, gb.x2, gb.y2]
+            c["green_polygon"] = zone["green_polygon"]
 
 
 def _same_utterance_vertical_columns(
@@ -2337,6 +2449,7 @@ def _container_flood_outline(
     red_box: list[int],
     max_area_ratio: float = 9.0,
     dark_interior: bool = False,
+    bubble_hint_mask: np.ndarray | None = None,
 ) -> list[list[int]]:
     """Trace the CONTAINER that encloses a text region, not the text itself.
 
@@ -2351,7 +2464,22 @@ def _container_flood_outline(
     free-space polarity both flip so the flood travels through the dark fill
     the same way it travels through a light one (verified against
     new_sample_5's solid-black speech bubbles, which the default light-mode
-    barrier -- dark pixels -- cannot flood through at all)."""
+    barrier -- dark pixels -- cannot flood through at all).
+
+    `bubble_hint_mask` (optional, page-sized, from step 1's YOLO-seg detector)
+    clips the flood's free space to a dilated version of the detected bubble
+    -- without it, a text box much smaller than its bubble (vertical CJK
+    columns in a large round bubble) undersizes the search window, and even
+    when the window is widened the flood escapes through the wall's own thin
+    line-art or a genuine gap (verified on external_ja_1: the flood found an
+    area already 3x the true bubble size at the tightest window, and 13x at a
+    wide one -- growing the window alone just leaks further, eventually onto
+    the page background, which the border-leak check cannot catch because a
+    window edge that coincides with the page edge is deliberately exempted).
+    The hint is a coarse prior only (step 6's own docstring elsewhere notes it
+    "often hugs the whitened glyph areas instead of the bubble/box boundary"),
+    so it is dilated generously and the flood still does the real work of
+    finding the precise wall inside that bound."""
     if image is None or len(red_box) < 4:
         return []
     img_h, img_w = image.shape[:2]
@@ -2361,6 +2489,25 @@ def _container_flood_outline(
     width = x2 - x1
     height = y2 - y1
     flood_pad = max(60, min(220, int(max(width, height) * 0.9)))
+    # `ndim == 2` is load-bearing, not redundant with the shape check: shape[:2]
+    # matches for an (H, W, 1) array too, so a spurious-channel mask passed this
+    # gate and then blew up the 2-value unpack below (see the caller's own
+    # normalization comment).
+    if (
+        bubble_hint_mask is not None
+        and bubble_hint_mask.ndim == 2
+        and bubble_hint_mask.shape[:2] == (img_h, img_w)
+    ):
+        # With a real bound available, widen the window to comfortably contain the
+        # hint's own extent -- otherwise the hint mask itself gets clipped by a too-
+        # small window and reintroduces the same leak this parameter exists to fix.
+        hint_ys, hint_xs = np.where(bubble_hint_mask > 127)
+        if hint_xs.size > 0:
+            hint_pad = int(max(
+                x1 - hint_xs.min(), hint_xs.max() - x2,
+                y1 - hint_ys.min(), hint_ys.max() - y2,
+            )) + 20
+            flood_pad = max(flood_pad, min(300, hint_pad))
     fx1 = max(0, x1 - flood_pad)
     fy1 = max(0, y1 - flood_pad)
     fx2 = min(img_w, x2 + flood_pad)
@@ -2378,6 +2525,17 @@ def _container_flood_outline(
             (flood_gray < 100).astype(np.uint8),
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
         )
+    if (
+        bubble_hint_mask is not None
+        and bubble_hint_mask.ndim == 2
+        and bubble_hint_mask.shape[:2] == (img_h, img_w)
+    ):
+        hint_crop = bubble_hint_mask[fy1:fy2, fx1:fx2]
+        hint_dilated = cv2.dilate(
+            (hint_crop > 127).astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+        )
+        barrier = np.maximum(barrier, (hint_dilated == 0).astype(np.uint8))
     free = (barrier == 0).astype(np.uint8)
     _, flood_labels = cv2.connectedComponents(free, connectivity=4)
     sx1 = max(0, x1 - fx1 + max(2, int(width * 0.05)))
@@ -2715,12 +2873,70 @@ def _load_semantic_dialogue_regions(detect_dir: Path) -> list[tuple[int, int, in
     return boxes
 
 
+def _small_floating_semantic_clip(
+    item: dict,
+    semantic_dialogue_boxes: list[tuple[int, int, int, int]],
+    image_shape,
+) -> list[int] | None:
+    """Clip bound for a small, bubble-less dialogue item the semantic detector vouches for.
+
+    Deliberately keyed on the item's own measured geometry rather than on which
+    classification branch produced its role. The floating_too_small rescue below is
+    one way such an item gets kept, but NOT the only one: step 6's verdict for the
+    same on-disk input is not stable between a fresh single-stage process and the
+    long-lived backend process that runs step 5->6 back to back (documented drift;
+    the backend reaches "dialogue" for external_ja_2 ids 1/3 directly, without
+    passing through the rescue at all). Keying the bound on the branch meant the
+    clip attached in batch runs and silently did not attach in the real extension
+    path -- exactly where the bubble damage was reported.
+
+    Conditions mirror the floating_too_small gate's own size signature, so this
+    covers that gate's population without depending on it having fired.
+
+    NOTE for anyone widening that size signature: because this no longer keys off the
+    gate, the population is every kept `bubble_idx == -1` dialogue item matching the
+    signature -- not only the ones the gate rejected. Measured at exactly 2 items
+    across all 34 samples today. `_semantic_dialogue_rescue` below records four
+    confirmed false positives from a past attempt to use it on a broad population, so
+    re-measure the blast radius rather than assuming it stays at 2.
+    """
+    if image_shape is None:
+        return None
+    box = item.get("box", {})
+    if not all(k in box for k in ("x1", "y1", "x2", "y2")):
+        return None
+    if int(item.get("bubble_idx", -1)) != -1:
+        return None
+    img_h, img_w = int(image_shape[0]), int(image_shape[1])
+    if not (img_h and img_w):
+        return None
+    x1, y1, x2, y2 = int(box["x1"]), int(box["y1"]), int(box["x2"]), int(box["y2"])
+    width, height = max(1, x2 - x1), max(1, y2 - y1)
+    compact_text_len = len("".join(c for c in str(item.get("text", "")) if c.isalnum()))
+    if not (
+        width < max(28, int(img_w * 0.025))
+        and height < max(72, int(img_h * 0.070))
+        and 2 <= compact_text_len <= 5
+    ):
+        return None
+    region = _semantic_dialogue_rescue(item, semantic_dialogue_boxes, img_w)
+    if region is None:
+        return None
+    return [int(v) for v in region]
+
+
 def _semantic_dialogue_rescue(
     item: dict, semantic_dialogue_boxes: list[tuple[int, int, int, int]], img_w: int
-) -> bool:
-    # Only consumed for a "title_logo" verdict (see the one call site in the
-    # main layout loop) -- NOT wired into the general content-classification
-    # rejection gate. An earlier version of this rescue was tried there too
+) -> tuple[int, int, int, int] | None:
+    # Returns the matched detector region (truthy) rather than True, so a caller
+    # that needs the geometry can have it -- the floating_too_small caller uses it
+    # as a hard bound on Step 4's cleanup mask. Callers that only need a yes/no
+    # (the title_logo one below) are unaffected: a 4-tuple is always truthy and
+    # None is falsy, so `if _semantic_dialogue_rescue(...)` reads identically.
+    # Consumed for the "title_logo" and "floating_too_small" verdicts only (see
+    # the two call sites in the main layout loop) -- NOT wired into the general
+    # content-classification rejection gate. An earlier version of this rescue
+    # was tried there too
     # (to catch bubbles the flood-fill container tracer also fails to
     # enclose) and was reverted: full 33-sample verification found it
     # produced FOUR confirmed false positives (SFX/decorative lettering
@@ -2736,16 +2952,16 @@ def _semantic_dialogue_rescue(
     # sprawl wide; a reaction bubble stays narrow) AND the matched detector
     # region itself is plausibly bubble-shaped, not an elongated strip.
     if not semantic_dialogue_boxes or not img_w:
-        return False
+        return None
     box = item.get("box", {})
     if not all(k in box for k in ("x1", "y1", "x2", "y2")):
-        return False
+        return None
     x1, y1, x2, y2 = int(box["x1"]), int(box["y1"]), int(box["x2"]), int(box["y2"])
     width = max(1, x2 - x1)
     if width / img_w >= 0.15:
-        return False
+        return None
     if not _has_usable_translation(item.get("text", "")):
-        return False
+        return None
     area_a = max(1, (x2 - x1) * (y2 - y1))
     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
     for sx1, sy1, sx2, sy2 in semantic_dialogue_boxes:
@@ -2761,8 +2977,8 @@ def _semantic_dialogue_rescue(
             rh = max(1, sy2 - sy1)
             region_aspect = max(rw, rh) / min(rw, rh)
             if region_aspect <= 2.2:
-                return True
-    return False
+                return (int(sx1), int(sy1), int(sx2), int(sy2))
+    return None
 
 
 def _semantic_role_for_item(item: dict, image_shape, sample_name: str = "", image: np.ndarray | None = None) -> str:
@@ -3072,11 +3288,44 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
                     for g in group:
                         sfx_artwork_group_ids.add(line_items[g].get("id"))
         for item in ocr_data:
+            # Reset per item -- this is read much further down when the constraint
+            # dict is built, so a leftover value from a previous iteration would
+            # attach a bound to an unrelated constraint and silently widen the
+            # blast radius past the two items this rescue is meant to cover.
+            semantic_rescue_region = None
             semantic_role = _semantic_role_for_item(item, image_shape, sample_name, image)
             if semantic_role == "title_logo" and _semantic_dialogue_rescue(
                 item, semantic_dialogue_boxes, image_shape[1] if image_shape is not None else 0
             ):
                 semantic_role = "dialogue"
+            # floating_too_small has no rescue at all (unlike title_logo above), so a
+            # genuine short vertical exclamation (2-char CJK boxes are inherently
+            # ~17-19px wide, tripping the gate's width floor) is dropped with zero
+            # debug trace. Measured against the full 37-item population that trips
+            # this gate suite-wide: _semantic_dialogue_rescue + compact_text_len>=2
+            # gives 2/2 precision and 2/2 recall (the only 2 genuine hits, e.g.
+            # external_ja_2's "あれ？"/"えっ！？"; the other 35 -- single glyphs,
+            # ellipses, stray kana -- correctly stay rejected). The >=2 floor exists
+            # because compact_text_len<=1 items (e.g. a lone "こ") also match the
+            # semantic detector but are noise, not dialogue.
+            elif semantic_role == "floating_too_small":
+                compact_text_len = len("".join(c for c in item.get("text", "") if c.isalnum()))
+                if compact_text_len >= 2:
+                    rescue_region = _semantic_dialogue_rescue(
+                        item, semantic_dialogue_boxes, image_shape[1] if image_shape is not None else 0
+                    )
+                    if rescue_region is not None:
+                        semantic_role = "dialogue"
+            # Capture the clip bound AFTER the role is final, keyed on the item's own
+            # geometry rather than on which branch produced the role -- step 6's
+            # verdict is not stable between a fresh process and the backend's
+            # step5->6 process, so a branch-keyed bound attached in batch runs and
+            # silently did not attach in the real extension path. See
+            # _small_floating_semantic_clip.
+            if semantic_role == "dialogue":
+                semantic_rescue_region = _small_floating_semantic_clip(
+                    item, semantic_dialogue_boxes, image_shape
+                )
             if semantic_role in {
                 "credit",
                 "title_logo",
@@ -3087,7 +3336,7 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
                 "ocr_language_mismatch",
                 "ocr_low_confidence",
             }:
-                rejected.append(_layout_rejection(item, semantic_role, semantic_role=semantic_role))
+                rejected.extend(_layout_rejection_with_absorbed(item, semantic_role, semantic_role=semantic_role))
                 continue
 
             cls = classify_text_by_content(item.get("text", ""))
@@ -3112,7 +3361,7 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
                 # Brush/hollow display lettering is the artist's drawing, not
                 # text: no boxes, no erase, no typeset. Registered so Step 4
                 # shields the region from sweeps and neighboring cleanups.
-                rejected.append(_layout_rejection(item, "sfx_artwork", semantic_role="sfx", classification=cls))
+                rejected.extend(_layout_rejection_with_absorbed(item, "sfx_artwork", semantic_role="sfx", classification=cls))
                 rej_box = item.get("box") or {}
                 if all(k in rej_box for k in ("x1", "y1", "x2", "y2")):
                     sfx_artwork_regions.append(
@@ -3124,7 +3373,7 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
                 and _floating_roi_has_dominant_sfx_art(item, image)
                 and not keep_vision_rescue
             ):
-                rejected.append(_layout_rejection(item, "floating_sfx_art", semantic_role="sfx", classification=cls))
+                rejected.extend(_layout_rejection_with_absorbed(item, "floating_sfx_art", semantic_role="sfx", classification=cls))
                 rej_box = item.get("box") or {}
                 if all(k in rej_box for k in ("x1", "y1", "x2", "y2")):
                     sfx_artwork_regions.append(
@@ -3170,10 +3419,10 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
                 and not enclosed_dialogue_rescue
                 and not keep_vision_rescue
             ):
-                rejected.append(_layout_rejection(item, f"classification_{cls}", semantic_role=semantic_role, classification=cls))
+                rejected.extend(_layout_rejection_with_absorbed(item, f"classification_{cls}", semantic_role=semantic_role, classification=cls))
                 continue
             if cls == "dialogue" and not _has_usable_translation(item.get("text", "")):
-                rejected.append(_layout_rejection(item, "no_usable_translation", semantic_role=semantic_role, classification=cls))
+                rejected.extend(_layout_rejection_with_absorbed(item, "no_usable_translation", semantic_role=semantic_role, classification=cls))
                 continue
 
             rb = item["box"]
@@ -3227,6 +3476,36 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
             if inferred_bubble_outline:
                 constraint["inferred_bubble_outline"] = inferred_bubble_outline
                 constraint["inferred_bubble_source"] = "outline_contour"
+            if semantic_rescue_region:
+                # A hard bound for Step 4's floating cleanup, set ONLY for items kept
+                # by the floating_too_small semantic rescue above.
+                #
+                # Those items sit inside burst/spiky bubbles that step 1's segmentor
+                # misses, so they carry bubble_idx == -1 and no traced outline and
+                # therefore contribute nothing to Step 4's page-level container_mask.
+                # Nothing then bounds Step 4's floating cleanup: its bright-halo mask
+                # crawl treats the bubble's white interior as more background to
+                # swallow, and AnimeLaMa fills the resulting oversized hole from a
+                # +-256..512px context window -- measured on external_ja_2, that
+                # painted background speed-lines and character hair straight through
+                # both bubbles and broke their outlines (~half of ~2000 changed px per
+                # bubble landed outside the text area entirely).
+                #
+                # Measured against the real input, this region contains 100% of the
+                # glyph ink for both ids (300/300 and 253/253, zero outside) while
+                # cutting the exposed non-glyph wall/art ink from 216->27 px and
+                # 85->0 px. So it is safe to clip to WITHOUT leaving residue -- which
+                # is why no padding is applied: any pad buys zero extra glyph coverage
+                # and only drags more bubble wall inside the bound.
+                #
+                # Deliberately NOT stored as inferred_bubble_outline: that key joins
+                # Step 4's page-level container_mask union, which would start clipping
+                # every OTHER floating constraint whose ROI happens to overlap this
+                # rect. It would also mislabel a text-tight detector box as a bubble
+                # wall. The name must also avoid the substrings "missed_bubble" /
+                # "unsegmented_bubble", which Step 4 matches to flip
+                # allow_inferred_bubble_cleanup and change routing.
+                constraint["semantic_rescue_region"] = semantic_rescue_region
             if item.get("line_fragment_ids"):
                 constraint["line_fragment_ids"] = item.get("line_fragment_ids")
             if item.get("force_full_line_cleanup"):
@@ -3383,7 +3662,7 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
             _load_step1_text_mask(detect_dir, image.shape) if image is not None else None
         )
         for constraint in constraints:
-            _refine_constraint_geometry(constraint, refine_text_mask, image_shape, image)
+            _refine_constraint_geometry(constraint, refine_text_mask, image_shape, image, detect_dir=detect_dir)
 
         # ── Multi-column same-container consolidation ────────────────────
         # Vertical CJK dialogue is often split into several side-by-side
@@ -3439,9 +3718,19 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
             primary["red_box"] = [min(rxs), min(rys), max(rxs), max(rys)]
             primary["line_fragment_ids"] = [int(g.get("id", -1)) for g in ordered]
             primary["consolidated_container"] = True
+            # Task #191: unlike the line-fragment merge above, `primary` here is already a
+            # KEPT constraint that survives (it stays in `constraints`), and `ordered[1:]` are
+            # ALSO already-kept constraints about to be silently removed from `constraints`
+            # below with only primary["line_fragment_ids"] as any record. Since the primary
+            # isn't rejected, there's no later rejection event to hang a record on the way
+            # the merge-site fix does -- so record these unconditionally, right now.
+            rejected.extend(
+                _layout_rejection(g, f"consolidated_into_container:{primary.get('id')}")
+                for g in ordered[1:]
+            )
             for g in ordered[1:]:
                 consolidated_ids.add(id(g))
-            _refine_constraint_geometry(primary, refine_text_mask, image_shape, image)
+            _refine_constraint_geometry(primary, refine_text_mask, image_shape, image, detect_dir=detect_dir)
         if consolidated_ids:
             constraints[:] = [c for c in constraints if id(c) not in consolidated_ids]
 
@@ -3762,7 +4051,7 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
                     c.pop("red_polygon", None)
                     c.pop("green_polygons", None)
                     c.pop("touching_container_siblings", None)
-                    _refine_constraint_geometry(c, refine_text_mask, image_shape, image)
+                    _refine_constraint_geometry(c, refine_text_mask, image_shape, image, detect_dir=detect_dir)
                     continue
 
                 if sibling_boxes:
@@ -3823,13 +4112,27 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
                 c.pop("green_polygons", None)
                 # Re-derive the tight red box and the green inset from the
                 # container outline now that the geometry is consolidated.
-                _refine_constraint_geometry(c, refine_text_mask, image_shape, image)
+                _refine_constraint_geometry(c, refine_text_mask, image_shape, image, detect_dir=detect_dir)
             if enclosed_absorbed:
                 constraints[:] = [
                     k for k in constraints if id(k) not in enclosed_absorbed
                 ]
 
+        # P1-1: re-split shared-bubble siblings AFTER every _refine_constraint_geometry
+        # call for this sample and BEFORE the write below -- see docstring on
+        # _split_shared_bubble_siblings for why order matters here.
+        _split_shared_bubble_siblings(constraints, detect_dir)
+
         # ── Save layout constraints JSON ────────────────────────────────
+        # Task #191: a kept merged-line-fragment primary carries a scratch field
+        # (_absorbed_line_fragments, full item dicts) so a LATER rejection of that same
+        # primary can still emit a real rejected_layout_items.json record for each absorbed
+        # member -- see _merge_adjacent_floating_line_fragments and
+        # _layout_rejection_with_absorbed. A primary that's KEPT doesn't need it: its own
+        # line_fragment_ids field already documents the absorption, and leaving the scratch
+        # field in would dump nested raw OCR-item dicts into the public artifact.
+        for c in constraints:
+            c.pop("_absorbed_line_fragments", None)
         out_dir = sample_path / "step_6_layout"
         out_dir.mkdir(parents=True, exist_ok=True)
         with open(out_dir / "layout_constraints.json", "w", encoding="utf-8") as f:
@@ -3882,8 +4185,9 @@ def run_step6_layout(sample_map: dict[str, str] | None = None, samples_dir: Path
                 level="info",
             )
 
-        # ── Build debug image ────────────────────────────────────────────
-        if image is None:
+        # ── Build debug image (diagnostic only -- real outputs were already written
+        # above: layout_constraints.json / rejected_layout_items.json / sfx_artwork_regions.json)
+        if image is None or not _debug_images_enabled():
             continue
 
         debug_text_mask = _load_step1_text_mask(detect_dir, image.shape)

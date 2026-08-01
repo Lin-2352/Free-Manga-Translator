@@ -68,8 +68,42 @@ _LOCAL_TRANSLATOR_LOAD_LOCK = threading.Lock()
 ENV_FILE = PROJECT_ROOT / ".env"
 API_PROVIDER_FAILURES: list[dict[str, object]] = []
 API_PROVIDER_USES: list[dict[str, object]] = []
-API_PROVIDER_DISABLED: dict[str, str] = {}
+API_PROVIDER_DISABLED: dict[str, tuple[str, float]] = {}
 API_PROVIDER_KEY_DISABLED: dict[str, dict[int, str]] = {}
+
+# How long a provider stays marked disabled before it is eligible to be tried
+# again. step7 runs inside the long-lived backend server process, so a plain
+# boolean/permanent flag here meant one transient failure (e.g. a rate limit
+# that self-clears after ~60s on the provider's side) disabled that provider
+# for the rest of the process lifetime. TTLs below are deliberately short for
+# genuinely transient statuses and longer for statuses that usually mean a
+# real, longer-lived problem (bad key, exhausted daily quota).
+_PROVIDER_DISABLE_TTL_SECONDS = {
+    "rate_limited": 60,
+    "auth_locked": 900,
+    "quota_exhausted": 900,
+    "fail": 120,
+}
+_PROVIDER_DISABLE_DEFAULT_TTL_SECONDS = 120
+
+
+def _mark_provider_disabled(provider: str, reason: str, status: str) -> None:
+    ttl = _PROVIDER_DISABLE_TTL_SECONDS.get(status, _PROVIDER_DISABLE_DEFAULT_TTL_SECONDS)
+    API_PROVIDER_DISABLED[provider] = (reason, time.monotonic() + ttl)
+
+
+def _provider_disabled_reason(provider: str) -> str | None:
+    """Returns the disable reason if `provider` is still within its disable
+    window, otherwise clears the (now-stale) entry and returns None so the
+    provider gets tried again."""
+    entry = API_PROVIDER_DISABLED.get(provider)
+    if entry is None:
+        return None
+    reason, expires_at = entry
+    if time.monotonic() >= expires_at:
+        API_PROVIDER_DISABLED.pop(provider, None)
+        return None
+    return reason
 
 
 def _load_env_file(path: Path = ENV_FILE) -> None:
@@ -135,42 +169,30 @@ def _provider_keys(*names: str) -> list[str]:
     return keys
 
 
-SECRET_ENV_NAMES = {
-    "GEMINI_API_KEYS",
-    "GITHUB_API_KEYS",
-    "GITHUB_API_KEY",
-    "GROQ_API_KEYS",
-    "GROQ_API_KEY",
-    "MISTRAL_API_KEYS",
-    "MISTRAL_API_KEY",
-    "OPENROUTER_API_KEYS",
-    "OPENROUTER_API_KEY",
-    "CEREBRAS_API_KEYS",
-    "CEREBRAS_API_KEY",
-    "CEREBERAS_API_KEYS",
-    "CEREBERAS_API_KEY",
-    "NVIDIA_API_KEYS",
-    "NVIDIA_API_KEY",
-    "NVIDIA_NIM_API_KEYS",
-    "NVIDIA_NIM_API_KEY",
-    "FIREWORKS_API_KEYS",
-    "FIREWORKS_API_KEY",
-    "CLOUDFLARE_WORKERS_API_KEYS",
-    "CLOUDFLARE_WORKERS_API_KEY",
-    "CLOUDFLARE_API_KEYS",
-    "CLOUDFLARE_API_KEY",
-}
-SECRETS_TO_SCRUB: list[str] = []
-for secret_name in SECRET_ENV_NAMES:
-    raw_secret = os.environ.get(secret_name, "")
-    if _configured(raw_secret):
-        SECRETS_TO_SCRUB.append(raw_secret)
-        SECRETS_TO_SCRUB.extend(part.strip() for part in raw_secret.split(",") if part.strip())
+def _current_secrets_to_scrub() -> list[str]:
+    """Derives the scrub list from API_MANAGER.providers[*].env_names (the same
+    source _provider_keys()/_csv_env() use for actual key lookup) instead of a
+    frozen-at-import set. This project's .env convention is numbered/rotated
+    keys (GEMINI_API_KEY_1, _2, _3, ...), which _csv_env already expands -- a
+    hardcoded name list here previously listed only the bare plural form
+    (GEMINI_API_KEYS) and missed the numbered variants entirely, and being
+    computed once at import time also meant a key rotated in mid-session was
+    never added to the scrub set. Rebuilt on every call so both gaps are
+    closed; the values themselves are already the real, current os.environ
+    contents via _csv_env, so a mid-session rotation is picked up immediately.
+    """
+    secrets: list[str] = []
+    for config in API_MANAGER.providers.values():
+        for env_name in config.env_names:
+            for value in _csv_env(env_name):
+                secrets.append(value)
+                secrets.extend(part.strip() for part in value.split(",") if part.strip())
+    return secrets
 
 
 def _scrub_secret(text: Any) -> str:
     rendered = str(text)
-    for secret in sorted(set(SECRETS_TO_SCRUB), key=len, reverse=True):
+    for secret in sorted(set(_current_secrets_to_scrub()), key=len, reverse=True):
         if secret:
             rendered = rendered.replace(secret, "[REDACTED]")
     rendered = re.sub(r"Bearer\s+[A-Za-z0-9_\.\-]+", "Bearer [REDACTED]", rendered)
@@ -562,6 +584,13 @@ def _clean_api_translation(text: object) -> str:
     cleaned = cleaned.strip("\"'` ")
     if cleaned.lower().startswith("translation:"):
         cleaned = cleaned.split(":", 1)[1].strip()
+    # Strip markdown emphasis the API sometimes wraps a phrase in ("WE *ARE* COWORKERS.")
+    # -- these were leaking through to the rendered page verbatim. Bold before italic so
+    # ** isn't left as two unmatched single markers; require a matched pair with
+    # non-space content so a lone/contraction-adjacent asterisk (e.g. "5 * 3") survives.
+    cleaned = re.sub(r"\*\*([^\s*][^*]*?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"\*([^\s*][^*]*?)\*", r"\1", cleaned)
+    cleaned = re.sub(r"_([^\s_][^_]*?)_", r"\1", cleaned)
     return cleaned[:360]
 
 
@@ -1212,15 +1241,43 @@ def _api_translate_items(
 
     prompt = _translation_prompt(translatable_items, sample_name, page_context)
 
+    # Wall-clock budget for the whole provider waterfall for this one page. Each
+    # provider already retries API_RETRIES_PER_PROVIDER times internally (bounded),
+    # but with several configured providers the worst case (every provider slow/
+    # retrying before failing over) can still add up to tens of minutes on a single
+    # page while holding a GPU pipeline slot open. API_TIMEOUT_SECONDS is the
+    # per-HTTP-call timeout; size the total waterfall budget off of that so it
+    # scales sensibly if an operator raises/lowers the per-call timeout.
+    _waterfall_deadline_seconds = max(
+        60,
+        int(os.environ.get("API_TRANSLATION_WATERFALL_DEADLINE_SECONDS", str(API_TIMEOUT_SECONDS * 2 + 30))),
+    )
+    _waterfall_deadline = time.monotonic() + _waterfall_deadline_seconds
+
     for provider in provider_order:
         if not pending_ids:
             break
-        if provider in API_PROVIDER_DISABLED:
+        if time.monotonic() >= _waterfall_deadline:
+            provider_attempts.append(
+                {
+                    "status": "waterfall_deadline_exceeded",
+                    "reason": f"provider waterfall exceeded {_waterfall_deadline_seconds}s wall-clock budget",
+                    "remaining": len(pending_ids),
+                }
+            )
+            print(
+                f"  [api-translate-warn] waterfall wall-clock budget ({_waterfall_deadline_seconds}s) "
+                "exceeded; giving up on remaining providers for this page",
+                file=sys.stderr,
+            )
+            break
+        _disabled_reason = _provider_disabled_reason(provider)
+        if _disabled_reason is not None:
             provider_attempts.append(
                 {
                     "provider": provider,
                     "status": "skipped_disabled",
-                    "reason": API_PROVIDER_DISABLED[provider],
+                    "reason": _disabled_reason,
                     "remaining": len(pending_ids),
                 }
             )
@@ -1266,7 +1323,7 @@ def _api_translate_items(
                 }
                 API_PROVIDER_FAILURES.append(failure)
                 provider_attempts.append(failure)
-                API_PROVIDER_DISABLED[provider] = _scrub_secret(error)
+                _mark_provider_disabled(provider, _scrub_secret(error), "auth_locked")
                 print(f"  [api-translate-access-blocked] {provider}: {_scrub_secret(error)}", file=sys.stderr)
                 break
             except ApiQuotaExhausted as error:
@@ -1280,7 +1337,7 @@ def _api_translate_items(
                 }
                 API_PROVIDER_FAILURES.append(failure)
                 provider_attempts.append(failure)
-                API_PROVIDER_DISABLED[provider] = _scrub_secret(error)
+                _mark_provider_disabled(provider, _scrub_secret(error), "quota_exhausted")
                 print(f"  [api-translate-critical] {provider}: {_scrub_secret(error)}", file=sys.stderr)
                 break
             except ApiRateLimited as error:
@@ -1294,7 +1351,7 @@ def _api_translate_items(
                 }
                 API_PROVIDER_FAILURES.append(failure)
                 provider_attempts.append(failure)
-                API_PROVIDER_DISABLED[provider] = _scrub_secret(error)
+                _mark_provider_disabled(provider, _scrub_secret(error), "rate_limited")
                 print(f"  [api-translate-rate-limit] {provider}: {_scrub_secret(error)}", file=sys.stderr)
                 break
             except Exception as error:
@@ -1308,12 +1365,12 @@ def _api_translate_items(
                 provider_attempts.append({**failure, "status": "fail"})
                 print(f"  [api-translate-warn] {provider} attempt {attempt}: {_scrub_secret(error)}", file=sys.stderr)
                 if "no active API keys" in str(error).lower() or "http 401" in str(error).lower() or "http 403" in str(error).lower():
-                    API_PROVIDER_DISABLED[provider] = _scrub_secret(error)
+                    _mark_provider_disabled(provider, _scrub_secret(error), "auth_locked")
                     break
                 if attempt < API_RETRIES_PER_PROVIDER:
                     time.sleep(min(4, attempt * 1.5))
                 else:
-                    API_PROVIDER_DISABLED[provider] = _scrub_secret(error)
+                    _mark_provider_disabled(provider, _scrub_secret(error), "fail")
     if pending_ids and API_MANAGER.all_configured_providers_exhausted(provider_order):
         if _local_fallback_enabled():
             provider_attempts.append({
@@ -1321,8 +1378,25 @@ def _api_translate_items(
                 "reason": DAILY_LIMIT_MESSAGE,
                 "remaining": len(pending_ids),
             })
-        else:
+        elif not translations:
+            # Nothing was accepted before hitting exhaustion -- nothing to
+            # lose by raising, and the caller's existing handling for a fully
+            # failed page still applies.
             raise ApiQuotaExhausted(DAILY_LIMIT_MESSAGE)
+        else:
+            # Some ids in this same page were already translated by earlier
+            # providers in the waterfall before the remaining providers were
+            # exhausted. Raising here would discard that already-paid-for
+            # work and force it to be re-translated (re-spending API budget)
+            # on the next retry. Return what was accepted instead; the still-
+            # pending ids fall through to the fallback dictionary translator
+            # downstream exactly like the "missing" case always has.
+            provider_attempts.append({
+                "status": "api_quota_exhausted_partial",
+                "reason": DAILY_LIMIT_MESSAGE,
+                "accepted_before_exhaustion": len(translations),
+                "remaining": len(pending_ids),
+            })
     return translations, {
         "enabled": True,
         "attempts": provider_attempts,

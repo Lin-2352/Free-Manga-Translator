@@ -43,6 +43,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const queuedJobsText = document.getElementById('queuedJobsText');
   const parallelJobsText = document.getElementById('parallelJobsText');
   const queueMeterFill = document.getElementById('queueMeterFill');
+  const queueMeter = document.getElementById('queueMeter');
   const clearQueueBtn = document.getElementById('clearQueueBtn');
   const engineStatusText = document.getElementById('engineStatusText');
   const hoverHelp = document.getElementById('hoverHelp');
@@ -180,6 +181,17 @@ document.addEventListener('DOMContentLoaded', () => {
   function runtimeMessage(message) {
     return new Promise((resolve) => {
       chrome.runtime.sendMessage(message, (response) => {
+        // A failed sendMessage (background script not ready yet, or the message port closed
+        // before a response arrived) previously resolved silently to {} here -- every caller's
+        // `response.success === false` check then saw a plain {} and fell through as if nothing
+        // had gone wrong, so e.g. Clear Cache could report "caches cleared" when the message
+        // never actually reached background.js. chrome.runtime.lastError is Chrome's real signal
+        // for that failure and must be surfaced as an explicit error, not swallowed into a
+        // false-successful-looking empty object.
+        if (chrome.runtime.lastError) {
+          resolve({ success: false, error: chrome.runtime.lastError.message || 'Extension message failed' });
+          return;
+        }
         resolve(response || {});
       });
     });
@@ -192,6 +204,11 @@ document.addEventListener('DOMContentLoaded', () => {
       tabId: tab.id,
       command,
     });
+  }
+
+  function setTextIfChanged(el, text) {
+    if (!el || el.textContent === text) return;
+    el.textContent = text;
   }
 
   function setBusy(button, busy) {
@@ -342,12 +359,29 @@ document.addEventListener('DOMContentLoaded', () => {
     return response;
   }
 
+  // The gallery previously refreshed on every single stats poll (every 2s) -- each poll fetching
+  // up to 40 cached thumbnails just to redraw a preview that essentially never changes between
+  // two 2-second ticks. Decoupled to its own, much slower cadence: refreshed on the very first
+  // poll (so the gallery isn't empty on open) and then only every GALLERY_REFRESH_EVERY_N_TICKS
+  // stats polls after that.
+  const GALLERY_REFRESH_EVERY_N_TICKS = 5; // ~10s at the 2s stats-poll cadence
+  let statsPollCount = 0;
+
   function refreshStats() {
-    refreshRecentTranslations();
     chrome.runtime.sendMessage({ kind: 'getTranslationStats' }, (response) => {
       if (!response) return;
       const cacheSize = response.cacheSize || 0;
       const cacheLimit = response.cacheLimit || 0;
+      statsPollCount += 1;
+      if (statsPollCount === 1 || statsPollCount % GALLERY_REFRESH_EVERY_N_TICKS === 0) {
+        // Show every cached entry, not a fixed slice -- the gallery previously always
+        // requested the 6 most-recently-used entries regardless of how many were actually
+        // cached, so translating e.g. 15 pages with a cache limit of 15+ only ever showed the
+        // last 6 visited, reordered by recency. cacheLimit here is background.js's real
+        // configured limit (chrome.storage-backed), not the possibly-unsaved DOM value in
+        // the settings input, so it stays correct even before the user clicks Save.
+        refreshRecentTranslations(cacheLimit > 0 ? cacheLimit : 6);
+      }
       const activeRequests = Number(response.activeRequests || 0);
       const queueLength = Number(response.queueLength || 0);
       const queueLimit = Number.isFinite(response.queueLimit) ? response.queueLimit : DEFAULT_QUEUE_LIMIT;
@@ -360,10 +394,16 @@ document.addEventListener('DOMContentLoaded', () => {
       cacheStatusText.textContent = cacheLimit > 0
         ? `${cacheSize}/${cacheLimit} entries cached`
         : 'Cache disabled';
-      if (activeJobsText) activeJobsText.textContent = String(activeRequests);
-      if (queuedJobsText) queuedJobsText.textContent = `${queueLength}/${queueLimit}`;
-      if (parallelJobsText) parallelJobsText.textContent = String(parallelLimit);
+      // .queue-status-card is an aria-live="polite" region -- writing to it every single 2s poll
+      // (even when nothing actually changed) fires a DOM mutation on every tick, and several
+      // screen readers announce on ANY live-region mutation regardless of whether the text
+      // content actually differs. Only touching textContent when the value genuinely changed
+      // keeps the announcements limited to real state changes instead of a 2s metronome.
+      setTextIfChanged(activeJobsText, String(activeRequests));
+      setTextIfChanged(queuedJobsText, `${queueLength}/${queueLimit}`);
+      setTextIfChanged(parallelJobsText, String(parallelLimit));
       if (queueMeterFill) queueMeterFill.style.width = `${pressurePercent}%`;
+      if (queueMeter?.setAttribute) queueMeter.setAttribute('aria-valuenow', String(pressurePercent));
 
       const restartLost = Number(response.restartLost || 0);
       const parts = [];
@@ -372,7 +412,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (parallelLimit > 1) parts.push(`parallel ${parallelLimit}`);
       if (queueLength > 0) parts.push(`${queueLength}/${queueLimit} queued`);
       if (restartLost > 0) parts.push(`${restartLost} lost in restart - re-run Translate Page`);
-      statsText.textContent = parts.length ? parts.join(' Â· ') : 'ready';
+      statsText.textContent = parts.length ? parts.join(' · ') : 'ready';
 
       renderQueueItems(Array.isArray(response.items) ? response.items : []);
 
@@ -436,9 +476,9 @@ document.addEventListener('DOMContentLoaded', () => {
     return `${hours}h ago`;
   }
 
-  function refreshRecentTranslations() {
+  function refreshRecentTranslations(limit = 6) {
     if (!recentTranslations) return;
-    chrome.runtime.sendMessage({ kind: 'getRecentTranslations', limit: 6 }, (response) => {
+    chrome.runtime.sendMessage({ kind: 'getRecentTranslations', limit }, (response) => {
       const entries = Array.isArray(response?.entries) ? response.entries : [];
       if (!entries.length) {
         recentTranslations.hidden = true;
@@ -448,9 +488,16 @@ document.addEventListener('DOMContentLoaded', () => {
       recentTranslations.hidden = false;
       recentTranslations.innerHTML = entries.map((entry) => {
         const title = `${entry.pageHost || 'unknown page'} - ${timeAgoLabel(entry.lastUsed)}`;
+        // entry.thumbnail is backend-controlled (round-tripped through translationCache from
+        // the pipeline server's response) and was the one interpolation in this file NOT run
+        // through escapeHtml -- a crafted value could break out of the src="" attribute into
+        // this privileged extension page's HTML. Every other field here is escaped; this one
+        // additionally must be a real data:image/ URL, since nothing else is a legitimate
+        // thumbnail source.
+        const thumbnailSrc = /^data:image\//i.test(entry.thumbnail || '') ? entry.thumbnail : '';
         return `
           <div class="recent-translation-thumb" title="${escapeHtml(title)}">
-            <img src="${entry.thumbnail}" alt="${escapeHtml(entry.pageHost || 'Recent translation')}" loading="lazy" />
+            <img src="${escapeHtml(thumbnailSrc)}" alt="${escapeHtml(entry.pageHost || 'Recent translation')}" loading="lazy" />
             <span class="recent-translation-time">${escapeHtml(timeAgoLabel(entry.lastUsed))}</span>
           </div>
         `;
@@ -598,7 +645,7 @@ document.addEventListener('DOMContentLoaded', () => {
           <div class="quota-meter" aria-label="GPU ${gpuIndex} VRAM usage">
             <span style="width:${percent}%"></span>
           </div>
-          <div class="quota-detail">${used}/${total} MiB used Â· ${free} MiB free Â· ${utilization}% GPU load</div>
+          <div class="quota-detail">${used}/${total} MiB used · ${free} MiB free · ${utilization}% GPU load</div>
         </div>
       `;
     }).join('');
@@ -799,6 +846,10 @@ document.addEventListener('DOMContentLoaded', () => {
       statusText.textContent = response.backendCleared === false
         ? 'Browser cache cleared; backend cache unavailable'
         : 'Browser and backend runtime caches cleared';
+      // An explicit Clear Cache is exactly the kind of real change the decoupled gallery
+      // cadence must not delay -- force it to redraw (empty) right away instead of waiting for
+      // the next scheduled tick.
+      statsPollCount = 0;
       refreshStats();
     } catch (error) {
       reportPopupError(error);

@@ -15,8 +15,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .pipeline_bridge import PipelineRunError, run_pipeline_payload
-from .gpu_scheduler import PIPELINE_SCHEDULER
+from .gpu_scheduler import PIPELINE_SCHEDULER, SchedulerBusyError
 from .schemas import (
+    BATCH_MAX_IMAGES,
     BatchRequest,
     BatchResponse,
     HealthResponse,
@@ -30,6 +31,31 @@ import run_extension_pipeline_server as legacy_bridge
 
 
 API_VERSION = "0.1.4-local-8stage"
+
+
+def _resolve_running_commit() -> str | None:
+    # Resolved once at import time, not per-request: it answers "what code is this
+    # PROCESS actually running", which by definition can't change without a restart.
+    # This exists specifically so a stale-backend session (edited source on disk,
+    # server never restarted) is visible in /v1/health instead of silently inferred --
+    # see the "restart before trusting a result" note in LOCAL_USER_MANUAL.md.
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            commit = result.stdout.strip()
+            return commit or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+RUNNING_COMMIT = _resolve_running_commit()
 
 app = FastAPI(
     title="Free Manga Translator Local Pipeline API",
@@ -77,6 +103,14 @@ def _require_extension_client(
 
 _GATED = [Depends(_require_extension_client)]
 
+# Shared, bounded, module-level executor for /v1/batch dispatch (see translate_batch below).
+# A fresh ThreadPoolExecutor per request had no natural bound beyond BATCH_MAX_IMAGES (itself
+# only just added), and re-created worker threads on every request; sizing this once at import
+# time keeps the actual pipeline concurrency cap where it belongs -- PIPELINE_SCHEDULER -- while
+# still avoiding an unbounded number of live thread pools if a server sees a burst of concurrent
+# batch requests.
+_BATCH_EXECUTOR = ThreadPoolExecutor(max_workers=BATCH_MAX_IMAGES, thread_name_prefix="fmt-batch")
+
 JOBS: dict[str, dict[str, Any]] = {}
 _JOBS_GUARD = threading.Lock()
 _JOBS_MAX_ENTRIES = 200
@@ -90,17 +124,35 @@ def _record_job(job_id: str, record: dict[str, Any]) -> None:
                 JOBS.pop(stale_id, None)
 
 
+_DIAGNOSTIC_REDACT_KEYS = {"imagedata", "base64data", "translatedimagedataurl", "imagedataurl"}
+_DIAGNOSTIC_MAX_DEPTH = 20
+
+
+def _diagnostic_safe_value(value: Any, depth: int) -> Any:
+    # Depth cap protects against pathological deeply-nested input causing runaway
+    # recursion (e.g. a crafted or buggy payload nesting thousands of levels deep).
+    if depth > _DIAGNOSTIC_MAX_DEPTH:
+        return "<max-depth>"
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            if str(key).lower() in _DIAGNOSTIC_REDACT_KEYS:
+                safe[key] = "<redacted>"
+            else:
+                safe[key] = _diagnostic_safe_value(item, depth + 1)
+        return safe
+    if isinstance(value, list):
+        # Previously only dict values recursed, so a redact-worthy key nested inside a
+        # list of dicts (e.g. {"frames": [{"imageData": "..."}]}) passed through
+        # unredacted -- lists must recurse the same way dicts do.
+        return [_diagnostic_safe_value(item, depth + 1) for item in value]
+    if isinstance(value, str) and len(value) > 260:
+        return value[:260] + "..."
+    return value
+
+
 def _diagnostic_json(payload: dict[str, Any]) -> str:
-    safe: dict[str, Any] = {}
-    for key, value in payload.items():
-        if key.lower() in {"imagedata", "base64data", "translatedimagedataurl", "imagedataurl"}:
-            safe[key] = "<redacted>"
-        elif isinstance(value, str) and len(value) > 260:
-            safe[key] = value[:260] + "..."
-        elif isinstance(value, dict):
-            safe[key] = json.loads(_diagnostic_json(value))
-        else:
-            safe[key] = value
+    safe = _diagnostic_safe_value(payload, 0)
     return json.dumps(safe, ensure_ascii=False, sort_keys=True)
 
 
@@ -155,6 +207,61 @@ def _request_trace_id(request: TranslateRequest, fallback: str) -> str:
     )
 
 
+def _load_translations(artifacts: dict[str, Any]) -> list[dict[str, Any]]:
+    # translations was hardcoded to [] here while the extension's own JS branches on
+    # response.translations.length > 0 to decide whether to draw the overlay -- real data
+    # has been sitting on disk this whole time, but at the WRONG artifact for what the
+    # consumers need. A first attempt at this fix (2026-07-30) read step7_translate and
+    # returned {box:{x1,y1,...}, en_text, jp_text, ...} -- zero field overlap with what
+    # content.js's overlayTranslations and translationPanel.js's showTranslationPanel
+    # actually read (t.minX/minY/maxX/maxY, t.translatedText; verified by grepping the
+    # extension source, not guessing from field names). Both compute their own text
+    # layout (fitText/fitTextStrict), so font_size/lines/lineHeight are NOT part of the
+    # required shape despite superficially resembling it.
+    #
+    # step8_report (typeset_report.json) is the right artifact: only items step 8 actually
+    # rendered appear (so a G2-style merged/absorbed id is handled automatically, not by
+    # duplicating that logic here), and `position` is already the final on-page box. It's
+    # in OUTPUT (rendered, possibly upscaled) space though -- render_scale is present on
+    # every item and verified across the full 34-sample baseline to take values 1, 2 AND 3
+    # (never assume 2), with output_size == native_size * render_scale holding universally.
+    # Dividing by render_scale lands in native (posted-image) space, which is the
+    # coordinate system both consumers already treat imageData as being in.
+    path = artifacts.get("step8_report") if isinstance(artifacts, dict) else None
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+
+    result: list[dict[str, Any]] = []
+    for item in data:
+        position = item.get("position")
+        text = item.get("text")
+        if not (isinstance(position, list) and len(position) == 4 and text):
+            # Non-rendered entries (e.g. status="skipped_unsafe_floating_cleanup") carry
+            # no position at all -- nothing to overlay for them, not an error.
+            continue
+        scale = item.get("render_scale") or 1
+        try:
+            left, top, right, bottom = (float(v) / scale for v in position)
+        except (TypeError, ZeroDivisionError):
+            continue
+        result.append({
+            "id": item.get("id"),
+            "minX": left,
+            "minY": top,
+            "maxX": right,
+            "maxY": bottom,
+            "translatedText": text,
+        })
+    return result
+
+
 def _execute_translate(request: TranslateRequest) -> TranslateResponse:
     job_id = str(uuid4())
     started_at = datetime.now(timezone.utc).isoformat()
@@ -187,7 +294,7 @@ def _execute_translate(request: TranslateRequest) -> TranslateResponse:
             status="pass",
             translatedImageDataUrl=result["translatedImageDataUrl"],
             imageDataUrl=result["translatedImageDataUrl"],
-            translations=[],
+            translations=_load_translations(result.get("artifacts") or {}),
             report=result["report"],
             artifacts=result["artifacts"],
         )
@@ -240,6 +347,51 @@ def _execute_translate(request: TranslateRequest) -> TranslateResponse:
             level="error",
         )
         raise HTTPException(status_code=429, detail={"code": "DAILY_LIMIT_REACHED", "message": DAILY_LIMIT_MESSAGE}) from error
+    except SchedulerBusyError as error:
+        # A bounded acquire() wait elapsed -- surface this distinctly as 503 (server busy,
+        # try again) rather than folding it into the generic 500 pipeline-error path below.
+        _record_job(job_id, {
+            "jobId": job_id,
+            "status": "fail",
+            "report": JOBS.get(job_id, {}).get("report", {}),
+            "artifacts": JOBS.get(job_id, {}).get("artifacts", {}),
+            "error": "Server busy: no pipeline slot became available in time.",
+        })
+        write_diagnostic_event(
+            "pipeline.request.scheduler_busy",
+            {"jobId": job_id, "error": str(error)},
+            trace_id=trace_id,
+            source="backend",
+            level="error",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "SCHEDULER_BUSY", "message": "Server busy: no pipeline slot became available in time.", "traceId": trace_id},
+        ) from error
+    except ValueError as error:
+        # _decode_image_data raises ValueError (or its binascii.Error subclass) for
+        # malformed/empty imageData -- a caller mistake, not a pipeline failure. This must
+        # be checked before the broad (PipelineRunError, Exception) branch below, which
+        # would otherwise catch it too and report a misleading 500.
+        safe_message = "Invalid request: malformed or missing imageData."
+        _record_job(job_id, {
+            "jobId": job_id,
+            "status": "fail",
+            "report": JOBS.get(job_id, {}).get("report", {}),
+            "artifacts": JOBS.get(job_id, {}).get("artifacts", {}),
+            "error": safe_message,
+        })
+        write_diagnostic_event(
+            "pipeline.request.bad_request",
+            {"jobId": job_id, "error": str(error)},
+            trace_id=trace_id,
+            source="backend",
+            level="warning",
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_IMAGE_DATA", "message": safe_message, "traceId": trace_id},
+        ) from error
     except (PipelineRunError, Exception) as error:
         # Diagnostics get the full exception text (including local paths); the HTTP response
         # only ever gets an opaque code + traceId so callers on the local API surface can't use
@@ -273,6 +425,7 @@ def health() -> HealthResponse:
         service="free-manga-translator-local-pipeline-api",
         mode="local-only-strict",
         version=API_VERSION,
+        commit=RUNNING_COMMIT,
         warmup=legacy_bridge.get_warmup_state(),
         scheduler=PIPELINE_SCHEDULER.status(),
     )
@@ -483,9 +636,7 @@ def translate_batch(request: BatchRequest) -> BatchResponse:
     # how much scheduler capacity is actually free. ThreadPoolExecutor.map preserves input order
     # and re-raises the first failing item's exception at that item's position when iterated,
     # matching the previous sequential comprehension's fail-fast behavior on error.
-    worker_count = max(1, min(len(request.images), 8))
-    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="fmt-batch") as pool:
-        results = list(pool.map(_execute_translate, request.images))
+    results = list(_BATCH_EXECUTOR.map(_execute_translate, request.images))
     return BatchResponse(status="pass", results=results)
 
 
