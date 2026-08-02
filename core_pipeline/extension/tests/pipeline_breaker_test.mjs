@@ -178,4 +178,22 @@ assert.equal(statsAfterBurst.pipelineBreakerOpen, true, 'stats expose the breake
 assert.equal(sessionSetCalls.length > 0, true, 'queue descriptor persistence still fires on real queue mutations while the breaker is open');
 assert.equal(alarmActive, false, 'keep-alive alarm is not left dangling once a short-circuited backlog fully drains');
 
+// (h) A successful health check alone -- no translate dispatch involved -- must also close the
+// breaker. Before this, resetBreaker() was only ever called from the translate path, so a
+// breaker opened by one transient failure stayed open (per stats) even after /v1/health
+// confirmed the backend was reachable again, until a translate happened to land in a probe
+// window or came along at all. This is the exact mechanism behind the popup's "green for a
+// moment, then flips red" bug: checkPipelineHealth() succeeds, but a stale open breaker (read
+// separately by refreshStats) still reported true.
+backendUp = true; // health fetch always returns ok in this sandbox regardless of this flag,
+// but flip it anyway so a subsequent dispatch (below) exercises the real network path too.
+const healthCheck = await send({ kind: 'checkPipelineHealth' });
+assert.equal(healthCheck.ok, true, 'health check itself succeeds');
+const statsAfterHealthCheck = await send({ kind: 'getTranslationStats' });
+assert.equal(
+  statsAfterHealthCheck.pipelineBreakerOpen,
+  false,
+  'a successful health check closes the breaker on its own, with no translate dispatch required',
+);
+
 console.log('extension_pipeline_breaker=pass');

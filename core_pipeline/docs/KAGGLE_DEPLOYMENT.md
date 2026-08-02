@@ -134,27 +134,25 @@ Build a zip of the code **on your own machine**, where Git LFS is already resolv
 Kaggle Dataset.
 
 ```powershell
-# Run this on your own machine, inside the repo.
+# Run this on your own machine, inside this repo (Manga Translator).
 cd "D:\Desktop\translator D\app\Manga Translator"
-
-# Build a clean copy for upload -- excludes secrets and every local-only dev/test
-# artifact directory (quality_reports, runtime_samples, validation_logs, training_data,
-# runtime_logs, extension) so the upload carries only what's actually needed to run the
-# backend (code + vendored model weights: ~682MB zipped, verified by actually running
-# this command), not the ~1GB of local test output that would otherwise get swept in
-# alongside it. The extension itself never runs on Kaggle -- it stays local in your
-# browser -- so it's excluded too.
-robocopy core_pipeline kaggle_upload\core_pipeline /E /XD .git __pycache__ runtime_samples `
-  .venv quality_reports validation_logs training_data runtime_logs extension `
-  /XF .env "*.pyc"
-
-Compress-Archive -Path kaggle_upload\core_pipeline -DestinationPath fmt_core_pipeline.zip -Force
+.\core_pipeline\deploy\kaggle\build_kaggle_dataset.ps1
 ```
 
-This creates `fmt_core_pipeline.zip` in the directory you `cd`'d into above — i.e.
-`D:\Desktop\translator D\app\Manga Translator\fmt_core_pipeline.zip` — right alongside
-the `kaggle_upload\` staging folder `robocopy` builds it from. That's the file you
-upload as the Kaggle Dataset in the next step.
+This script (not a manual copy) builds a clean copy for upload -- it excludes secrets and
+every local-only dev/test artifact directory (quality_reports, runtime_samples,
+validation_logs, training_data, runtime_logs, extension) so the upload carries only what's
+actually needed to run the backend (code + vendored model weights: ~680MB zipped, verified
+by actually running it), not the ~1GB of local test output that would otherwise get swept in
+alongside it. The extension itself never runs on Kaggle -- it stays local in your browser --
+so it's excluded too. Internally it's still `robocopy` into a `kaggle_upload\` staging
+folder followed by `Compress-Archive`, but the script owns the exact exclusion list and exit
+codes so you don't retype (or drift from) them by hand.
+
+This creates `fmt_core_pipeline.zip` at the repo root — i.e.
+`D:\Desktop\translator D\app\Manga Translator\fmt_core_pipeline.zip`. That's the file you
+upload as the Kaggle Dataset in the next step. The script also prints the final zip size and
+warns if it looks like it accidentally picked up an excluded folder.
 
 Then on kaggle.com:
 
@@ -174,10 +172,12 @@ between sessions anyway.
 notebook (§5) copies straight from this dataset every run — editing `main.py` (or
 anything else) in your local repo has zero effect on Kaggle until you re-zip and
 upload a new dataset version. One narrow exception: Cell 2 hot-patches the *copied*
-`main.py`'s CORS config on every run (adds the ngrok bypass header, §4) specifically
-so that particular fix doesn't require a re-upload while it's still new — but that's
-a deliberate, temporary, single-purpose patch, not a general mechanism. Don't rely on
-it for anything else; re-upload the dataset for any other backend change.
+`main.py`'s CORS config on every run (adds the ngrok bypass header, §4) so that fix
+doesn't depend on the dataset being current. The source repo has carried this fix
+since it was added, so on an up-to-date dataset the patch is now a verified no-op
+(Cell 2 prints "already present" and moves on) — it's a defensive, idempotent check,
+not a mechanism to lean on for anything else; re-upload the dataset for any other
+backend change.
 
 ### Option B: fine-grained GitHub PAT (if you'd rather clone directly)
 
@@ -248,7 +248,7 @@ was, whether that was payload size or something else, and it's the better-suppor
 approach regardless.
 
 The committed notebook (`deploy/kaggle/fmt_kaggle_backend.ipynb`) reads exactly
-**12 secret names** — verified by grepping the notebook's own cells, not assumed. Every
+**13 secret names** — verified by grepping the notebook's own cells, not assumed. Every
 label below is spelled **identically** to the environment variable it becomes — no
 translation table to keep in your head. **You do not need a `GH_PAT` secret** — that's
 only for the git-clone path (§3 Option B), and this document's primary path (Option A,
@@ -409,7 +409,7 @@ level deeper instead, at `/kaggle/input/datasets/<your-username>/<slug>` — con
 running `os.listdir("/kaggle/input")` during this document's own testing and seeing
 `['datasets']` instead of the dataset slug directly. This cell checks both locations so
 it works either way, and prints which one it found. See the notebook's own Cell 1 for
-the full code (`fmt-cell1-v2`).
+the full code (`fmt-cell1-v3`).
 
 Expect a `Dataset found at: ...` line, GPU lines naming `Tesla T4, 15360 MiB` (or
 similar), and a version line per preinstalled library. If this cell raises the
@@ -420,16 +420,18 @@ If GPU output is empty instead, the accelerator setting wasn't applied — fix i
 side panel and restart the session before continuing.
 
 **Cell 2 — copy code, fonts, CORS + tokenizer-routing hot-patches, smart dependency
-install.** The biggest cell in the notebook, doing eleven things in a load-bearing
-order (`fmt-cell2-v7` in the notebook):
+install.** The biggest cell in the notebook, doing twelve things in a load-bearing
+order (`fmt-cell2-v11` in the notebook):
 
 1. **Copy** `DATASET_DIR/core_pipeline` → `/kaggle/working/core_pipeline` (`/kaggle/input`
    is read-only).
 2. **Hot-patch the copy's CORS config** to allow ngrok's interstitial-bypass header
-   (temporary — bakes into the next dataset version).
+   (defensive/idempotent — the source repo already carries this fix, so on an
+   up-to-date dataset this is a verified no-op every run, not an active patch).
 3. **Hot-patch the copy's `ml_region_lib.py`** with a tokenizer-routing shim — the
-   actual, source-confirmed fix for the tokenizer failure below (also temporary,
-   same reason). Explained in full in §10; short version: `transformers` ≥5.13.0
+   actual, source-confirmed fix for the tokenizer failure below (also
+   defensive/idempotent, same reason — a no-op once the dataset carries the shim
+   directly). Explained in full in §10; short version: `transformers` ≥5.13.0
    registers TrOCR's `model_type` (`"vision-encoder-decoder"`, loaded internally by
    magi via `TrOCRProcessor`) in `TOKENIZER_MAPPING_NAMES` pointing at the generic
    `TokenizersBackend` class, which can only build from a `tokenizer.json` —
@@ -497,7 +499,21 @@ order (`fmt-cell2-v7` in the notebook):
    Finally, **`transformers==5.12.0`** is pinned explicitly — belt-and-braces with the
    step-3 shim, matching the exact version the full pipeline (magi + TrOCR +
    manga-ocr + NLLB) is proven on daily on the maintainer's own machine.
-11. **Smoke test**: in a **fresh subprocess** (this kernel may still hold stale
+11. **`paddlepaddle-gpu` install, multi-index with real verification** — a bare
+   `paddlepaddle` line installs the CPU-only build, and recent `paddleocr`/`paddlex`
+   releases don't reliably pull ANY paddle in transitively (a real run hit
+   `ModuleNotFoundError('paddle')` with paddle wholly absent). Mapping torch's CUDA
+   tag to a single paddle index isn't reliable either — `cu128` is real and reachable
+   but only serves paddle up to 3.2.0, so a `>=3.3.0` pin resolves to nothing on that
+   index and fails outright. This step tries `cu126`, `cu129`, `cu130`, `cu118` in
+   order (confirmed by fetching each index page directly to see what it actually
+   serves `>=3.3.0` on), **verifies each install for real in a fresh subprocess**
+   (`paddle.device.is_compiled_with_cuda()` and `cuda.device_count() > 0` — not
+   `get_device()`, which lies and reports `"gpu:0"` even for a CPU-only build) rather
+   than trusting pip's exit code, and treats the whole step as best-effort: PaddleOCR
+   falling back to EasyOCR is a quality/speed regression for Korean/Chinese OCR only,
+   never something that should take the rest of the deployment down.
+12. **Smoke test**: in a **fresh subprocess** (this kernel may still hold stale
    imports of packages just uninstalled), scans installed distributions (exactly
    one opencv variant, `onnxruntime-gpu` present and plain `onnxruntime` absent) and
    creates a **real** `onnxruntime.InferenceSession` on the actual text-detector model
@@ -558,16 +574,26 @@ and polls for up to **20 minutes**, since a first-ever run downloads several GB
 gated by `FMT_AUTH_TOKEN` (Cell 3 always sets it) — sending only `X-Fmt-Client`, as an
 earlier version of this cell did, gets a `403` here and crashes the cell.
 
-**Cell 5b — loopback end-to-end translate (new).** The single highest-value check in
-the whole notebook. Before any tunnel exists, this cell POSTs a real sample manga page
+**Cell 5b — loopback end-to-end translate.** The single highest-value check in the
+whole notebook. Before any tunnel exists, this cell POSTs a real sample manga page
 (`samples/sample1/sample.jpg`, bundled in the dataset) to
 `127.0.0.1:8766/v1/translate-image` with both headers, asserts the response status is
-`pass`, prints a report summary, and displays the translated image inline. This single
-request exercises the CUDA ONNX text detector, OpenCV, PaddleOCR, EasyOCR, the LaMa
-inpainter, the fonts installed in Cell 2, and whichever translation provider keys you
-configured — all at once. **If this cell passes, the pipeline itself is proven working
-end to end**, and any problem you hit afterward is tunnel- or extension-side, not
+`pass`, and prints a report summary — decoding and validating the returned image
+without ever rendering it inline or writing it to disk (the sample is copyrighted
+manga art with no reason to sit in a saved notebook's output). This single request
+exercises the CUDA ONNX text detector, OpenCV, PaddleOCR, EasyOCR, the LaMa inpainter,
+the fonts installed in Cell 2, and whichever translation provider keys you configured
+— all at once. **If this cell passes, the pipeline itself is proven working end to
+end**, and any problem you hit afterward is tunnel- or extension-side, not
 pipeline-side — a genuinely useful thing to know before debugging blind.
+
+**As of `fmt-cell5b-v5`, it also prints a per-stage timing breakdown** (the backend
+already collects this via `run_stage()`/`stageTimings`, nothing surfaced it before).
+The real execution order is **5 → 6 → 7 → 4 → 8**, not 1→8, and only steps 1/4/5 touch
+the GPU at all — steps 6 and 8 are pure CPU/PIL by design, and step 7 is a blocking
+network call to whichever translation provider served the request. This line is what
+tells you, from one real run, whether the wall-clock is GPU-bound, CPU-bound, or
+network-bound, instead of guessing from a single aggregate number.
 
 **Cell 6 — open the tunnel.** Uses `pyngrok` with your static domain, so the public URL
 is the same every session. Re-run safe: calls `ngrok.kill()` first, since the free
@@ -582,6 +608,16 @@ paid-only "custom subdomain" — observed live with newer `.ngrok-free.dev` dev-
 even when the domain is genuinely reserved to the account (§10) — this cell catches
 that specific error and automatically retries with no domain argument at all, letting
 ngrok auto-assign the account's dev domain instead of hard-failing.
+
+**This fallback has a real consequence, not just a cosmetic one.** An auto-assigned
+domain is **different every single run** — the "set the extension's URL once" promise
+elsewhere in this document only holds when the static domain actually resolves. If
+this fallback fires on a run *after* you already saved a URL in the extension popup,
+every request from then on goes to a dead host with no obvious cause on the extension
+side — the popup's health check just starts failing, indistinguishable at a glance
+from the backend being down. The cell prints a loud, boxed warning (v5) when this
+happens specifically so this isn't silent; if you ever see that warning, re-copy the
+freshly printed URL into the popup before assuming anything else is wrong.
 
 **Cell 7 — keep the session alive.** Kaggle interactive sessions can idle-disconnect;
 this cell just keeps the notebook actively running and periodically confirms the
@@ -720,9 +756,20 @@ notebook and get a new health-check success.
 (`gpu_scheduler.py`) is **single-GPU admission control**; every model load in this
 codebase is hardcoded to `cuda:0`. On Kaggle's 2×T4 offering, **only the first GPU is
 used** by the setup in §5 — the second one sits idle. This is not a bug you need to
-work around for normal use; `FMT_PIPELINE_MAX_PARALLEL` (default 2) already lets a
-single T4 (16GB) run 2 pipeline jobs concurrently, which is plenty for one person's
-reading pace.
+work around for normal use.
+
+**Cell 3 tunes concurrency and idle-unload specifically for this deployment,
+deliberately different from the local `.env.example` defaults:** the code's own
+generic defaults (`FMT_PIPELINE_MAX_PARALLEL=2`, `FMT_GPU_IDLE_UNLOAD_SECONDS=0`) are
+sized for a shared/laptop GPU, not a dedicated single-user Kaggle T4 with real spare
+VRAM (confirmed: the full model set uses ~5GB of the T4's 15GB, leaving ~10GB free).
+Cell 3 raises `FMT_PIPELINE_MAX_PARALLEL` to **3** (the scheduler already probes real
+free VRAM per request via `DEFAULT_JOB_VRAM_MB=3072` and admits more jobs when it's
+actually available — 2 was capping throughput below what the hardware allows, not VRAM
+itself; 4 would eat into the scheduler's own safety margin for no further benefit) and
+sets `FMT_GPU_IDLE_UNLOAD_SECONDS` to **0** (never unload — on a dedicated GPU nobody
+else is waiting on that VRAM, so unloading after an idle reading pause only buys a
+slow cold-reload on the next page).
 
 *Advanced/untested appendix — using the second GPU:* it's possible in principle to
 launch a **second** backend process with `CUDA_VISIBLE_DEVICES=1` bound to a different
@@ -831,6 +878,24 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 
 ## 10. Troubleshooting
 
+**Diagnosing a failure against the real tunnel, from your own machine.** Every other
+test/smoke script in this repo (`run_extension_live_smoke.py`,
+`test_extension_backend_contract.py`, etc.) talks to the pipeline **in-process** —
+none of them make an actual HTTP request, so none of them can reproduce a
+tunnel-specific failure like a 403 or an ngrok interstitial. `run_remote_backend_smoke.py`
+closes that gap: it sends the exact same request shape and headers the Chrome
+extension does, over real HTTP, to whatever URL you give it.
+
+```powershell
+& $py python\diagnostics\run_remote_backend_smoke.py --url "https://your-domain.ngrok-free.dev/v1/translate-image" --auth-token "your-FMT_AUTH_TOKEN-value"
+```
+
+It distinguishes the failure modes below by name instead of a generic error: a plain
+HTTP error (with the real response body), an unreachable host, and — the one that
+otherwise looks like success until you inspect the body — a `200` response whose
+`Content-Type` is `text/html`, meaning ngrok's interstitial page came back instead of
+JSON.
+
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `/v1/health` never responds (cell 5 loop exhausts) | Backend crashed on startup — usually a missing dependency or bad `.env` | Check `/kaggle/working/backend.log`; a torch/CUDA mismatch shows up here as an import error |
@@ -840,7 +905,9 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 | Extension badge stuck on "Offline" right after Save | Pasted a bare domain instead of the full `/v1/translate-image` path (§6) | Fix the URL field, click Save again |
 | `403` on every request from the extension | `FMT_AUTH_TOKEN` set on the backend but not matching (or not set) in the popup's auth token field | Make sure both sides have the exact same token value, no trailing whitespace |
 | `paddlepaddle`/`paddleocr` install hangs or fails | Occasionally flaky on Kaggle's network | Re-run the pip install cell; these packages are large and occasionally need a retry |
-| Out-of-memory (OOM) errors during translation | Too many concurrent jobs for one T4 | Lower `FMT_PIPELINE_MAX_PARALLEL` directly in cell 3's `os.environ.update({...})` block — default 2 should normally fit a T4's 16GB comfortably |
+| Cell 2 dies in step 6e with `ModuleNotFoundError: No module named 'paddle'`, or a pip resolution error against `paddlepaddle.org.cn` | The active torch build's CUDA tag doesn't serve a paddlepaddle-gpu wheel meeting the version floor this cell requires (e.g. `cu128`'s stable index tops out at 3.2.0, not the required 3.3.0+) | Cell 2 (v11+) no longer hardcodes one tag — it tries `cu126`/`cu129`/`cu130`/`cu118` in order and verifies each with a real CUDA check before moving on; if you're on an older Cell 2 (v10 or earlier), paste the current notebook cell in fresh rather than patching the old one |
+| Cell 2's smoke test prints `paddle: NOT INSTALLED` or a `[WARN] paddle installed but not CUDA-verified` line | Every candidate paddle index failed to verify this session (see previous row) | Not fatal — the smoke test no longer hard-asserts on paddle (v11+); Korean/Chinese OCR falls back to EasyOCR for this session. Re-running Cell 2 may pick a different candidate; check the printed `[WARN]` text for which tags were tried |
+| Out-of-memory (OOM) errors during translation | Too many concurrent jobs for one T4 | Lower `FMT_PIPELINE_MAX_PARALLEL` directly in cell 3's `os.environ.update({...})` block — this notebook sets it to 3 (the code's own generic default is 2); drop back to 2 or 1 if you see OOM |
 | Cell 1's `AssertionError` fires even though Add-ons → Data shows the dataset attached | Kaggle mounted it one level deeper than expected (`/kaggle/input/datasets/<username>/<slug>`, seen on interactive/draft sessions) — the error's printed `checked:` list shows exactly what was tried | Run `os.listdir("/kaggle/input")` and, if it shows `['datasets']`, also `os.listdir("/kaggle/input/datasets")` to see the real path; Cell 1 already checks both layouts, so this should only happen if the dataset name itself doesn't match `fmt-core-pipeline` |
 | Dataset not visible in notebook at all | Forgot to attach it, or uploaded under a different name | Add-ons → Data → attach; the name must match `DATASET_SLUG` in cell 1 |
 | A secret you created won't stay in the Secrets list (reverts to "No secrets added" right after Save) | Not confirmed — no documented Kaggle limit matches this; possibly a transient session/browser issue | Follow the go/no-go branch in §4 Step 1: hard refresh, try incognito/a different browser, save the notebook first, or wait a few minutes and retry |
@@ -848,7 +915,7 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 | Cell 2's smoke test fails with `session.get_providers()[0] != 'CUDAExecutionProvider'` (or an ORT provider/cuDNN error) | A CPU `onnxruntime` package shadowed `onnxruntime-gpu`, or the CUDA/cuDNN stack didn't initialize | Re-run cell 2 (idempotent — it uninstalls onnxruntime variants before reinstalling); if it persists, restart the session and re-run cells 1-2 fresh |
 | `onnxruntime` import fails with `libcudart.so.13: cannot open shared object file` | `onnxruntime-gpu` resolved to 1.27.0+, which switched its default CUDA build from 12 to 13 — Kaggle's box only has CUDA 12.4 | Cell 2 already pins `onnxruntime-gpu==1.26.0` (step 6b) specifically for this; if a future Kaggle image ships a newer CUDA, that pin may need bumping — check `torch.version.cuda` in Cell 1's preflight output first |
 | Warmup fails with `libtorchaudio.so: undefined symbol: aoti_torch_abi_version` | A transitive dependency (transformers/easyocr audio extras) pulled in a `torchaudio` build that doesn't match the active torch | Cell 2 already force-reinstalls a matching `torchaudio` build from the same CUDA index as the active torch (step 10) — determined dynamically, not hardcoded, specifically for this |
-| Cell 2's smoke test fails loading `microsoft/trocr-base-printed`'s tokenizer, or warmup fails with `Couldn't instantiate the backend tokenizer... You need to have sentencepiece or tiktoken installed` | A `sentencepiece`/`protobuf` version mismatch — this is magi's bundled TrOCR/RobertaTokenizer dependency, not NLLB, traced directly from magi's own HF Hub source (step 7) | Cell 2 already force-reinstalls `sentencepiece` and `protobuf` together (not `--no-deps`, so pip picks a mutually compatible pair); if it still fails, the smoke test's traceback now shows the real underlying exception instead of this generic message — paste that, not this row |
+| Cell 2's smoke test fails loading `microsoft/trocr-base-printed`'s tokenizer, or warmup fails with `Couldn't instantiate the backend tokenizer... You need to have sentencepiece or tiktoken installed` | **Not** a `sentencepiece`/`protobuf` mismatch — that theory didn't survive contact with the real traceback (see §5 item 8). The actual cause: `transformers` ≥5.13.0 routes TrOCR's model type to a tokenizer class that needs a `tokenizer.json` file `microsoft/trocr-base-printed` has never shipped | Cell 2's tokenizer-routing shim (§5 item 3) is the real fix and should already be applied; if it still fails, check that the shim's anchor string still matches `ml_region_lib.py` (a repo refactor could move it) and paste the smoke test's actual traceback, not this row |
 | Cell 6 gets `ERR_NGROK_313` / "Only paid plans may create endpoints with custom subdomains" even though the domain is reserved to your account | A known quirk with newer `.ngrok-free.dev` dev-domains and explicit `domain=` requests | Cell 6 already catches this specific error and retries with no domain argument, letting ngrok auto-assign your account's dev domain instead of failing |
 | Cell 2's smoke test fails with a stray-opencv-dist assertion, or `cv2` import errors mentioning `cv2.dnn`/missing attributes | Two opencv variants installed simultaneously (dual-`cv2` corruption) — usually `ultralytics` or `paddleocr` re-pulling non-headless `opencv-python` | Re-run cell 2 — its post-install cleanup step force-reinstalls `opencv-python-headless` last with `--no-deps` specifically to fix this |
 | Any import error mentioning `_ARRAY_API not found` or "compiled using NumPy 1.x" | numpy ABI mismatch — something upgraded numpy without recompiling against it | Restart the Kaggle session and re-run cells 1-2 fresh; don't `pip install --upgrade numpy` manually mid-session |
@@ -860,7 +927,7 @@ is identical — only the tunnel mechanism and the "re-paste every session" cost
 
 ## 11. Cold-start timing
 
-As of `fmt-cell2-v9`/`fmt-cell5b-v3`, every cell from Cell 1 through Cell 6 prints
+As of `fmt-cell2-v11`/`fmt-cell5b-v5`, every cell from Cell 1 through Cell 6 prints
 `[TIMING]` lines: Cell 2 breaks its own runtime down by step (repo copy, hot-patches,
 fonts, torch check, each pip install/reinstall, the smoke test), and Cells 4/5/5b/6
 each print elapsed time since Cell 1 started, so `Run All` on a genuinely fresh

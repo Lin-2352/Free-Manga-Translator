@@ -745,6 +745,30 @@
     return width >= minSize && height >= minSize;
   }
 
+  // Family A (task #179): an image already well past the NATURAL-size floors below (real
+  // page-scan territory, not a thumbnail/icon) can still render small on the page via CSS
+  // shrink-to-fit -- a tall webtoon strip is the confirmed case (e.g. 800x10081, natural area
+  // 8M+ px, but ~67px rendered width). isLikelyPageImage()/shouldTranslate() used to gate on
+  // RENDERED rect size unconditionally after already passing the natural-size floors, so those
+  // strips were silently rejected with no error (translateImage returns before any diagnostic
+  // log). Gated on extreme aspect ratio OR generously-large natural area (3x the page-image
+  // floor) so this stays narrow: verified against the two real thumbnail sizes that must keep
+  // failing (358x520, area 186160, aspect 1.45; 540x720, area 388800, aspect 1.33) -- neither
+  // clears either condition, so neither gets an escape hatch. Do not lower these thresholds to
+  // "fix" a case that turns out to need it; that's exactly the failure mode this guards against.
+  function hasSubstantialNaturalSize(img) {
+    const width = img.naturalWidth || img.width || 0;
+    const height = img.naturalHeight || img.height || 0;
+    if (width < MIN_PAGE_IMAGE_SIZE || height < MIN_PAGE_IMAGE_SIZE) return false;
+    const area = width * height;
+    if (area < MIN_PAGE_IMAGE_AREA) return false;
+    const longSide = Math.max(width, height);
+    const shortSide = Math.max(1, Math.min(width, height));
+    const extremeAspect = longSide / shortSide >= 3;
+    const largeNatural = area >= MIN_PAGE_IMAGE_AREA * 3;
+    return extremeAspect || largeNatural;
+  }
+
   function isLikelyPageImage(img) {
     if (isStandaloneImagePage()) return true;
     const width = img.naturalWidth || img.width || 0;
@@ -754,6 +778,8 @@
 
     const src = getOriginalSrc(img) || getEffectiveSrc(img) || '';
     if (/[?&]type=p100\b/i.test(src) && (width < 720 || height < 720)) return false;
+
+    if (hasSubstantialNaturalSize(img)) return true;
 
     const rect = img.getBoundingClientRect?.();
     if (rect && rect.width > 0 && rect.height > 0) {
@@ -1110,7 +1136,7 @@
     if (!imageDimensionsReady(img, minSize)) return false;
     if (!options.manualSpecific && !isLikelyPageImage(img)) return false;
 
-    if (!isStandaloneImagePage()) {
+    if (!isStandaloneImagePage() && !hasSubstantialNaturalSize(img)) {
       const rect = img.getBoundingClientRect();
       const minRect = options.pickerMode ? 50 : 100;
       if (rect.width < minRect || rect.height < minRect) return false;

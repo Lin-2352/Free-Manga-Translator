@@ -533,6 +533,17 @@ async function checkPipelineHealth(settings, options = {}) {
     const payload = await response.json().catch(() => null);
     noteBackendCapacity(payload?.scheduler?.capacity);
     requestPipelineWarmup(settings).catch(() => {});
+    // resetBreaker() was previously called ONLY from the translate dispatch path -- so a
+    // breaker opened by one transient failure (a preflight revalidation landing badly, an
+    // ngrok tunnel blip) stayed open until the next translate attempt happened to land in a
+    // shouldAttemptDispatch() probe window, or forever if nothing was actively translating.
+    // A successful health check is definitionally proof the backend is reachable right now,
+    // so any earlier "give up" latch is stale -- clearing it here means opening the popup (or
+    // Save, or engine start, the three existing callers) is its own independent recovery path,
+    // and fixes the "green for a moment, then flips red" popup bug: without this, the health
+    // check itself could succeed while the breaker (checked separately by refreshStats) stayed
+    // open from an unrelated earlier failure.
+    resetBreaker();
     return true;
   } catch {
     if (options.clearCacheOnFailure) await clearTranslationCache();

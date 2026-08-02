@@ -69,6 +69,13 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Fmt-Client", "X-Fmt-Auth", "ngrok-skip-browser-warning"],
+    # Starlette defaults max_age to 600s -- Chrome re-sends an OPTIONS preflight roughly every
+    # 10 minutes over a long-lived tunnel connection (Kaggle+ngrok), and a preflight structurally
+    # cannot carry the ngrok-skip-browser-warning header, so a preflight landing on ngrok's
+    # free-tier interstitial page (HTML instead of a CORS response) reads as one transient network
+    # failure to the extension -- enough to trip its circuit breaker. A day-long cache all but
+    # eliminates how often that revalidation can land on a bad moment during one Kaggle session.
+    max_age=86400,
 )
 
 # Every route except the bare health check requires this header. It buys two things cheaply:

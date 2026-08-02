@@ -513,6 +513,57 @@ assert.equal(
 contentListener({ kind: 'toggleTranslation', enabled: false }, {}, () => {});
 await new Promise((resolve) => setTimeout(resolve, 10));
 
+// ===== Family A (#179): tall webtoon strip rendered small (shrink-to-fit) is still scheduled =====
+// 800x10081 natural (aspect 12.6:1, area 8M+ px) is real page-scan territory -- but shrink-to-fit
+// CSS renders it at only ~67px wide. Before the natural-size escape hatch in
+// hasSubstantialNaturalSize(), the rendered-rect check (rect.width < 180) silently rejected this
+// with zero diagnostic. Must schedule now.
+//
+// A second, small companion image is included so document.body.children.length !== 1 --
+// isStandaloneImagePage() short-circuits isLikelyPageImage() to true for ANY size whenever
+// exactly one <img> exists on the mocked page (a single-image test setup always trips this
+// bypass), which would make this test pass even with the OLD rect-only gate and prove nothing.
+// The companion is itself too small to ever become a scan candidate, so it can't interfere with
+// the assertion below.
+const beforeStripRequests = translateRequests.length;
+fakeImages = [
+  makeQueueImage('https://example.test/webtoon-strip.jpg', { left: 0, top: 0, right: 67, bottom: 845, width: 67, height: 845 }, 800, 10081),
+  makeQueueImage('https://example.test/tiny-companion.png', { left: 0, top: 900, right: 64, bottom: 964, width: 64, height: 64 }, 64, 64),
+];
+contentListener({ kind: 'toggleTranslation', enabled: true }, {}, () => {});
+await new Promise((resolve) => setTimeout(resolve, 10));
+assert.equal(
+  translateRequests.length,
+  beforeStripRequests + 1,
+  'an 800x10081 webtoon strip rendered at 67px wide is scheduled, not silently skipped',
+);
+assert.equal(
+  translateRequests.at(-1).originalImageUrl,
+  'https://example.test/webtoon-strip.jpg',
+);
+contentListener({ kind: 'toggleTranslation', enabled: false }, {}, () => {});
+await new Promise((resolve) => setTimeout(resolve, 10));
+
+// ===== Family A (#179): a genuine small icon must NOT get the natural-size escape hatch =====
+// A 64x64 icon fails the pre-existing natural-size floors (MIN_PAGE_IMAGE_SIZE=340) on its own,
+// so it must still be rejected -- the escape hatch only ever widens what ALREADY cleared those
+// floors, it never bypasses them. Paired with a second small image for the same
+// isStandaloneImagePage() reason as above.
+const beforeIconRequests = translateRequests.length;
+fakeImages = [
+  makeQueueImage('https://example.test/icon.png', { left: 0, top: 0, right: 64, bottom: 64, width: 64, height: 64 }, 64, 64),
+  makeQueueImage('https://example.test/icon-2.png', { left: 0, top: 100, right: 64, bottom: 164, width: 64, height: 64 }, 64, 64),
+];
+contentListener({ kind: 'toggleTranslation', enabled: true }, {}, () => {});
+await new Promise((resolve) => setTimeout(resolve, 10));
+assert.equal(
+  translateRequests.length,
+  beforeIconRequests,
+  'a 64x64 icon is still filtered out -- the natural-size escape hatch must not widen the floors themselves',
+);
+contentListener({ kind: 'toggleTranslation', enabled: false }, {}, () => {});
+await new Promise((resolve) => setTimeout(resolve, 10));
+
 // ===== bfcache restore recovers a stuck PROCESSING marker =====
 // A back/forward navigation freezes the page (with any PROCESSING_ATTR/
 // pendingSrcs state) mid-request; the message port that request was awaiting
