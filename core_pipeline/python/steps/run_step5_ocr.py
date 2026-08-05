@@ -82,7 +82,13 @@ def _sample_cjk_ocr_language(sample_name: str) -> str | None:
     chinese_markers = ("_zh_", "zh_", "_chi", "(chi", "_chinese", "(chinese", "_cn", "(cn")
     korean_markers = ("_ko_", "ko_", "_kor", "(ko", "(kor", "_korean", "(korean", "_kr", "(kr")
     if any(marker in lowered for marker in chinese_markers) or lowered.startswith(("external_zh", "modern_zh", "runtime_zh")):
-        return "ch_tra"
+        # Was unconditionally "ch_tra" (Traditional) for every zh sample -- never a detected
+        # choice, just an unverified guess, and Simplified is the more common real-world source
+        # script. This EasyOCR reader is only ever reached as a last-resort fallback behind
+        # PaddleOCR (lang="ch", script-agnostic) -- so this default only matters when paddle is
+        # unavailable, but should still default to the more likely case rather than the less
+        # likely one.
+        return "ch_sim"
     if any(marker in lowered for marker in korean_markers) or lowered.startswith(("external_ko", "modern_ko", "runtime_ko")):
         return "ko"
     return None
@@ -122,9 +128,19 @@ def _paddleocr_reader(language: str):
             import torch  # noqa: F401
             import paddle
             from paddleocr import PaddleOCR
-        except ModuleNotFoundError:
+        except (ModuleNotFoundError, ImportError, OSError, RuntimeError) as exc:
+            # Was ModuleNotFoundError only -- correct for "paddle isn't installed" but not for
+            # a PARTIALLY broken install (a missing libcudnn sub-DLL, a mismatched wheel from
+            # an interrupted multi-index install loop -- see the Kaggle notebook's Cell 2 §6e,
+            # a best-effort install that can leave paddle importable-but-broken rather than
+            # absent). That raised ImportError/OSError/RuntimeError instead, uncaught, crashing
+            # step 5 outright for zh/ko requests instead of falling back the way a genuinely
+            # missing module already does. Every zh runtime sample in this repo's own fixture
+            # tree was produced via this exact path succeeding -- there is zero evidence the
+            # fallback below has ever been exercised for zh, so a crash here silently means
+            # "Chinese OCR stopped working," not a visible error.
             _PADDLEOCR_UNAVAILABLE.add(language)
-            print(f"  [PaddleOCR warn] {language}: paddleocr is not installed; using non-Paddle OCR fallbacks")
+            print(f"  [PaddleOCR warn] {language}: paddleocr unavailable ({type(exc).__name__}: {exc}); using non-Paddle OCR fallbacks")
             return None
 
         paddle_lang = "korean" if language == "ko" else "ch"
@@ -724,7 +740,11 @@ def _combine_easyocr_results(results: list, language: str, min_confidence: float
         return {"text": "", "confidence": 0.0}
 
     if min_confidence is None:
-        min_confidence = 0.35 if _is_chinese_ocr_language(language) else 0.55
+        # Was 0.35 for zh vs 0.55 for ko -- an asymmetry with no found justification (no
+        # comment, no measured tuning note) alongside a zh rescue path that had never been
+        # exercised on a real sample (see _paddleocr_reader/rescue changes above). Matched to
+        # ko's stricter floor rather than assumed correct as-is.
+        min_confidence = 0.55
     kept = []
     for polygon, text, confidence in results:
         clean_text = str(text or "").strip()
@@ -788,7 +808,9 @@ def _easyocr_rescue_variants(crop_rgb: np.ndarray) -> list[np.ndarray]:
 
 def _read_easyocr_rescue(crop_rgb: np.ndarray, language: str) -> dict:
     script = "han" if _is_chinese_ocr_language(language) else "hangul"
-    min_confidence = 0.18 if _is_chinese_ocr_language(language) else 0.32
+    # Was 0.18 for zh vs 0.32 for ko -- same unexplained asymmetry as _combine_easyocr_results
+    # above, matched to ko's stricter floor.
+    min_confidence = 0.32
     best = {"text": "", "confidence": 0.0, "script_count": 0}
     reader = _easyocr_reader(language)
 
@@ -925,18 +947,39 @@ class LocalCjkOcr:
             if rescued["text"]:
                 return rescued
             if _is_chinese_ocr_language(self.language):
-                if _MANGA_OCR_MODEL is None:
-                    _MANGA_OCR_MODEL = load_ocr_model(force_cpu=False)
+                # Was manga-ocr -- a JAPANESE model -- accepted at a hardcoded 0.42 confidence
+                # just because its output happened to contain Han characters. Chinese text
+                # misread as plausible-looking kanji passed this trivially, and unlike Korean's
+                # rescue below (real PaddleOCR-ko, gated at real confidence), this path has zero
+                # evidence it was ever exercised on a real Chinese sample: every zh runtime
+                # sample in this repo's own fixture tree was produced by the primary
+                # PaddleOCR-ch path succeeding, never this fallback. Mirrors ko's rescue pattern
+                # instead: the request's own language via PaddleOCR, gated on the same real
+                # confidence/script checks, not a borrowed model's guess. No landscape-only
+                # restriction (unlike ko's, which exists specifically because tall/narrow
+                # Korean crops belong to a separate upstream vertical-column pipeline -- no
+                # equivalent constraint is documented for Chinese).
                 try:
-                    manga_text = str(_MANGA_OCR_MODEL(pil_image) or "").strip()
+                    paddle_reader = _paddleocr_reader("ch")
+                    paddle_results = paddle_reader.predict(crop_rgb[:, :, ::-1]) if paddle_reader is not None else []
+                    paddle_text = ""
+                    paddle_score = 0.0
+                    for payload in paddle_results:
+                        texts = payload.get("rec_texts") or []
+                        scores = payload.get("rec_scores") or []
+                        if texts:
+                            paddle_text = str(texts[0] or "").strip()
+                            paddle_score = float(scores[0]) if scores else 0.0
+                            break
                 except Exception as error:
-                    print(f"  [MangaOCR warn] Chinese rescue failed: {str(error)[:100]}")
-                    manga_text = ""
-                if _script_count(manga_text, "han") > 0:
+                    print(f"  [PaddleOCR warn] Chinese rescue failed: {str(error)[:100]}")
+                    paddle_text = ""
+                    paddle_score = 0.0
+                if _script_count(paddle_text, "han") > 0 and paddle_score >= 0.55:
                     return {
-                        "text": manga_text,
-                        "provider": "manga_ocr_ch_rescue",
-                        "confidence": 0.42,
+                        "text": paddle_text,
+                        "provider": "paddleocr_ch_rescue",
+                        "confidence": round(paddle_score, 4),
                     }
             elif self.language == "ko" and crop_rgb.shape[1] >= crop_rgb.shape[0]:
                 # Landscape crops only (width >= height): a horizontal line
@@ -2672,8 +2715,16 @@ def _run_step5_ocr_unlocked(sample_map: dict[str, str] | None = None, samples_di
                 
             # Step 2: Bubble & Semantic
             bubble_masks = detect_bubbles(bubble_model, bubble_device, image, cfg)
+            bubble_count_raw = len(bubble_masks)
             bubble_masks = _filter_and_save_bubble_masks(detect_dir, bubble_masks, text_result.boxes)
-            
+            # Was silent -- a pasted backend.log had text-region and classification detail
+            # (steps 5/6 already print plenty) but nothing at all for step 1/2 detection, so a
+            # detection MISS (as opposed to a classification/OCR miss) was undiagnosable from
+            # logs alone. text_result.boxes is step 1's independent text-region detector, not
+            # part of this bubble count, but printing both together is what actually answers
+            # "did detection see anything on this page at all."
+            print(f"  [detect] text_boxes={len(text_result.boxes)} bubbles_raw={bubble_count_raw} bubbles_kept={len(bubble_masks)}")
+
             semantic_result = detect_semantic_text_regions(semantic_handle, image, cfg)
             with open(semantic_path, 'w') as f:
                 json.dump({"regions": [{"box": {k: int(v) for k, v in r.box.to_dict().items()}, "class_id": int(r.class_id), 

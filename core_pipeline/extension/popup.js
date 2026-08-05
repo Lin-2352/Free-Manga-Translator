@@ -76,16 +76,37 @@ document.addEventListener('DOMContentLoaded', () => {
     return url.toString();
   }
 
-  function updatePipelineModeBadge(pipelineUrl) {
-    if (!pipelineModeBadge) return;
-    let isLoopback = true;
+  // The one real local/remote signal in the popup -- was previously inlined only inside
+  // updatePipelineModeBadge, so the badge could say REMOTE while every status/error message
+  // elsewhere in the popup stayed hardcoded to local wording regardless. Factored out so every
+  // caller reads the same signal the badge already computes.
+  function isLoopbackUrl(pipelineUrl) {
     try {
       const host = new URL(pipelineUrl).hostname;
-      isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '[::1]';
+      return host === '127.0.0.1' || host === 'localhost' || host === '[::1]';
     } catch {
-      isLoopback = true;
+      return true;
     }
-    pipelineModeBadge.textContent = isLoopback ? 'LOCAL' : 'REMOTE';
+  }
+
+  function currentPipelineIsLoopback() {
+    return isLoopbackUrl(localPipelineUrl?.value || DEFAULT_LOCAL_PIPELINE_URL);
+  }
+
+  function updatePipelineModeBadge(pipelineUrl) {
+    const loopback = isLoopbackUrl(pipelineUrl);
+    if (pipelineModeBadge) pipelineModeBadge.textContent = loopback ? 'LOCAL' : 'REMOTE';
+    // Start Engine's tooltip (popup.html's static data-help) describes only the local-launcher
+    // flow -- "shows the local launcher command because Chrome cannot spawn Python directly" --
+    // which is misleading/inapplicable once the backend is remote (Kaggle etc). Rewritten here
+    // rather than in HTML since this is the one place the mode is actually known; the hover
+    // handler already reads element.dataset.help live at hover time, so mutating the attribute
+    // is enough -- no separate re-render call needed.
+    if (startEngineBtn && startEngineBtn.dataset) {
+      startEngineBtn.dataset.help = loopback
+        ? 'Checks whether the local backend is reachable.|If reachable, requests model warmup through /v1/warmup.|If unreachable, shows the local launcher command because Chrome cannot spawn Python directly without a native host.'
+        : 'Checks whether the remote backend (e.g. a Kaggle-hosted tunnel) is reachable.|If reachable, requests model warmup through /v1/warmup -- a fresh remote session\'s first warmup can take several minutes.|If unreachable, double-check the pipeline URL below is still current (tunnel URLs can change between sessions).';
+    }
   }
   // Must match background.js's own DEFAULT_CACHE_LIMIT: a cache smaller than the
   // queue-ahead depth LRU-evicts the page you started reading before you're done
@@ -675,7 +696,9 @@ document.addEventListener('DOMContentLoaded', () => {
         setEngineStatus('Reachable');
       } else {
         setEngineStatus('Offline');
-        statusText.textContent = 'Local server unreachable';
+        statusText.textContent = currentPipelineIsLoopback()
+          ? 'Local server unreachable'
+          : 'Remote backend unreachable';
       }
       refreshStats();
       refreshQuotaStatus().catch(() => {});
@@ -714,25 +737,34 @@ document.addEventListener('DOMContentLoaded', () => {
   startEngineBtn?.addEventListener('click', async () => {
     const originalLabel = startEngineBtn.textContent;
     try {
+      const remoteMode = !currentPipelineIsLoopback();
       startEngineBtn.textContent = 'Checking engine...';
       setEngineStatus('Checking...');
-      statusText.textContent = 'Checking local backend...';
+      statusText.textContent = remoteMode ? 'Checking remote backend...' : 'Checking local backend...';
       const response = await withButton(startEngineBtn, () => runtimeMessage({ kind: 'startEngine' }));
       apiStatus.classList.toggle('active', response.ok === true);
       apiStatus.classList.toggle('error', response.ok !== true);
       if (response.ok === true) {
         const warmupStatus = response.warmup?.payload?.status || response.warmup?.payload?.warmup?.status || 'warming';
         setEngineStatus(warmupStatus === 'pass' ? 'Ready' : 'Warming');
-        statusText.textContent = response.warmup?.skipped
-          ? 'Engine already reachable'
-          : 'Engine reachable; warmup requested';
+        if (response.warmup?.skipped) {
+          statusText.textContent = 'Engine already reachable';
+        } else if (remoteMode && warmupStatus !== 'pass') {
+          // A fresh Kaggle session's first warmup downloads several GB of model weights --
+          // meaningfully different from a local backend's near-instant warmup, and nothing
+          // told the user this before. Static local-only wording here read as a hang.
+          statusText.textContent = 'Remote engine warming up -- first run can take several minutes (downloading models)';
+        } else {
+          statusText.textContent = 'Engine reachable; warmup requested';
+        }
         startEngineBtn.textContent = warmupStatus === 'pass' ? 'Engine Ready' : 'Warmup Requested';
         flashAction(startEngineBtn);
         refreshVramStatus().catch(() => {});
       } else {
         setEngineStatus('Offline');
-        statusText.textContent = response.message || 'Start the local backend first';
-        startEngineBtn.textContent = 'Backend Offline';
+        statusText.textContent = response.message
+          || (remoteMode ? 'Could not reach the remote backend' : 'Start the local backend first');
+        startEngineBtn.textContent = remoteMode ? 'Remote Offline' : 'Backend Offline';
       }
       refreshStats();
     } catch (error) {

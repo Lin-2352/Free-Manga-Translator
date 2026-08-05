@@ -399,7 +399,10 @@ def _classify_text_by_content_detailed(text: str) -> tuple[str, bool]:
     # 3. CJK script composition
     katakana = sum(1 for c in script_text if '\u30A0' <= c <= '\u30FF' or c == 'ー')
     hiragana = sum(1 for c in script_text if '\u3040' <= c <= '\u309F')
-    kanji    = sum(1 for c in script_text if '\u4E00' <= c <= '\u9FFF')
+    # Was \u4E00-\u9FFF only -- narrower than the \u3400-\u9FFF ("han") range steps 5/6
+    # already use elsewhere in this codebase, so CJK Extension-A characters counted as
+    # Chinese/Japanese text there counted as zero here.
+    kanji    = sum(1 for c in script_text if '\u3400' <= c <= '\u9FFF')
     hangul   = sum(
         1 for c in script_text
         if '\uAC00' <= c <= '\uD7AF'
@@ -446,8 +449,11 @@ def _classify_text_by_content_detailed(text: str) -> tuple[str, bool]:
     # characters. Keep single/short Han glyph runs conservative to avoid SFX.
     if kanji >= 2 and hiragana == 0 and katakana == 0:
         return 'dialogue', False
-    if kanji == 1 and hiragana == 0 and katakana == 0:
-        return 'sfx', False
+    # Was: single Han glyph with no kana -> auto-'sfx'. But a single Han character is
+    # common, real Chinese dialogue (啊/嗯/哦 -- interjections/particles), not just an SFX
+    # glyph, and this codebase has no signal here to tell the two apart. Falls through
+    # instead to rule 7 below (`kanji >= 1` -> 'dialogue'), the same rule that already
+    # handles single-kanji Japanese text -- no longer special-cased to 'sfx' for zh.
 
     # 6. SFX heuristics — be very aggressive here
     # Mixed hiragana+katakana is a grammatically structured sentence (the
@@ -739,16 +745,18 @@ def load_bubble_model(model_path: str, allow_cpu: bool = False):
     return model, device
 
 
-def detect_bubbles(
+def _detect_bubbles_single_pass(
     model,
     device: str,
     image: np.ndarray,
     cfg: MLConfig,
 ) -> List[np.ndarray]:
     """
-    Run bubble segmentation. Returns list of binary masks [H, W] at original
-    image resolution. Each mask: 255 = inside bubble, 0 = outside.
-    
+    Run bubble segmentation on ONE untiled image. Returns list of binary
+    masks [H, W] at the resolution of `image` as passed in (caller is
+    responsible for remapping into full-page coordinates when `image` is a
+    tile crop, not the whole page).
+
     Post-processing: Validates that each detected region is actually a speech
     bubble rather than a face/body/background-art false positive. A region
     passes if either (a) its interior is predominantly white (classic bubble
@@ -799,6 +807,114 @@ def detect_bubbles(
 
             masks.append(binary)
     return masks
+
+
+# Extreme-aspect-ratio tiling threshold for detect_bubbles — matches the extension's own
+# Family A `extremeAspect` gate (content.js `hasSubstantialNaturalSize`, long/short >= 3) so
+# an image the extension now schedules as "worth translating" for its extreme aspect gets
+# detection that can actually see it, not the same single 1600px-letterboxed pass that squeezed
+# an 800x10081 webtoon strip down to ~127x1600 before YOLO ever ran.
+_BUBBLE_TILE_ASPECT_THRESHOLD = 3.0
+_BUBBLE_TILE_SIZE = 1600
+_BUBBLE_TILE_OVERLAP = 200
+
+
+def _dedupe_tiled_masks(masks: List[np.ndarray], iou_threshold: float = 0.5) -> List[np.ndarray]:
+    """
+    Overlapping tiles can detect the same bubble twice (once per tile whose overlap region
+    contains it). Drop duplicates by mask-IoU, keeping the larger (more complete) mask of
+    each duplicate pair — a bubble split across a tile seam is more fully captured by
+    whichever tile's crop contained more of it.
+    """
+    if len(masks) <= 1:
+        return masks
+    areas = [int(np.count_nonzero(m)) for m in masks]
+    order = sorted(range(len(masks)), key=lambda i: areas[i], reverse=True)
+    kept: List[int] = []
+    kept_bool: List[np.ndarray] = []
+    for i in order:
+        mi = masks[i] > 0
+        is_dup = False
+        for kb in kept_bool:
+            inter = int(np.count_nonzero(mi & kb))
+            if inter == 0:
+                continue
+            union = int(np.count_nonzero(mi | kb))
+            if union > 0 and (inter / union) >= iou_threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(i)
+            kept_bool.append(mi)
+    kept_set = set(kept)
+    return [masks[i] for i in range(len(masks)) if i in kept_set]
+
+
+def detect_bubbles(
+    model,
+    device: str,
+    image: np.ndarray,
+    cfg: MLConfig,
+) -> List[np.ndarray]:
+    """
+    Run bubble segmentation. Returns list of binary masks [H, W] at original
+    image resolution. Each mask: 255 = inside bubble, 0 = outside.
+
+    Below the extreme-aspect threshold: a single untiled pass, byte-identical to the
+    pre-tiling behavior — this is the code path every normal-aspect sample still takes.
+
+    Above the threshold (e.g. tall webtoon strips): the long axis is split into
+    overlapping `_BUBBLE_TILE_SIZE`-px tiles (mirroring step 5 OCR's existing
+    `_axis_tiles()` pattern), each tile is detected independently so a full-page
+    single-pass resize never shrinks a bubble below detectability, results are remapped
+    back into full-page coordinates, and duplicate detections from the tile overlap are
+    deduped by mask IoU.
+    """
+    h, w = image.shape[:2]
+    long_side, short_side = max(h, w), max(1, min(h, w))
+    if (long_side / short_side) < _BUBBLE_TILE_ASPECT_THRESHOLD:
+        return _detect_bubbles_single_pass(model, device, image, cfg)
+
+    vertical = h >= w
+    axis_len = h if vertical else w
+    tiles = _axis_tiles_local(axis_len, _BUBBLE_TILE_SIZE, _BUBBLE_TILE_OVERLAP)
+    print(f"  [detect_bubbles] extreme aspect ({w}x{h}) -> {len(tiles)} tiles along {'y' if vertical else 'x'}-axis")
+
+    all_masks: List[np.ndarray] = []
+    for start, end in tiles:
+        crop = image[start:end, :] if vertical else image[:, start:end]
+        if crop.size == 0:
+            continue
+        tile_masks = _detect_bubbles_single_pass(model, device, crop, cfg)
+        for tm in tile_masks:
+            full = np.zeros((h, w), dtype=np.uint8)
+            if vertical:
+                full[start:end, :] = tm
+            else:
+                full[:, start:end] = tm
+            all_masks.append(full)
+
+    return _dedupe_tiled_masks(all_masks)
+
+
+def _axis_tiles_local(length: int, tile_size: int, overlap: int) -> List[Tuple[int, int]]:
+    """Same overlapping-range logic as step 5 OCR's `_axis_tiles()` — duplicated locally
+    (rather than imported across the steps/common boundary) since `ml_region_lib.py` is a
+    shared module imported by every step, and `run_step5_ocr.py` is not."""
+    if length <= tile_size:
+        return [(0, length)]
+    ranges: List[Tuple[int, int]] = []
+    stride = max(1, tile_size - overlap)
+    start = 0
+    while start < length:
+        end = min(length, start + tile_size)
+        ranges.append((start, end))
+        if end >= length:
+            break
+        start = max(0, end - overlap)
+        if ranges and start <= ranges[-1][0]:
+            start = ranges[-1][0] + stride
+    return ranges
 
 
 # ===================================================================

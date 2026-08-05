@@ -90,6 +90,7 @@ for (const id of elementIds) {
       this.appendedChildren = (this.appendedChildren || []).concat(nodes);
     },
     attributes: {},
+    dataset: {},
     setAttribute(name, value) {
       this.attributes[name] = String(value);
     },
@@ -371,6 +372,11 @@ assert.equal(
   'REMOTE',
   'the header badge flips to REMOTE when the saved backend is not loopback',
 );
+assert.equal(
+  elements.get('startEngineBtn').dataset.help.toLowerCase().includes('remote'),
+  true,
+  'Start Engine tooltip is rewritten to describe the remote backend once the mode is remote',
+);
 
 elements.get('localPipelineUrl').value = 'https://example-test.ngrok-free.app/v1/translate-image';
 await elements.get('saveLocalPipelineBtn').listeners.click();
@@ -394,6 +400,11 @@ assert.equal(
   elements.get('pipelineModeBadge').textContent,
   'LOCAL',
   'the header badge flips back to LOCAL when the saved backend is loopback again',
+);
+assert.equal(
+  elements.get('startEngineBtn').dataset.help.toLowerCase().includes('local'),
+  true,
+  'Start Engine tooltip is rewritten back to the local-launcher description once the mode is local again',
 );
 
 await elements.get('startEngineBtn').listeners.click();
