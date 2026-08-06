@@ -287,7 +287,7 @@ Click **Save**, then look at the Secrets list.
   Continue to Step 2 below with confidence; the rest of the secrets will behave the
   same way.
 - **If it also reverts to "No secrets added"** — this isn't about payload size (this
-  value is a short token, nowhere near 15KB), so don't create the other 11 secrets yet;
+  value is a short token, nowhere near 15KB), so don't create the other 12 secrets yet;
   they'll very likely hit the same wall. Instead try, in order: a hard refresh
   (Ctrl+Shift+R) before retrying, an incognito window or a different browser, clicking
   **Save Version** on the notebook first (an unsaved draft notebook has been reported

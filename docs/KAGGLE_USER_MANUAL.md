@@ -18,11 +18,11 @@ Use **Kaggle** (this guide) if:
 
 - You don't have a GPU, or yours doesn't have enough VRAM.
 - You'd rather not keep your own machine running while you read.
-- You're fine with the trade-offs in section 9 below (a Kaggle session eventually
+- You're fine with the trade-offs in section 8 below (a Kaggle session eventually
   ends, there's a small monthly bandwidth cap on the free tunnel, and setup takes
   about 20-30 minutes the first time).
 
-Kaggle is not "better" than local — it's a different set of trade-offs. Read section 9
+Kaggle is not "better" than local — it's a different set of trade-offs. Read section 8
 before committing to it as your daily driver.
 
 ## 1. Kaggle Account Prerequisites
@@ -50,29 +50,26 @@ zip as a private Kaggle Dataset.
 On your own machine, in the repo root:
 
 ```powershell
-robocopy core_pipeline kaggle_upload\core_pipeline /E /XD .git __pycache__ runtime_samples `
-  .venv quality_reports validation_logs training_data runtime_logs extension `
-  /XF .env "*.pyc"
-
-Compress-Archive -Path kaggle_upload\core_pipeline -DestinationPath fmt_core_pipeline.zip -Force
+.\core_pipeline\deploy\kaggle\build_kaggle_dataset.ps1
 ```
 
-This excludes secrets, dev/test artifact folders, and the extension itself (it never
-runs on Kaggle — it stays local in your browser). Expected result: a zip a few hundred
-MB to under 1GB, depending on your local test data.
+This script excludes secrets, dev/test artifact folders, and the extension itself (it
+never runs on Kaggle — it stays local in your browser). Expected result: a zip a few
+hundred MB to under 1GB, depending on your local test data — the script prints the exact
+size and warns if it looks like it accidentally picked up an excluded folder.
 
 Then on kaggle.com:
 
 1. **Create → New Dataset**.
-2. Upload `fmt_core_pipeline.zip`.
+2. Upload `fmt_core_pipeline.zip` (built at the repo root by the script above).
 3. Give it a name — this manual assumes `fmt-core-pipeline`.
 4. Leave visibility as **Private** (the default). Do not click "Make Public."
 5. Click **Create**.
 
-**Updating the code later:** re-run the same two commands above, then on your
-dataset's page click **New Version** and upload the fresh zip. The notebook always
-copies straight from whatever dataset version is currently attached — a code change on
-your machine has zero effect on Kaggle until you do this.
+**Updating the code later:** re-run the script above, then on your dataset's page click
+**New Version** and upload the fresh zip. The notebook always copies straight from
+whatever dataset version is currently attached — a code change on your machine has zero
+effect on Kaggle until you do this.
 
 ## 3. Create the 13 Kaggle Secrets
 
@@ -177,6 +174,28 @@ entirely inside the Kaggle VM, before any tunnel exists. If it passes, the pipel
 itself works end to end and any remaining problem is tunnel or extension
 configuration, not the pipeline.
 
+**Stale-backend trap (Kaggle version):** on your own machine, `/v1/health`'s `commit`
+field (see `LOCAL_USER_MANUAL.md`) tells you the exact git commit the running backend
+loaded. **On Kaggle this doesn't work** — the dataset zip only ever contains
+`core_pipeline/`, never the repo's `.git` directory, so `commit` reads `null` for every
+Kaggle session; there's no git history on the VM to hash. Comparing it against
+`git rev-parse --short HEAD` will never match anything and isn't a useful check here.
+
+The real freshness signal on Kaggle is each code cell's own version-tag comment — the
+first line of Cell 1 through Cell 6 (e.g. `# fmt-cell2-v11`). Check these against the
+list in `core_pipeline/docs/KAGGLE_DEPLOYMENT.md` (search that file for "fmt-cell"): if
+your imported notebook's tags are older than what's documented there, re-download/
+re-import `core_pipeline/deploy/kaggle/fmt_kaggle_backend.ipynb` before trusting a test
+result. Kaggle sessions are long-lived, so it's easy to keep re-running an old imported
+notebook after the source repo has moved on without noticing.
+
+**Between Cell 6 and Cell 7 sits one more cell you don't have to run yet** — an
+on-demand "print recent backend.log lines" cell. It's not part of the unattended Run
+All sequence and does nothing on its own; it's there for later, so you can re-run it
+any time (mid-session, next to Cell 7's loop, whenever something looks wrong) to see
+what the backend has actually logged recently, without restarting anything. See
+section 11 below for how to use it.
+
 **Then it will look like it's hanging on Cell 7.** This is correct, not a bug. Cell 7
 is a deliberate infinite loop that keeps the session's kernel busy while you read.
 Leave it running for as long as you're using the extension.
@@ -187,7 +206,7 @@ and models stay cached in that session's memory — but a brand new session (tom
 or after a restart) starts cold again, at roughly the same 6-8 minutes.
 
 If any cell fails, its output now contains the real error at the exact point it
-failed — see section 11 below, or paste it into a chat with an AI assistant if you're
+failed — see section 10 below, or paste it into a chat with an AI assistant if you're
 stuck; the error itself is safe to share, just never a secret value.
 
 ## 5. Get the Public URL
@@ -198,6 +217,13 @@ Cell 6's output prints two lines:
 Public URL: https://<your-domain>.ngrok-free.dev
 Paste this into the extension popup's Local Pipeline URL field:
   https://<your-domain>.ngrok-free.dev/v1/translate-image
+```
+
+```for extension location: 
+D:\Desktop\translator D\app\Manga Translator\core_pipeline\extension
+
+for fmt auth token:
+Wnak75CQVg13ltjfDLXZr0icqxASpsGbYByPHTdN
 ```
 
 Copy the **second** line — the one ending in `/v1/translate-image`, not the bare
@@ -354,7 +380,126 @@ that's specifically designed so you don't have to guess. See
 `core_pipeline/docs/KAGGLE_DEPLOYMENT.md` section 10 for the full troubleshooting
 table covering every cell.
 
-## 11. Security Notes
+## 11. Debugging — What to Check and What to Paste Back
+
+If something's wrong and section 10 above didn't cover it, this section gives you the
+actual commands to run and exactly what to paste into a chat when asking for help. Run
+these roughly in this order — each one narrows down where the problem is.
+
+### 1. The log-tail cell (fastest, start here)
+
+Between Cell 6 and Cell 7 in the notebook is a cell that prints the last 150 lines of
+`/kaggle/working/backend.log` — the backend's own stdout/stderr, redirected there by
+Cell 4. Run it any time; it's read-only and doesn't touch the running backend or
+tunnel. **This is usually the single most useful thing to paste back.** It requires
+Cell 5 to have already run once in this kernel (it reuses a helper function Cell 5
+defines) — if you get a `NameError`, run Cell 5 first, then retry.
+
+If you'd rather look at the whole file instead of just the tail, add a new cell
+anywhere after Cell 4 and run:
+
+```python
+with open("/kaggle/working/backend.log") as f:
+    print(f.read())
+```
+
+### 2. Health and warmup state — `/v1/health`
+
+Tells you whether the backend process is up, what it thinks its own warmup state is,
+and current GPU/scheduler load — without needing the extension popup open. Run from a
+new notebook cell (loopback, no auth header games) or from your own machine against the
+tunnel URL (needs both headers plus the ngrok bypass header).
+
+From a Kaggle cell (loopback):
+```python
+get_json("http://127.0.0.1:8766/v1/health")
+```
+(`get_json` is defined in Cell 5 — run it first if you haven't this session.)
+
+From your own machine, against the public tunnel URL — PowerShell:
+```powershell
+Invoke-RestMethod "https://<your-domain>.ngrok-free.dev/v1/health" -Headers @{
+  "X-Fmt-Client" = "free-manga-translator-extension"
+  "X-Fmt-Auth"   = "<your FMT_AUTH_TOKEN>"
+  "ngrok-skip-browser-warning" = "1"
+}
+```
+or curl:
+```bash
+curl -s "https://<your-domain>.ngrok-free.dev/v1/health" \
+  -H "X-Fmt-Client: free-manga-translator-extension" \
+  -H "X-Fmt-Auth: <your FMT_AUTH_TOKEN>" \
+  -H "ngrok-skip-browser-warning: 1"
+```
+
+Fields worth checking in the response:
+- `commit` — will be `null` on Kaggle (see section 4 above); not a bug.
+- `warmup.status` — one of `idle` (never warmed up), `running`, `pass` (ready),
+  `fail`, `released` (GPU freed after idle), or `disabled` (only before Cell 5's
+  forced warmup POST has run this session — Kaggle sets `FMT_STARTUP_WARMUP=0`, so
+  this is expected to say `disabled` if you check *before* Cell 5 finishes).
+- `scheduler.active` — how many translation jobs are running right now.
+- `scheduler.gpu` — `total_mb`/`used_mb`/`free_mb` VRAM, straight from `nvidia-smi`.
+
+The `ngrok-skip-browser-warning` header matters over the public tunnel — without it
+you can get a 200 response that's an HTML interstitial page instead of JSON (see the
+next item for how to tell these apart automatically).
+
+### 3. VRAM and provider quota — `/v1/vram-status`, `/v1/quota-status`
+
+Same request pattern as above, different paths. `/v1/vram-status` gives the same GPU
+numbers as the popup's VRAM panel; `/v1/quota-status` gives today's per-provider usage
+counts (which providers are actually configured and how much of each is used) — useful
+if translations are unexpectedly falling back to the slower local NLLB translator.
+
+### 4. Reproduce the exact extension request — `run_remote_backend_smoke.py`
+
+This is the one tool that reproduces tunnel-specific failures the loopback Cell 5b
+can't see (since Cell 5b runs before any tunnel exists). It sends the same request
+shape the extension sends, straight at your public tunnel URL, and tells you which of
+three failure modes you're hitting: a real HTTP error from the backend, the tunnel
+host being unreachable entirely, or a 200 response that's actually an ngrok
+interstitial HTML page instead of JSON (the same trap `/v1/health` can hit, but this
+script checks for it explicitly instead of you having to notice).
+
+Run from your own machine, inside `core_pipeline/`, with your local Python environment
+(see `LOCAL_USER_MANUAL.md` for the interpreter path):
+
+```powershell
+& $py "python\diagnostics\run_remote_backend_smoke.py" --url "https://<your-domain>.ngrok-free.dev/v1/translate-image" --auth-token "<your FMT_AUTH_TOKEN>"
+```
+
+(the full path matters here too — same bare-origin trap as section 5; the script itself
+will tell you plainly if you get it wrong)
+
+### 5. GPU sanity check — `nvidia-smi`
+
+Cell 1 already prints this once at the very start of a session. If you want a fresh
+reading later (e.g. VRAM looks wrong in `/v1/vram-status`), add a new cell anywhere and
+run:
+
+```python
+import subprocess
+print(subprocess.run(["nvidia-smi"], capture_output=True, text=True).stdout)
+```
+
+### What to actually paste into chat
+
+In order of usefulness, if you're reporting a problem:
+
+1. The log-tail cell's output (item 1 above) — almost always paste this first.
+2. The `/v1/health` response (item 2) — one line, tells you warmup/scheduler state.
+3. Which cell (if any) actually failed, and its full output — Kaggle keeps this
+   visible in the notebook even after the run stops.
+4. If it's specifically "translations don't work but the notebook looks fine," the
+   `run_remote_backend_smoke.py` output (item 4) — it's built to answer exactly that.
+
+None of the above ever prints a secret value — it's all safe to paste as-is. The one
+exception is your `FMT_AUTH_TOKEN` itself if you type it directly into a command as
+shown above; don't paste the command line with the real token filled in, only its
+output.
+
+## 12. Security Notes
 
 - Kaggle Secrets are encrypted at rest and are never included if you share or fork
   the notebook — a copy of your notebook does not carry your keys with it.
@@ -368,7 +513,7 @@ table covering every cell.
   anywhere outside your own `.env` file and the provider's dashboard, rotate that key
   on the provider's dashboard before using it here.
 
-## 12. Daily Copy-Paste Checklist
+## 13. Daily Copy-Paste Checklist
 
 For when you've read all of the above once and just need the routine:
 
