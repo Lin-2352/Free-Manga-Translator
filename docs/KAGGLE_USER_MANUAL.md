@@ -50,29 +50,26 @@ zip as a private Kaggle Dataset.
 On your own machine, in the repo root:
 
 ```powershell
-robocopy core_pipeline kaggle_upload\core_pipeline /E /XD .git __pycache__ runtime_samples `
-  .venv quality_reports validation_logs training_data runtime_logs extension `
-  /XF .env "*.pyc"
-
-Compress-Archive -Path kaggle_upload\core_pipeline -DestinationPath fmt_core_pipeline.zip -Force
+.\core_pipeline\deploy\kaggle\build_kaggle_dataset.ps1
 ```
 
-This excludes secrets, dev/test artifact folders, and the extension itself (it never
-runs on Kaggle — it stays local in your browser). Expected result: a zip a few hundred
-MB to under 1GB, depending on your local test data.
+This script excludes secrets, dev/test artifact folders, and the extension itself (it
+never runs on Kaggle — it stays local in your browser). Expected result: a zip a few
+hundred MB to under 1GB, depending on your local test data — the script prints the exact
+size and warns if it looks like it accidentally picked up an excluded folder.
 
 Then on kaggle.com:
 
 1. **Create → New Dataset**.
-2. Upload `fmt_core_pipeline.zip`.
+2. Upload `fmt_core_pipeline.zip` (the file at `D:\Desktop\translator D\app\Manga Translator\fmt_core_pipeline.zip` built by the script above).
 3. Give it a name — this manual assumes `fmt-core-pipeline`.
 4. Leave visibility as **Private** (the default). Do not click "Make Public."
 5. Click **Create**.
 
-**Updating the code later:** re-run the same two commands above, then on your
-dataset's page click **New Version** and upload the fresh zip. The notebook always
-copies straight from whatever dataset version is currently attached — a code change on
-your machine has zero effect on Kaggle until you do this.
+**Updating the code later:** re-run the script above (which regenerates `D:\Desktop\translator D\app\Manga Translator\fmt_core_pipeline.zip`), then on your dataset's page click
+**New Version** and upload the fresh zip. The notebook always copies straight from
+whatever dataset version is currently attached — a code change on your machine has zero
+effect on Kaggle until you do this.
 
 ## 3. Create the 13 Kaggle Secrets
 
@@ -156,7 +153,7 @@ placeholder by hand every time.
 ## 4. Import the Notebook and Run All
 
 1. On kaggle.com, **Create → New Notebook**, then **File → Import Notebook** and
-   select `core_pipeline/deploy/kaggle/fmt_kaggle_backend.ipynb` from your machine.
+   select `D:\Desktop\translator D\app\Manga Translator\core_pipeline\deploy\kaggle\fmt_kaggle_backend.ipynb` from your machine.
 2. Confirm the checklist from section 3 is complete.
 3. Click **Run → Run All**.
 
@@ -176,6 +173,16 @@ Cell 5b is the single most important line to watch: it runs one real translation
 entirely inside the Kaggle VM, before any tunnel exists. If it passes, the pipeline
 itself works end to end and any remaining problem is tunnel or extension
 configuration, not the pipeline.
+
+**Stale-backend trap (Kaggle version):** Cell 5's health check also returns a
+`commit` field — the same one `LOCAL_USER_MANUAL.md` describes — reporting the short
+git hash of the code the running Kaggle process actually loaded. Kaggle sessions are
+long-lived: it's easy to re-run an old notebook session (or attach an outdated
+dataset version) after pushing new commits locally and not notice you're still
+testing old code. Before trusting a test result, compare Cell 5's `commit` value
+against `git rev-parse --short HEAD` from the clone you zipped into the dataset — a
+mismatch means re-zip the current code, upload a new dataset version, and re-run
+the notebook from Cell 1.
 
 **Then it will look like it's hanging on Cell 7.** This is correct, not a bug. Cell 7
 is a deliberate infinite loop that keeps the session's kernel busy while you read.
