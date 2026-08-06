@@ -47,15 +47,7 @@ credential-handling. The simplest path is to zip the code on your own machine (w
 Git LFS has already resolved the vendored model weights to real files) and upload that
 zip as a private Kaggle Dataset.
 
-From any PowerShell terminal, run this command with the full path — you don't need to
-navigate to any specific directory first:
-
-```powershell
-& "D:\Desktop\translator D\app\Manga Translator\core_pipeline\deploy\kaggle\build_kaggle_dataset.ps1"
-```
-
-**Alternative (if you prefer navigating first):** open a PowerShell terminal in the repo
-root (`D:\Desktop\translator D\app\Manga Translator`) and run:
+Navigate to your local repo root in PowerShell and run:
 
 ```powershell
 .\core_pipeline\deploy\kaggle\build_kaggle_dataset.ps1
@@ -65,20 +57,21 @@ This script excludes secrets, dev/test artifact folders, and the extension itsel
 never runs on Kaggle — it stays local in your browser). Expected result: a zip a few
 hundred MB to under 1GB, depending on your local test data — the script prints the exact
 size and warns if it looks like it accidentally picked up an excluded folder. The output
-file is saved as `D:\Desktop\translator D\app\Manga Translator\fmt_core_pipeline.zip`.
+file is saved as `fmt_core_pipeline.zip` in your repo root.
 
 Then on kaggle.com:
 
 1. **Create → New Dataset**.
-2. Upload `fmt_core_pipeline.zip` (the file at `D:\Desktop\translator D\app\Manga Translator\fmt_core_pipeline.zip` built by the script above).
+2. Upload the `fmt_core_pipeline.zip` file built by the script above.
 3. Give it a name — this manual assumes `fmt-core-pipeline`.
 4. Leave visibility as **Private** (the default). Do not click "Make Public."
 5. Click **Create**.
 
-**Updating the code later:** re-run the script above (which regenerates `D:\Desktop\translator D\app\Manga Translator\fmt_core_pipeline.zip`), then on your dataset's page click
-**New Version** and upload the fresh zip. The notebook always copies straight from
-whatever dataset version is currently attached — a code change on your machine has zero
-effect on Kaggle until you do this.
+**Updating the code later:** re-run the script above (which regenerates
+`fmt_core_pipeline.zip`), then on your dataset's page click **New Version** and upload
+the fresh zip. The notebook always copies straight from whatever dataset version is
+currently attached — a code change on your machine has zero effect on Kaggle until you
+do this.
 
 ## 3. Create the 13 Kaggle Secrets
 
@@ -162,7 +155,8 @@ placeholder by hand every time.
 ## 4. Import the Notebook and Run All
 
 1. On kaggle.com, **Create → New Notebook**, then **File → Import Notebook** and
-   select `D:\Desktop\translator D\app\Manga Translator\core_pipeline\deploy\kaggle\fmt_kaggle_backend.ipynb` from your machine.
+   select the `fmt_kaggle_backend.ipynb` file from your repo's
+   `core_pipeline/deploy/kaggle/` directory.
 2. Confirm the checklist from section 3 is complete.
 3. Click **Run → Run All**.
 
@@ -395,33 +389,3 @@ For when you've read all of the above once and just need the routine:
    changed.
 4. Read, translating pages as normal.
 5. Done reading: Cell 7 → ■ Stop → run Cell 8.
-
----
-
-## 📋 YOUR PERSONAL CONFIGURATION (LOCAL REFERENCE ONLY)
-
-**⚠️ WARNING: This section contains your personal credentials and paths. DO NOT COMMIT OR SHARE THIS SECTION.**
-
-### Your FMT_AUTH_TOKEN
-```
-Wnak75CQVg13ltjfDLXZr0icqxASpsGbYByPHTdN
-```
-Paste this into: Kaggle Secret labeled `FMT_AUTH_TOKEN` AND the extension popup's "Backend auth token" field.
-
-### Your Local Extension Location
-```
-d:\Desktop\translator D\app\Manga Translator\core_pipeline\extension
-```
-Use this path when loading the unpacked extension in Chrome/Brave (chrome://extensions → Load unpacked).
-
-### Your Build Script Commands
-
-**Full-path command (run from anywhere):**
-```powershell
-& "D:\Desktop\translator D\app\Manga Translator\core_pipeline\deploy\kaggle\build_kaggle_dataset.ps1"
-```
-
-**Output location:**
-```
-D:\Desktop\translator D\app\Manga Translator\fmt_core_pipeline.zip
-```
