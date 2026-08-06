@@ -25,3 +25,4 @@ diagnostics/**
 .DS_Store
 Thumbs.db
 CLAUDE.md
+docs/KAGGLE_USER_MANUAL.md
