@@ -47,7 +47,15 @@ credential-handling. The simplest path is to zip the code on your own machine (w
 Git LFS has already resolved the vendored model weights to real files) and upload that
 zip as a private Kaggle Dataset.
 
-On your own machine, in the repo root:
+From any PowerShell terminal, run this command with the full path — you don't need to
+navigate to any specific directory first:
+
+```powershell
+& "D:\Desktop\translator D\app\Manga Translator\core_pipeline\deploy\kaggle\build_kaggle_dataset.ps1"
+```
+
+**Alternative (if you prefer navigating first):** open a PowerShell terminal in the repo
+root (`D:\Desktop\translator D\app\Manga Translator`) and run:
 
 ```powershell
 .\core_pipeline\deploy\kaggle\build_kaggle_dataset.ps1
@@ -56,7 +64,8 @@ On your own machine, in the repo root:
 This script excludes secrets, dev/test artifact folders, and the extension itself (it
 never runs on Kaggle — it stays local in your browser). Expected result: a zip a few
 hundred MB to under 1GB, depending on your local test data — the script prints the exact
-size and warns if it looks like it accidentally picked up an excluded folder.
+size and warns if it looks like it accidentally picked up an excluded folder. The output
+file is saved as `D:\Desktop\translator D\app\Manga Translator\fmt_core_pipeline.zip`.
 
 Then on kaggle.com:
 
