@@ -603,10 +603,16 @@ class SemanticDetectionResult:
     regions: List[SemanticTextRegion]
 
 
-def detect_text(session, image: np.ndarray, cfg: MLConfig) -> TextDetectionResult:
+def _detect_text_single_pass(session, image: np.ndarray, cfg: MLConfig) -> Tuple[List[Box], np.ndarray, np.ndarray]:
     """
-    Run comic-text-detector. Returns BOTH bounding boxes AND pixel-level
-    text segmentation mask at original image resolution.
+    Run comic-text-detector on ONE untiled image (a crop, not necessarily the whole
+    page -- called once directly by detect_text below its tiling threshold, and once
+    per tile above it). Returns (boxes, scores, seg01): boxes/scores are this crop's
+    own NMS-filtered detections in this crop's own pixel space (not yet offset into
+    full-page coordinates -- the caller does that for the tiled path), and seg01 is
+    the UNDILATED binary [0,1] segmentation mask at this crop's resolution. Dilation
+    is applied once by the caller after tiles are stitched, not here -- doing it per
+    tile would double-dilate the tile-overlap band.
     """
     h_orig, w_orig = image.shape[:2]
     sx, sy = w_orig / cfg.input_size, h_orig / cfg.input_size
@@ -621,30 +627,94 @@ def detect_text(session, image: np.ndarray, cfg: MLConfig) -> TextDetectionResul
     obj = blk[:, 4]
     mask = obj > cfg.confidence_threshold
     preds, obj_filtered = blk[mask], obj[mask]
-    boxes = []
+    boxes: List[Box] = []
+    scores: List[float] = []
     if len(preds) > 0:
         cx, cy, w, h = preds[:, 0], preds[:, 1], preds[:, 2], preds[:, 3]
         corners = np.stack([cx - w/2, cy - h/2, cx + w/2, cy + h/2], axis=1)
         keep = _nms(corners, obj_filtered, cfg.nms_iou_threshold)
         corners = corners[keep]
-        for d in corners:
+        kept_scores = obj_filtered[keep]
+        for d, s in zip(corners, kept_scores):
             bx1, by1 = int(max(0, d[0]*sx)), int(max(0, d[1]*sy))
             bx2, by2 = int(min(w_orig, d[2]*sx)), int(min(h_orig, d[3]*sy))
             if bx2 > bx1 and by2 > by1:
                 boxes.append(Box(x1=bx1, y1=by1, x2=bx2, y2=by2))
+                scores.append(float(s))
 
-    # --- Process seg mask → binary at original resolution ---
+    # --- Process seg mask → binary 0/1 at this crop's own resolution (undilated) ---
     seg_binary = (seg_raw > cfg.seg_threshold).astype(np.uint8)
-    seg_resized = cv2.resize(seg_binary, (w_orig, h_orig),
-                             interpolation=cv2.INTER_NEAREST)
-    # Dilate slightly to cover anti-aliased text edges
+    seg01 = cv2.resize(seg_binary, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
+
+    return boxes, np.array(scores, dtype=np.float32), seg01
+
+
+def detect_text(session, image: np.ndarray, cfg: MLConfig) -> TextDetectionResult:
+    """
+    Run comic-text-detector. Returns BOTH bounding boxes AND pixel-level
+    text segmentation mask at original image resolution.
+
+    Below the extreme-aspect threshold (same _BUBBLE_TILE_ASPECT_THRESHOLD detect_bubbles
+    uses, deliberately -- see that constant's comment for why the two detectors must stay
+    coupled): a single untiled pass, byte-identical to the pre-tiling behavior. Above it,
+    the long axis is split into overlapping cfg.input_size-px tiles (reusing
+    _axis_tiles_local; tile size is deliberately cfg.input_size=1024, not detect_bubbles'
+    1600, so this model's seg-mask upsample factor per tile is exactly 1.0x instead of
+    ~1.56x -- 1600 was chosen for the bubble model's native scale and has no bearing here).
+    Each tile is detected independently, boxes are remapped to full-page coordinates and
+    deduped by box-IoU NMS (reusing the same _nms already used for intra-frame NMS above),
+    and the seg mask is stitched into ONE shared canvas via np.maximum -- this model
+    returns a single seg mask, not a list of per-instance masks like detect_bubbles, so a
+    naive per-tile overwrite would erase the previous tile's detections in the overlap band.
+    """
+    h, w = image.shape[:2]
+    long_side, short_side = max(h, w), max(1, min(h, w))
+
+    if (long_side / short_side) < _BUBBLE_TILE_ASPECT_THRESHOLD:
+        boxes, _scores, seg01 = _detect_text_single_pass(session, image, cfg)
+        if cfg.seg_dilate_kernel > 0:
+            kernel = np.ones((cfg.seg_dilate_kernel, cfg.seg_dilate_kernel), np.uint8)
+            seg01 = cv2.dilate(seg01, kernel, iterations=cfg.seg_dilate_iterations)
+        return TextDetectionResult(boxes=boxes, seg_mask=seg01 * 255)
+
+    vertical = h >= w
+    axis_len = h if vertical else w
+    tiles = _axis_tiles_local(axis_len, cfg.input_size, _BUBBLE_TILE_OVERLAP)
+
+    all_boxes: List[Box] = []
+    all_scores: List[float] = []
+    seg_canvas = np.zeros((h, w), dtype=np.uint8)
+    for start, end in tiles:
+        crop = image[start:end, :] if vertical else image[:, start:end]
+        if crop.size == 0:
+            continue
+        tile_boxes, tile_scores, tile_seg01 = _detect_text_single_pass(session, crop, cfg)
+        for b, s in zip(tile_boxes, tile_scores):
+            if vertical:
+                all_boxes.append(Box(x1=b.x1, y1=b.y1 + start, x2=b.x2, y2=b.y2 + start))
+            else:
+                all_boxes.append(Box(x1=b.x1 + start, y1=b.y1, x2=b.x2 + start, y2=b.y2))
+            all_scores.append(s)
+        if vertical:
+            seg_canvas[start:end, :] = np.maximum(seg_canvas[start:end, :], tile_seg01)
+        else:
+            seg_canvas[:, start:end] = np.maximum(seg_canvas[:, start:end], tile_seg01)
+
+    if all_boxes:
+        corners = np.array([[b.x1, b.y1, b.x2, b.y2] for b in all_boxes], dtype=np.float32)
+        scores_arr = np.array(all_scores, dtype=np.float32)
+        keep = _nms(corners, scores_arr, cfg.nms_iou_threshold)
+        deduped_boxes = [all_boxes[i] for i in keep]
+    else:
+        deduped_boxes = []
+
+    print(f"  [detect_text] extreme aspect ({w}x{h}) -> {len(tiles)} tiles, {len(deduped_boxes)} boxes")
+
     if cfg.seg_dilate_kernel > 0:
         kernel = np.ones((cfg.seg_dilate_kernel, cfg.seg_dilate_kernel), np.uint8)
-        seg_resized = cv2.dilate(seg_resized, kernel,
-                                 iterations=cfg.seg_dilate_iterations)
-    seg_resized = seg_resized * 255  # 0 or 255
+        seg_canvas = cv2.dilate(seg_canvas, kernel, iterations=cfg.seg_dilate_iterations)
 
-    return TextDetectionResult(boxes=boxes, seg_mask=seg_resized)
+    return TextDetectionResult(boxes=deduped_boxes, seg_mask=seg_canvas * 255)
 
 
 def detect_semantic_text_regions(
