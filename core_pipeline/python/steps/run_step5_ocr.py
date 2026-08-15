@@ -2747,7 +2747,16 @@ def _run_step5_ocr_unlocked(sample_map: dict[str, str] | None = None, samples_di
                 else: break
             bubble_masks = _filter_and_save_bubble_masks(detect_dir, bubble_masks, text_result.boxes)
 
-        if sample_ocr_language == "ch_tra":
+        # Was `== "ch_tra"`. _sample_cjk_ocr_language() used to return "ch_tra" for every
+        # Chinese sample, so that exact-equality test was the whole-page PaddleOCR path's
+        # real gate. 09eff6b changed the producer to return "ch_sim" without updating this
+        # consumer, which made the condition permanently false and turned
+        # _fallback_chinese_from_paddle into dead code -- silently demoting Chinese OCR to
+        # the per-crop EasyOCR path (measured: 0/82 empty OCR results before, 31/112 =
+        # 27.7% after, with paddleocr_ch_page_clustered vanishing from every zh sample).
+        # Use the module's own canonical predicate so producer and consumer cannot drift
+        # apart again the next time a script variant is added.
+        if _is_chinese_ocr_language(sample_ocr_language):
             final_results = _fallback_chinese_from_paddle(img_path, image, bubble_masks)
             if final_results:
                 print(f"  [paddle-ch] using {len(final_results)} clustered page OCR regions")
