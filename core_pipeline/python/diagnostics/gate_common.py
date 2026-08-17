@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import os
 import time
 import urllib.error
 import urllib.request
@@ -195,21 +196,56 @@ def iter_baseline_samples(baseline_dir: Path, required: tuple[str, ...] = ()):
         yield group_sample, entry, runtime_dir, missing
 
 
-def clear_cache(port: str = "8766") -> None:
+# Where the backend lives. Defaults reproduce the loopback behaviour every existing
+# caller relies on, so passing nothing is byte-identical to before. Set these to drive a
+# remote deployment (e.g. the Kaggle GPU behind a tunnel) instead of a local backend:
+#   FMT_GATE_BASE_URL   full origin, e.g. https://xxxx.trycloudflare.com  (no trailing /)
+#   FMT_GATE_AUTH_TOKEN value of FMT_AUTH_TOKEN on that deployment
+# Every route except /health is gated once FMT_AUTH_TOKEN is set, which any public
+# deployment must do -- so without the token a remote drive 403s on the first request.
+def _base_url(port: str = "8766", base_url: str | None = None) -> str:
+    return (base_url or os.environ.get("FMT_GATE_BASE_URL") or f"http://127.0.0.1:{port}").rstrip("/")
+
+
+def _request_headers(auth_token: str | None = None) -> dict[str, str]:
+    """Header set proven by run_remote_backend_smoke.py, the repo's only other
+    tunnel-driving code. ngrok-skip-browser-warning is harmless on loopback and on
+    cloudflared; without it an ngrok tunnel can answer with an HTML interstitial that
+    parses as neither JSON nor an image."""
+    headers = {
+        "Content-Type": "application/json",
+        "X-Fmt-Client": "free-manga-translator-extension",
+        "ngrok-skip-browser-warning": "1",
+    }
+    token = auth_token or os.environ.get("FMT_GATE_AUTH_TOKEN") or ""
+    if token:
+        headers["X-Fmt-Auth"] = token
+    return headers
+
+
+def clear_cache(port: str = "8766", base_url: str | None = None,
+                auth_token: str | None = None) -> None:
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/cache/clear",
+        f"{_base_url(port, base_url)}/v1/cache/clear",
         data=b"{}",
-        headers={"Content-Type": "application/json", "X-Fmt-Client": "free-manga-translator-extension"},
+        headers=_request_headers(auth_token),
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=60) as resp:
         resp.read()
 
 
-def drive_once(port: str, group: str, sample: str, lang: str, timeout: int = 900) -> dict:
+def drive_once(port: str, group: str, sample: str, lang: str, timeout: int = 900,
+               base_url: str | None = None, auth_token: str | None = None) -> dict:
     """POST one sample through the real backend /translate endpoint, exactly as the
     extension does. Shared by G4 (determinism) and G5 (surface health) -- previously
-    two near-identical copies of this request-building logic."""
+    two near-identical copies of this request-building logic.
+
+    The image is read from the LOCAL fixture tree and POSTed as base64, so pointing
+    base_url at a remote deployment moves only the compute -- fixtures stay here and
+    nothing needs uploading. Note the pipeline then writes its step_* artifacts on the
+    REMOTE host, so the filesystem-reading gates (G1/G2/G3, and G4's hash comparison)
+    cannot see them without fetching them back."""
     import glob
 
     matches = glob.glob(str(SAMPLES_ROOT / group / sample / "input.*"))
@@ -231,9 +267,9 @@ def drive_once(port: str, group: str, sample: str, lang: str, timeout: int = 900
     }).encode("utf-8")
 
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/translate",
+        f"{_base_url(port, base_url)}/translate",
         data=body,
-        headers={"Content-Type": "application/json", "X-Fmt-Client": "free-manga-translator-extension"},
+        headers=_request_headers(auth_token),
         method="POST",
     )
     t0 = time.time()
