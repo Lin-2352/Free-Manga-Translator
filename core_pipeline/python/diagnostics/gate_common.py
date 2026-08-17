@@ -236,7 +236,8 @@ def clear_cache(port: str = "8766", base_url: str | None = None,
 
 
 def drive_once(port: str, group: str, sample: str, lang: str, timeout: int = 900,
-               base_url: str | None = None, auth_token: str | None = None) -> dict:
+               base_url: str | None = None, auth_token: str | None = None,
+               font_family: str | None = None) -> dict:
     """POST one sample through the real backend /translate endpoint, exactly as the
     extension does. Shared by G4 (determinism) and G5 (surface health) -- previously
     two near-identical copies of this request-building logic.
@@ -245,7 +246,13 @@ def drive_once(port: str, group: str, sample: str, lang: str, timeout: int = 900
     base_url at a remote deployment moves only the compute -- fixtures stay here and
     nothing needs uploading. Note the pipeline then writes its step_* artifacts on the
     REMOTE host, so the filesystem-reading gates (G1/G2/G3, and G4's hash comparison)
-    cannot see them without fetching them back."""
+    cannot see them without fetching them back.
+
+    font_family mirrors the extension, which always sends the user's picked font
+    (background.js: fontFamily: settings.fontFamily). Left None the key is omitted
+    entirely, so every existing caller sends a byte-identical body and exercises step
+    8's DEFAULT_FONT_FAMILY path instead -- both are worth being able to drive, since
+    "one font, the one the user chose" is only really tested by sending one."""
     import glob
 
     matches = glob.glob(str(SAMPLES_ROOT / group / sample / "input.*"))
@@ -257,14 +264,17 @@ def drive_once(port: str, group: str, sample: str, lang: str, timeout: int = 900
         raw = f.read()
     data_url = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
 
-    body = json.dumps({
+    request_body: dict[str, str] = {
         "imageData": data_url,
         "sourceLanguage": lang,
         "targetLanguage": "en",
         "qualityProfile": "strict",
         "requestedOutput": "translatedImageDataUrl",
         "clientRequestId": f"gate-drive-{sample}",
-    }).encode("utf-8")
+    }
+    if font_family:
+        request_body["fontFamily"] = font_family
+    body = json.dumps(request_body).encode("utf-8")
 
     req = urllib.request.Request(
         f"{_base_url(port, base_url)}/translate",
