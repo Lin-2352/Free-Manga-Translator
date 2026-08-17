@@ -158,26 +158,41 @@ def _paddleocr_reader(language: str):
         _paddle_device = "gpu:0" if paddle.device.is_compiled_with_cuda() else "cpu"
         if os.environ.get("MANGA_PADDLE_DEVICE", "").strip().lower() == "cpu":
             _paddle_device = "cpu"
+        def _build(device: str):
+            return PaddleOCR(
+                lang=paddle_lang,
+                device=device,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+
+        # Constructing the reader gets the same "degrade, never crash" contract the import
+        # above already has. It did not: a cpu-device failure re-raised, and the CPU retry
+        # after a failed GPU init was itself unguarded -- so _paddleocr_reader could raise
+        # instead of returning None, and every caller's `if reader is None` guard never got
+        # a chance. Measured on Kaggle 2026-08-18: ja returned 200 while BOTH paddle
+        # languages returned HTTP 500 in ~8-11s (ko and zh alike, and ko never touches the
+        # Chinese page path at all), i.e. step 5 crashed outright rather than falling back.
+        # PaddleOCR 3.x also fetches its det/rec models on first construction, so this is
+        # reachable from a plain network hiccup, not just a broken wheel.
         try:
-            _PADDLEOCR_READERS[language] = PaddleOCR(
-                lang=paddle_lang,
-                device=_paddle_device,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-            )
-        except Exception as exc:
-            if _paddle_device == "cpu":
-                raise
-            print(f"  [PaddleOCR warn] {language}: GPU init failed ({exc}); falling back to CPU for this process")
-            _paddle_device = "cpu"
-            _PADDLEOCR_READERS[language] = PaddleOCR(
-                lang=paddle_lang,
-                device=_paddle_device,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-            )
+            _PADDLEOCR_READERS[language] = _build(_paddle_device)
+        except Exception as exc:  # noqa: BLE001 -- any init failure must degrade, not crash
+            if _paddle_device != "cpu":
+                print(f"  [PaddleOCR warn] {language}: GPU init failed ({type(exc).__name__}: {exc}); retrying on CPU")
+                try:
+                    _paddle_device = "cpu"
+                    _PADDLEOCR_READERS[language] = _build(_paddle_device)
+                except Exception as cpu_exc:  # noqa: BLE001
+                    exc = cpu_exc
+                else:
+                    exc = None
+            if exc is not None:
+                _PADDLEOCR_UNAVAILABLE.add(language)
+                print(f"  [PaddleOCR warn] {language}: reader init failed "
+                      f"({type(exc).__name__}: {exc}); using non-Paddle OCR fallbacks")
+                return None
         print(f"  [Model D3] PaddleOCR device: {_paddle_device}")
         print(f"  [Model D3] PaddleOCR {paddle_lang}: LOADED")
     return _PADDLEOCR_READERS[language]

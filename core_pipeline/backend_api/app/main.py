@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import hmac
+import io
 import json
 import os
 import shutil
 import subprocess
 import threading
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from .pipeline_bridge import PipelineRunError, run_pipeline_payload
@@ -27,6 +30,7 @@ from .schemas import (
 )
 from api_manager import API_MANAGER, DAILY_LIMIT_MESSAGE, ApiQuotaExhausted
 from diagnostic_logger import diagnostics_enabled, diagnostics_log_path, write_diagnostic_event
+from pipeline_paths import EXTENSION_RUNTIME_ROOT
 import run_extension_pipeline_server as legacy_bridge
 
 
@@ -203,6 +207,62 @@ def diagnostics_status() -> dict[str, Any]:
         "path": str(diagnostics_log_path()),
         "checkedAt": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# Exactly the artifacts the G1-G4 gates read, and nothing else. G1 needs step 4's
+# inpainted image and G3 needs step 8's render, so this cannot be JSON-only.
+_ARTIFACT_BUNDLE_NAMES = frozenset({
+    "input.jpg", "input.png", "input.jpeg", "input.webp",
+    "inpainted_result.jpg",
+    "layout_constraints.json", "rejected_layout_items.json",
+    "translation_results.json",
+    "ocr_results.json",
+    "typeset_report.json",
+    # step 8's render. The runtime tree calls it final_output.*; a baseline dir calls the
+    # same image rendered.png (build_baseline writes it from the HTTP response body). G3
+    # reads it under the baseline name, so ship the runtime name and rename on assembly.
+    # (only the .png -- final_output.jpg is the same render and would add ~25% transfer
+    # to every fetch, which matters on a free tunnel with a monthly bandwidth cap.)
+    "final_output.png",
+    "cleanup_status.json",
+})
+
+
+@app.get("/v1/artifacts/bundle", dependencies=_GATED)
+def artifacts_bundle() -> Response:
+    """Stream the gate-relevant runtime artifacts as one zip.
+
+    Exists because the gates read artifacts off a local filesystem, but a remote
+    (Kaggle) deployment writes them on the REMOTE host -- so a remote run leaves
+    G1/G2/G3/G4 with nothing to inspect. Pulling the tree back and extracting it into
+    the local runtime path lets every gate run completely UNMODIFIED, which is the
+    point: a green gate then means what it has always meant.
+
+    Deliberately takes no path parameter. An endpoint that serves a caller-supplied
+    path is a traversal bug waiting to happen; this one walks a fixed root and admits
+    only an allowlist of basenames, so there is no untrusted input to sanitise.
+    """
+    root = Path(EXTENSION_RUNTIME_ROOT)
+    if not root.is_dir():
+        raise HTTPException(status_code=404, detail={"code": "NO_RUNTIME_ROOT", "path": str(root)})
+
+    buf = io.BytesIO()
+    written = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and path.name in _ARTIFACT_BUNDLE_NAMES:
+                bundle.write(path, path.relative_to(root).as_posix())
+                written += 1
+
+    data = buf.getvalue()
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": 'attachment; filename="fmt_artifacts.zip"',
+            "X-Fmt-Artifact-Files": str(written),
+        },
+    )
 
 
 def _request_trace_id(request: TranslateRequest, fallback: str) -> str:
