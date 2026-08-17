@@ -72,46 +72,116 @@ LOW_RES_MAX_RENDER_SCALE = 3
 DARK_BACKGROUND_MEDIAN_LUMA = 90
 DARK_BACKGROUND_P75_LUMA = 130
 
+def _bundled_font_dir() -> str:
+    """Absolute path to the bundled fonts, which live INSIDE core_pipeline/.
+
+    This file is core_pipeline/python/steps/run_step8_typeset.py, so three dirname()
+    levels reach core_pipeline/.
+
+    They used to sit at the REPO ROOT (four levels up), one directory outside
+    core_pipeline/ -- and build_kaggle_dataset.ps1 stages only core_pipeline/*, so the
+    fonts never reached Kaggle. The cascade silently fell through to DejaVu there: no
+    error, still one font per page, just not the font anyone asked for. Keeping them
+    inside the deployable unit is what makes the Kaggle and local paths agree.
+
+    Single source of truth on purpose -- this computation used to be duplicated inline
+    below, and a move that updated only one copy is exactly the producer/consumer drift
+    that silently disabled the Chinese OCR path.
+    """
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "fonts",
+    )
+
+
 FONT_PATH = "C:/Windows/Fonts/comicbd.ttf"
 if not os.path.exists(FONT_PATH):
     FONT_PATH = "arialbd.ttf"
 if not os.path.exists(FONT_PATH):
-    # Linux: use bundled Comic Neue (open-source Comic Sans alternative, manga-style)
-    _local_font_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "fonts")
-    FONT_PATH = os.path.join(_local_font_dir, "ComicNeue-Bold.ttf")
+    # Linux/Kaggle: bundled Comic Neue (open-source Comic Sans alternative, manga-style)
+    FONT_PATH = os.path.join(_bundled_font_dir(), "ComicNeue-Bold.ttf")
 if not os.path.exists(FONT_PATH):
     FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-MODERN_REFERENCE_FONT_PATH = "C:/Windows/Fonts/comic.ttf"
-if not os.path.exists(MODERN_REFERENCE_FONT_PATH):
-    _local_font_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "fonts")
-    MODERN_REFERENCE_FONT_PATH = os.path.join(_local_font_dir, "ComicNeue-Regular.ttf")
-if not os.path.exists(MODERN_REFERENCE_FONT_PATH):
-    MODERN_REFERENCE_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-if not os.path.exists(MODERN_REFERENCE_FONT_PATH):
-    MODERN_REFERENCE_FONT_PATH = FONT_PATH
+# MODERN_REFERENCE_FONT_PATH / FLOATING_FONT_PATH / NARROW_FLOATING_FONT_PATH /
+# DENSE_FONT_PATH used to live here -- four more role-keyed cascades that
+# _font_path_for_layout() picked between PER REGION, which is what put two different
+# font families on 16 of 34 sample pages. Region role still drives font SIZE, outline
+# width and wrapping; it no longer drives font FAMILY, so these constants had no
+# remaining readers and are removed rather than left as dead code that reads as live.
 
-FLOATING_FONT_PATH = "C:/Windows/Fonts/arialbd.ttf"
-if not os.path.exists(FLOATING_FONT_PATH):
-    FLOATING_FONT_PATH = FONT_PATH
 
-NARROW_FLOATING_FONT_PATH = "C:/Windows/Fonts/arialnb.ttf"
-if not os.path.exists(NARROW_FLOATING_FONT_PATH):
-    # Was falling straight to plain DejaVu here, unlike every other font role in this
-    # file (FONT_PATH/MODERN_REFERENCE_FONT_PATH/FLOATING_FONT_PATH all try the bundled
-    # ComicNeue before DejaVu) -- on Linux/Kaggle, arialnb.ttf never exists but DejaVu
-    # always does, so this landed on plain DejaVu deterministically for every tall/narrow
-    # floating caption box while ordinary bubbles on the same page correctly used
-    # ComicNeue. FLOATING_FONT_PATH already resolves to the bundled ComicNeue-Bold on
-    # Linux (via its own fallback to FONT_PATH), so route through it instead.
-    NARROW_FLOATING_FONT_PATH = FLOATING_FONT_PATH
+# ---------------------------------------------------------------------------
+# One font per page.
+#
+# The five constants above are five INDEPENDENT role-keyed cascades, and
+# _font_path_for_layout() used to pick between them per REGION -- so a page with one
+# speech bubble plus one floating caption rendered Comic Sans Bold beside Arial Bold.
+# Measured across the 34-sample fixture suite: 16 of 34 pages (47%) shipped with two
+# different font families on the same page. Users read that as "the fonts keep
+# changing," and separately, the extension popup has had a font picker
+# (popup.html `fontSelect` -> `mangaFontStyle`) whose value was never sent to the
+# backend and never consulted here at all.
+#
+# `family` is the popup's own option value. Each entry keeps the SAME degradation
+# chain the originals used (Windows font -> bundled Comic Neue -> DejaVu), so an
+# unavailable font degrades to something legible instead of raising. Families we do
+# not ship a real file for resolve to the default rather than silently rendering as
+# something unrelated -- and _resolve_font_family() reports what it actually picked so
+# the substitution is visible in typeset_report.json rather than invisible.
+# Only families we can actually deliver. The popup used to also offer CC Wild Words,
+# Bangers and Patrick Hand; no font file for any of them exists in this repo, in the
+# extension package, or in C:/Windows/Fonts, so all three silently rendered as Comic
+# Sans. They are not re-added here: those files only ever entered this repo as a
+# byproduct of vendoring a third-party extension and were deliberately removed again in
+# b55ac43 ("Polish repository for public release"), and CC Wild Words in particular is a
+# commercial Comicraft font with no license artifact anywhere in the tree.
+#
+# Comic Neue is the default because it is the ONLY option that resolves to the identical
+# file on Windows and on Kaggle/Linux -- the other two degrade to it off-Windows, so
+# picking either of them yields different output per platform, which is the very
+# inconsistency this change exists to remove.
+FONT_FAMILY_FILES: dict[str, list[str]] = {
+    "comic neue": ["ComicNeue-Bold.ttf"],
+    "comic sans ms": ["C:/Windows/Fonts/comicbd.ttf", "ComicNeue-Bold.ttf"],
+    "arial": ["C:/Windows/Fonts/arialbd.ttf", "ComicNeue-Bold.ttf"],
+}
 
-DENSE_FONT_PATH = "C:/Windows/Fonts/arial.ttf"
-if not os.path.exists(DENSE_FONT_PATH):
-    _local_font_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "fonts")
-    DENSE_FONT_PATH = os.path.join(_local_font_dir, "ComicNeue-Regular.ttf")
-if not os.path.exists(DENSE_FONT_PATH):
-    DENSE_FONT_PATH = FONT_PATH
+DEFAULT_FONT_FAMILY = "comic neue"
+
+
+def _resolve_font_family(family: str | None) -> tuple[str, str]:
+    """Resolve a popup font-family name to a concrete, existing font file.
+
+    Returns (path, resolved_label). `resolved_label` names what was actually used --
+    it differs from the requested family when we had to fall back, and it is recorded
+    in typeset_report.json so a substitution is auditable instead of silent.
+    """
+    def _first_existing(fam: str) -> str | None:
+        for candidate in FONT_FAMILY_FILES.get(fam, []):
+            path = candidate if os.path.isabs(candidate) else os.path.join(_bundled_font_dir(), candidate)
+            if os.path.exists(path):
+                return path
+        return None
+
+    requested = (family or "").strip().lower()
+    hit = _first_existing(requested)
+    if hit:
+        return hit, requested
+
+    # Unknown family (or its files missing): fall back to DEFAULT_FONT_FAMILY rather than
+    # to raw FONT_PATH. Those are not the same thing -- FONT_PATH resolves to Comic Sans
+    # on Windows but to bundled Comic Neue on Linux/Kaggle, so returning it here made a
+    # typo'd font name render a DIFFERENT typeface per platform, and made an unknown name
+    # disagree with an omitted one. Caught by driving the real endpoint with
+    # fontFamily="Nonexistent Font": it returned comicbd.ttf while an omitted field
+    # returned ComicNeue-Bold.ttf.
+    label = f"{requested}->default" if requested else "default"
+    fallback = _first_existing(DEFAULT_FONT_FAMILY)
+    if fallback:
+        return fallback, label
+    # Last resort only if even the default family's files are missing.
+    return FONT_PATH, label
 
 
 def _external_local_mode() -> bool:
@@ -1608,13 +1678,22 @@ def _layout_text_variants(text: str) -> list[str]:
     return variants
 
 
-def _font_path_for_layout(layout: dict, text: str = "") -> str:
-    if layout.get("fallback_source") == "peppercarrot_svg" and layout.get("bubble_idx", -1) != -1:
-        return MODERN_REFERENCE_FONT_PATH
-    if _dense_external_text(text):
-        return DENSE_FONT_PATH
-    if _typeset_as_floating(layout):
-        return FLOATING_FONT_PATH
+def _font_path_for_layout(layout: dict, text: str = "", selected_font_path: str | None = None) -> str:
+    """One font for the whole page.
+
+    `selected_font_path` is resolved ONCE per page (see _resolve_font_family) and passed
+    down explicitly rather than read from a module global or env var: step 8 runs
+    IN-PROCESS and the GPU scheduler admits several requests concurrently, so any
+    process-wide font state would race between two pages that chose different fonts.
+
+    The previous per-region role branching (peppercarrot_svg / dense / floating /
+    tall-narrow-floating) is intentionally gone -- it was the mechanism that put two
+    font families on 47% of pages. Region role still drives SIZE (fit-to-box) and
+    styling like outline width, which is correct comic typesetting; it no longer drives
+    font FAMILY.
+    """
+    if selected_font_path:
+        return selected_font_path
     return FONT_PATH
 
 
@@ -2315,6 +2394,7 @@ def _find_two_region_layout(
     layout: dict,
     allowed_mask: Image.Image,
     text_style: dict,
+    selected_font_path: str | None = None,
 ) -> dict | None:
     if layout.get("bubble_idx", -1) == -1:
         return None
@@ -2344,7 +2424,10 @@ def _find_two_region_layout(
             part_layout = dict(layout)
             part_layout["green_box"] = list(part_bounds)
             part_layout["red_box"] = list(part_bounds)
-            fit = _find_mask_aware_layout(part_text, part_layout, part_mask, text_style)
+            fit = _find_mask_aware_layout(
+                part_text, part_layout, part_mask, text_style,
+                selected_font_path=selected_font_path,
+            )
             if fit["status"] == "fallback_clipped":
                 failed = True
                 break
@@ -2681,6 +2764,7 @@ def _find_mask_aware_layout(
     allowed_mask: Image.Image,
     text_style: dict,
     group_max_size_cap: int | None = None,
+    selected_font_path: str | None = None,
 ) -> dict:
     words = text.split()
     if not words:
@@ -2718,9 +2802,10 @@ def _find_mask_aware_layout(
         layout.get("fallback_source") == "peppercarrot_svg"
         and not is_floating
     )
-    font_path = _font_path_for_layout(layout, text)
-    if tall_narrow_floating:
-        font_path = NARROW_FLOATING_FONT_PATH
+    # One font for the whole page -- `tall_narrow_floating` still shapes SIZE and
+    # wrapping below, it just no longer swaps the font family (that swap, to Arial
+    # Narrow Bold, was one of the sources of same-page font mixing).
+    font_path = _font_path_for_layout(layout, text, selected_font_path)
 
     max_size = min(MAX_FONT_DIALOGUE, max(MIN_FONT_SIZE, int(bounds_height * 0.9)))
     if is_floating:
@@ -3055,13 +3140,25 @@ def _find_mask_aware_layout(
     }
 
 
-def run_step8_typeset(sample_map: dict[str, str] | None = None, samples_dir: Path | None = None):
+def run_step8_typeset(
+    sample_map: dict[str, str] | None = None,
+    samples_dir: Path | None = None,
+    font_family: str | None = None,
+):
     print("=" * 60)
     print("  Step 8 - Automated Typesetting (Mask-Aware Fit)")
     print("=" * 60)
 
     samples_dir = Path(samples_dir) if samples_dir is not None else sample_root_from_env(DEFAULT_SAMPLES_ROOT)
     sample_map = sample_map or SAMPLE_MAP
+
+    # Resolve the page font ONCE, here, and pass it down explicitly. Not a module
+    # global and not an env var: this function runs in-process and the GPU scheduler
+    # admits multiple requests concurrently, so process-wide font state would race
+    # between two pages that picked different fonts.
+    selected_font_path, resolved_font_label = _resolve_font_family(font_family or DEFAULT_FONT_FAMILY)
+    print(f"  [font] requested={font_family or DEFAULT_FONT_FAMILY!r} "
+          f"resolved={resolved_font_label!r} file={os.path.basename(selected_font_path)}")
 
     for sample_name, img_file in sample_map.items():
         sample_path = samples_dir / sample_name
@@ -3212,6 +3309,8 @@ def run_step8_typeset(sample_map: dict[str, str] | None = None, samples_dir: Pat
                         "reason": cleanup_reason,
                         "bubble_idx": layout.get("bubble_idx", -1),
                         "font_role": "floating" if _typeset_as_floating(layout) else "dialogue",
+                        "font_file": os.path.basename(selected_font_path),
+                        "font_family_resolved": resolved_font_label,
                     })
                     continue
             if force_overlay_badge:
@@ -3298,6 +3397,7 @@ def run_step8_typeset(sample_map: dict[str, str] | None = None, samples_dir: Pat
                     layout,
                     allowed_mask,
                     text_style,
+                    selected_font_path=selected_font_path,
                 )
                 if split_candidate is not None:
                     fitted_candidates.append(split_candidate)
@@ -3308,6 +3408,7 @@ def run_step8_typeset(sample_map: dict[str, str] | None = None, samples_dir: Pat
                         allowed_mask,
                         text_style,
                         group_max_size_cap=group_font_caps.get(tid),
+                        selected_font_path=selected_font_path,
                     )
                 )
                 accepted = False
@@ -3435,6 +3536,8 @@ def run_step8_typeset(sample_map: dict[str, str] | None = None, samples_dir: Pat
                 "native_size": list(native_size),
                 "output_size": [image_size[0], image_size[1]],
                 "font_role": "floating" if _typeset_as_floating(layout) else "dialogue",
+                "font_file": os.path.basename(selected_font_path),
+                "font_family_resolved": resolved_font_label,
                 "caption_backing": "feathered_haze" if caption_haze_box is not None else None,
                 "text_style": text_style["name"],
                 "background_luma_median": (

@@ -1,0 +1,197 @@
+{
+  "caseId": "zh_f91d7cc715cd_b31609eef8",
+  "labels": [
+    {
+      "id": 0,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "dialogue",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    },
+    {
+      "id": 2,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "dialogue",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    },
+    {
+      "id": 6,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "dialogue",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    },
+    {
+      "id": 7,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "dialogue",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    },
+    {
+      "id": 8,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "dialogue",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    },
+    {
+      "id": 10,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "unknown",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    },
+    {
+      "id": 12,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "unknown",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    },
+    {
+      "id": 13,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "unknown",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    },
+    {
+      "id": 15,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "dialogue",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    },
+    {
+      "id": 16,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "dialogue",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    },
+    {
+      "id": 18,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "dialogue",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    },
+    {
+      "id": 19,
+      "correctOcrText": "",
+      "correctEnglishTranslation": "",
+      "regionKind": "dialogue",
+      "regionKindOptions": [
+        "dialogue",
+        "sfx",
+        "art",
+        "device",
+        "unknown"
+      ],
+      "expectedLayoutBehavior": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "notes": "",
+      "acceptedForTraining": false
+    }
+  ]
+}

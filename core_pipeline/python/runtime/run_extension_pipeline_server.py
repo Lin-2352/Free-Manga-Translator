@@ -1129,7 +1129,8 @@ def _assert_runtime_report_safe(report: dict[str, Any]) -> None:
 
 
 def _run_runtime_pipeline(
-    sample_name: str, language: str, stop_generation: int | None = None, page_key: str = ""
+    sample_name: str, language: str, stop_generation: int | None = None, page_key: str = "",
+    font_family: str | None = None,
 ) -> dict[str, Any]:
     total_started = time.perf_counter()
     page_domain = _page_context_domain(page_key)
@@ -1172,7 +1173,7 @@ def _run_runtime_pipeline(
         run_stage("step7_translate", lambda: run_step7_translate.run_step7_translate(sample_map=sample_map, samples_dir=SAMPLES_ROOT))
         _record_page_context(page_domain, _accepted_translation_lines(SAMPLES_ROOT / sample_name))
         run_stage("step4_inpaint", lambda: run_step4_inpaint.run_step4_inpaint(sample_map=sample_map, samples_dir=SAMPLES_ROOT))
-        run_stage("step8_typeset", lambda: run_step8_typeset.run_step8_typeset(sample_map=sample_map, samples_dir=SAMPLES_ROOT))
+        run_stage("step8_typeset", lambda: run_step8_typeset.run_step8_typeset(sample_map=sample_map, samples_dir=SAMPLES_ROOT, font_family=font_family))
 
         report = _collect_runtime_report(
             sample_name,

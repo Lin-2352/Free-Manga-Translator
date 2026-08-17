@@ -397,7 +397,7 @@
 
     // Load font preference
     chrome.storage.local.get(['mangaFontStyle', 'mangaFontColor'], (result) => {
-      const font = result.mangaFontStyle || 'CC Wild Words';
+      const font = result.mangaFontStyle || 'Comic Neue';
       const color = result.mangaFontColor || '#000000';
 
       const MASK_PADDING_PX = 2;

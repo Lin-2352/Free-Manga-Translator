@@ -13,6 +13,11 @@ class TranslateRequest(BaseModel):
     qualityProfile: str = "strict"
     requestedOutput: str = "translatedImageDataUrl"
     clientRequestId: str | None = None
+    # The extension popup's "Overlay Font Style" selection (popup.html `fontSelect`,
+    # stored as `mangaFontStyle`). Optional: older extension builds omit it and step 8
+    # falls back to its default font, so this stays backward compatible. Step 8 resolves
+    # this to a concrete font file ONCE per page and uses it for every region.
+    fontFamily: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

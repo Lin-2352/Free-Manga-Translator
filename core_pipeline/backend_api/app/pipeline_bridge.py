@@ -134,6 +134,11 @@ def run_pipeline_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if quality_profile != "strict":
         raise PipelineRunError("Only strict mode is enabled for consumer-safe output.")
 
+    # Optional; absent on older extension builds, in which case step 8 uses its default.
+    font_family = payload.get("fontFamily") or payload.get("font_family") or None
+    if font_family is not None:
+        font_family = str(font_family).strip() or None
+
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     cache_id = metadata.get("cacheId") or metadata.get("cacheKey") or "no-cache-id"
     trace_id = metadata.get("traceId") or payload.get("clientRequestId") or "no-trace"
@@ -172,7 +177,8 @@ def run_pipeline_payload(payload: dict[str, Any]) -> dict[str, Any]:
                         print(f"[api] runtime output cache hit sample={sample_name}", flush=True)
                     else:
                         report = legacy_bridge._run_runtime_pipeline(
-                            sample_name, language, stop_generation=stop_generation, page_key=page_key
+                            sample_name, language, stop_generation=stop_generation, page_key=page_key,
+                            font_family=font_family,
                         )
                     report["scheduler"] = scheduler_slot.as_report()
                     translated_image = legacy_bridge._read_output_data_url(sample_name)

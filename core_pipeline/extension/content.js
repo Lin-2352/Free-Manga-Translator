@@ -48,7 +48,7 @@
   // ===== State =====
   let isEnabled = false;
   let isPaused = false;
-  let fontFamily = 'CC Wild Words';
+  let fontFamily = 'Comic Neue';
   let fontColor = '#000000';
   let autoQueueLimit = DEFAULT_AUTO_QUEUE_LIMIT;
   // Bumped by cancelPageWork(). A request captures the current generation
@@ -121,7 +121,7 @@
   chrome.storage.local.get(['translationEnabled', 'translationPaused', 'mangaFontStyle', 'mangaFontColor', 'translationQueuePages'], (result) => {
     isEnabled = result.translationEnabled === true; // OFF by default
     isPaused = result.translationPaused === true;
-    fontFamily = result.mangaFontStyle || 'CC Wild Words';
+    fontFamily = result.mangaFontStyle || 'Comic Neue';
     fontColor = result.mangaFontColor || '#000000';
     autoQueueLimit = normalizeAutoQueueLimit(result.translationQueuePages);
     if (isEnabled && !isPaused) scheduleInitialScan();
@@ -159,20 +159,23 @@
     if (document.getElementById('fmt-fonts')) return;
     const style = document.createElement('style');
     style.id = 'fmt-fonts';
+    // These used to declare CC Wild Words / Bangers / Patrick Hand, none of which were
+    // ever shipped in the extension package -- extension/fonts/ did not exist, so all
+    // three URLs 404'd and every rule silently fell through to the CSS fallback stack.
+    // Comic Neue is now actually bundled (extension/fonts/), so this rule resolves, and
+    // it is the same file the backend uses, which keeps the client-side overlay and the
+    // backend-rendered image visually consistent.
     style.textContent = `
       @font-face {
-        font-family: 'CC Wild Words';
-        src: url('${chrome.runtime.getURL('fonts/CCWildWords-Regular.otf')}') format('opentype');
+        font-family: 'Comic Neue';
+        src: url('${chrome.runtime.getURL('fonts/ComicNeue-Bold.ttf')}') format('truetype');
+        font-weight: bold;
         font-display: swap;
       }
       @font-face {
-        font-family: 'Bangers';
-        src: url('${chrome.runtime.getURL('fonts/Bangers-Regular.ttf')}') format('truetype');
-        font-display: swap;
-      }
-      @font-face {
-        font-family: 'Patrick Hand';
-        src: url('${chrome.runtime.getURL('fonts/PatrickHand-Regular.ttf')}') format('truetype');
+        font-family: 'Comic Neue';
+        src: url('${chrome.runtime.getURL('fonts/ComicNeue-Regular.ttf')}') format('truetype');
+        font-weight: normal;
         font-display: swap;
       }
     `;
@@ -397,7 +400,12 @@
     stopSpinnerLoopIfIdle();
   }
 
-  function showErrorBadge(img, message) {
+  // `title` lets a caller override the "Translation failed:" verb. The no-text outcome
+  // is not a failure -- the backend ran fine and found nothing renderable -- but it still
+  // needs a visible marker and, more importantly, this badge's click handler, which is
+  // the only path that clears translatedSrcs/pendingSrcs/retryCountMap and force-retries.
+  // Defaults to the original wording so the existing error call site is unchanged.
+  function showErrorBadge(img, message, title) {
     hideErrorBadge(img);
     injectErrorBadgeStyles();
     const rect = img.getBoundingClientRect();
@@ -405,7 +413,7 @@
     const badge = document.createElement('div');
     badge.className = 'fmt-img-error-badge';
     badge.textContent = '!';
-    badge.title = `Translation failed: ${message || 'unknown error'} (click to retry)`;
+    badge.title = title || `Translation failed: ${message || 'unknown error'} (click to retry)`;
     badge.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -1374,6 +1382,12 @@
           retryCountMap.delete(cacheKey);
           translatedSrcs.add(cacheKey);
           img.setAttribute(TRANSLATED_ATTR, 'no-text');
+          // This branch marks the image done after a SINGLE attempt and used to exit with
+          // no badge, no message and no spinner -- indistinguishable from "nothing
+          // happened", which is what "it just won't translate" actually looks like. The
+          // badge is the only way back: its click handler clears the dedup state and
+          // force-retranslates.
+          showErrorBadge(img, 'no text detected', 'No text detected on this image (click to try again)');
           cleanupProcessing(img, cacheKey);
           return;
         }
@@ -1397,6 +1411,10 @@
         retryCountMap.delete(cacheKey);
         translatedSrcs.add(cacheKey);
         img.setAttribute(TRANSLATED_ATTR, 'no-text');
+        // Same silent-exit problem as the rescue-confirmed branch above: retries really
+        // did happen, but a deterministic pipeline verdict reproduces the same nothing
+        // every time, and without this the user is never told why.
+        showErrorBadge(img, 'no text detected', `No text detected after ${MAX_RETRIES} attempts (click to try again)`);
         cleanupProcessing(img, cacheKey);
         return;
       }

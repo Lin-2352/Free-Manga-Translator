@@ -180,6 +180,7 @@ def _request_payload(request: TranslateRequest) -> dict[str, Any]:
         "qualityProfile": request.qualityProfile,
         "requestedOutput": request.requestedOutput,
         "clientRequestId": request.clientRequestId,
+        "fontFamily": request.fontFamily,
         "metadata": request.metadata,
     }
 

@@ -267,6 +267,11 @@ async function getSettings() {
     'translationQueuePages',
     'translationParallelPages',
     'translationFetchTimeoutMs',
+    // The popup's "Overlay Font Style" pick. It already drove the two client-side
+    // canvas renderers (content.js overlayTranslations, translationPanel.js) but was
+    // never sent to the backend, so it had no effect on the image the pipeline
+    // actually renders -- which is the path users see. Now forwarded with the request.
+    'mangaFontStyle',
   ]);
   const cacheLimit = Number.parseInt(result.translationCachePages, 10);
   const queueLimit = Number.parseInt(result.translationQueuePages, 10);
@@ -276,6 +281,7 @@ async function getSettings() {
     localPipelineUrl: String(result.localPipelineUrl || DEFAULT_LOCAL_PIPELINE_URL).trim() || DEFAULT_LOCAL_PIPELINE_URL,
     localPipelineLanguage: String(result.localPipelineLanguage || 'ja').trim() || 'ja',
     localPipelineAuthToken: String(result.localPipelineAuthToken || '').trim(),
+    fontFamily: String(result.mangaFontStyle || 'Comic Neue').trim() || 'Comic Neue',
     cacheLimit: Number.isFinite(cacheLimit)
       ? Math.max(0, Math.min(MAX_CACHE_LIMIT, cacheLimit))
       : DEFAULT_CACHE_LIMIT,
@@ -970,6 +976,7 @@ async function callLocalPipeline(base64Data, width, height, settings, metadata =
       qualityProfile: 'strict',
       requestedOutput: 'translatedImageDataUrl',
       clientRequestId: traceId,
+      fontFamily: settings.fontFamily,
       metadata,
     }),
   });

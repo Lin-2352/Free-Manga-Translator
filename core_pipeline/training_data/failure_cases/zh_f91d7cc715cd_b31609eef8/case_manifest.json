@@ -1,0 +1,619 @@
+{
+  "schemaVersion": "training-case-v1",
+  "caseId": "zh_f91d7cc715cd_b31609eef8",
+  "createdAt": "2026-08-07T13:44:54.401229+00:00",
+  "sampleName": "runtime_zh_86218e75dddbb9",
+  "sourceLanguage": "zh",
+  "sourceImageHash": "f91d7cc715cd53518aebdcab605daff74d91c0b1c20cf800c9021be871bdb130",
+  "exportMode": "review",
+  "reason": {
+    "warnings": [
+      "rendered_regions_below_translations=8/9"
+    ],
+    "criticalErrors": [],
+    "outputSafety": "review"
+  },
+  "artifacts": {
+    "inputImage": "artifacts/input.jpg",
+    "debugLayoutBoxes": "artifacts/debug_layout_boxes.jpg",
+    "inpaintedResult": "artifacts/inpainted_result.jpg",
+    "finalOutput": "artifacts/final_output.png"
+  },
+  "pipelineReport": {
+    "sampleName": "runtime_zh_86218e75dddbb9",
+    "sourceLanguage": "zh",
+    "pipeline": "local-8-stage",
+    "stageSequence": [
+      {
+        "step": 1,
+        "name": "text detection",
+        "artifact": "step_1_detect/detections.json"
+      },
+      {
+        "step": 2,
+        "name": "bubble and semantic routing",
+        "artifact": "step_1_detect/semantic_detections.json"
+      },
+      {
+        "step": 3,
+        "name": "text grouping and cleanup mask planning",
+        "artifact": "step_5_ocr/ocr_results.json"
+      },
+      {
+        "step": 4,
+        "name": "context-aware inpainting",
+        "artifact": "step_4_final/inpainted_result.jpg"
+      },
+      {
+        "step": 5,
+        "name": "OCR consolidation",
+        "artifact": "step_5_ocr/ocr_results.json"
+      },
+      {
+        "step": 6,
+        "name": "layout constraints",
+        "artifact": "step_6_layout/layout_constraints.json"
+      },
+      {
+        "step": 7,
+        "name": "LLM translation",
+        "artifact": "step_7_translate/translation_results.json"
+      },
+      {
+        "step": 8,
+        "name": "typeset final image",
+        "artifact": "step_8_typeset/final_output.png"
+      }
+    ],
+    "stageArtifacts": {
+      "step_1": "D:\\Desktop\\translator D\\app\\agent_please_ignore_this_folder_for_now\\Free Manga Translator\\core_pipeline\\runtime_samples\\extension\\runtime_zh_86218e75dddbb9\\step_1_detect\\detections.json",
+      "step_2": "D:\\Desktop\\translator D\\app\\agent_please_ignore_this_folder_for_now\\Free Manga Translator\\core_pipeline\\runtime_samples\\extension\\runtime_zh_86218e75dddbb9\\step_1_detect\\semantic_detections.json",
+      "step_3": "D:\\Desktop\\translator D\\app\\agent_please_ignore_this_folder_for_now\\Free Manga Translator\\core_pipeline\\runtime_samples\\extension\\runtime_zh_86218e75dddbb9\\step_5_ocr\\ocr_results.json",
+      "step_4": "D:\\Desktop\\translator D\\app\\agent_please_ignore_this_folder_for_now\\Free Manga Translator\\core_pipeline\\runtime_samples\\extension\\runtime_zh_86218e75dddbb9\\step_4_final\\inpainted_result.jpg",
+      "step_5": "D:\\Desktop\\translator D\\app\\agent_please_ignore_this_folder_for_now\\Free Manga Translator\\core_pipeline\\runtime_samples\\extension\\runtime_zh_86218e75dddbb9\\step_5_ocr\\ocr_results.json",
+      "step_6": "D:\\Desktop\\translator D\\app\\agent_please_ignore_this_folder_for_now\\Free Manga Translator\\core_pipeline\\runtime_samples\\extension\\runtime_zh_86218e75dddbb9\\step_6_layout\\layout_constraints.json",
+      "step_7": "D:\\Desktop\\translator D\\app\\agent_please_ignore_this_folder_for_now\\Free Manga Translator\\core_pipeline\\runtime_samples\\extension\\runtime_zh_86218e75dddbb9\\step_7_translate\\translation_results.json",
+      "step_8": "D:\\Desktop\\translator D\\app\\agent_please_ignore_this_folder_for_now\\Free Manga Translator\\core_pipeline\\runtime_samples\\extension\\runtime_zh_86218e75dddbb9\\step_8_typeset\\final_output.png"
+    },
+    "missingStageArtifacts": [],
+    "ocrItems": 20,
+    "layoutConstraints": 9,
+    "rejectedLayoutItems": 11,
+    "rawTranslations": 20,
+    "translations": 9,
+    "placeholderTranslations": 0,
+    "renderedRegions": 8,
+    "typesetStatuses": [
+      "fit",
+      "fit",
+      "fit",
+      "fit",
+      "fit",
+      "fit",
+      "fit",
+      "fit"
+    ],
+    "stageTimings": [
+      {
+        "stage": "step5_ocr",
+        "seconds": 119.647
+      },
+      {
+        "stage": "step6_layout",
+        "seconds": 0.834
+      },
+      {
+        "stage": "step7_translate",
+        "seconds": 3.563
+      },
+      {
+        "stage": "step4_inpaint",
+        "seconds": 64.634
+      },
+      {
+        "stage": "step8_typeset",
+        "seconds": 56.267
+      }
+    ],
+    "totalSeconds": 251.911,
+    "runtimeOutputCache": "miss",
+    "translationServingProviders": [
+      "mistral:mistral-large-latest"
+    ],
+    "translationSourceCounts": {
+      "api": 10,
+      "skipped": 10
+    },
+    "rescueAttempted": false,
+    "rescueMode": null,
+    "rescueSucceeded": false,
+    "rescueRegions": 0,
+    "reviewWarnings": [
+      "rendered_regions_below_translations=8/9"
+    ],
+    "outputSafety": "review",
+    "noRenderableText": false
+  },
+  "regions": [
+    {
+      "id": 0,
+      "reasons": [
+        "layout_rejected:title_logo",
+        "missing_layout_constraint"
+      ],
+      "inputCrop": "regions/region_000_input.jpg",
+      "inpaintedCrop": "regions/region_000_inpainted.jpg",
+      "finalCrop": "regions/region_000_final.jpg",
+      "sourceText": "唤咿",
+      "currentEnglish": "Huh?",
+      "translationSource": "api",
+      "regionKindGuess": "dialogue",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 670,
+          "y1": 276,
+          "x2": 761,
+          "y2": 331,
+          "width": 91,
+          "height": 55
+        },
+        "redBox": null,
+        "eraseBoxes": [],
+        "greenBox": null,
+        "greenPolygon": []
+      },
+      "metadata": {
+        "ocrProvider": "paddleocr_ch_rescue",
+        "ocrConfidence": 0.575,
+        "route": "floating_dialogue",
+        "bubbleIdx": -1,
+        "maskMode": "",
+        "layoutAdjustment": ""
+      }
+    },
+    {
+      "id": 2,
+      "reasons": [
+        "layout_rejected:title_logo",
+        "missing_layout_constraint",
+        "missing_translation"
+      ],
+      "inputCrop": "regions/region_002_input.jpg",
+      "inpaintedCrop": "regions/region_002_inpainted.jpg",
+      "finalCrop": "regions/region_002_final.jpg",
+      "sourceText": "",
+      "currentEnglish": "",
+      "translationSource": "skipped",
+      "regionKindGuess": "dialogue",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 231,
+          "y1": 1117,
+          "x2": 272,
+          "y2": 1142,
+          "width": 41,
+          "height": 25
+        },
+        "redBox": null,
+        "eraseBoxes": [],
+        "greenBox": null,
+        "greenPolygon": []
+      },
+      "metadata": {
+        "ocrProvider": "easyocr_ch_sim",
+        "ocrConfidence": 0.0,
+        "route": "floating_dialogue",
+        "bubbleIdx": -1,
+        "maskMode": "",
+        "layoutAdjustment": ""
+      }
+    },
+    {
+      "id": 6,
+      "reasons": [
+        "layout_rejected:classification_noise",
+        "missing_layout_constraint",
+        "missing_translation"
+      ],
+      "inputCrop": "regions/region_006_input.jpg",
+      "inpaintedCrop": "regions/region_006_inpainted.jpg",
+      "finalCrop": "regions/region_006_final.jpg",
+      "sourceText": "",
+      "currentEnglish": "",
+      "translationSource": "skipped",
+      "regionKindGuess": "dialogue",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 585,
+          "y1": 2385,
+          "x2": 642,
+          "y2": 2430,
+          "width": 57,
+          "height": 45
+        },
+        "redBox": null,
+        "eraseBoxes": [],
+        "greenBox": null,
+        "greenPolygon": []
+      },
+      "metadata": {
+        "ocrProvider": "easyocr_ch_sim",
+        "ocrConfidence": 0.0,
+        "route": "floating_dialogue",
+        "bubbleIdx": -1,
+        "maskMode": "",
+        "layoutAdjustment": ""
+      }
+    },
+    {
+      "id": 7,
+      "reasons": [
+        "layout_rejected:classification_noise",
+        "missing_layout_constraint",
+        "missing_translation"
+      ],
+      "inputCrop": "regions/region_007_input.jpg",
+      "inpaintedCrop": "regions/region_007_inpainted.jpg",
+      "finalCrop": "regions/region_007_final.jpg",
+      "sourceText": "",
+      "currentEnglish": "",
+      "translationSource": "skipped",
+      "regionKindGuess": "dialogue",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 515,
+          "y1": 2401,
+          "x2": 575,
+          "y2": 2487,
+          "width": 60,
+          "height": 86
+        },
+        "redBox": null,
+        "eraseBoxes": [],
+        "greenBox": null,
+        "greenPolygon": []
+      },
+      "metadata": {
+        "ocrProvider": "easyocr_ch_sim",
+        "ocrConfidence": 0.0,
+        "route": "floating_dialogue",
+        "bubbleIdx": -1,
+        "maskMode": "",
+        "layoutAdjustment": ""
+      }
+    },
+    {
+      "id": 8,
+      "reasons": [
+        "layout_rejected:classification_noise",
+        "missing_layout_constraint",
+        "missing_translation"
+      ],
+      "inputCrop": "regions/region_008_input.jpg",
+      "inpaintedCrop": "regions/region_008_inpainted.jpg",
+      "finalCrop": "regions/region_008_final.jpg",
+      "sourceText": "",
+      "currentEnglish": "",
+      "translationSource": "skipped",
+      "regionKindGuess": "dialogue",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 468,
+          "y1": 2738,
+          "x2": 508,
+          "y2": 2780,
+          "width": 40,
+          "height": 42
+        },
+        "redBox": null,
+        "eraseBoxes": [],
+        "greenBox": null,
+        "greenPolygon": []
+      },
+      "metadata": {
+        "ocrProvider": "easyocr_ch_sim",
+        "ocrConfidence": 0.0,
+        "route": "floating_dialogue",
+        "bubbleIdx": -1,
+        "maskMode": "",
+        "layoutAdjustment": ""
+      }
+    },
+    {
+      "id": 10,
+      "reasons": [
+        "layout_rejected:classification_noise",
+        "missing_layout_constraint",
+        "missing_translation"
+      ],
+      "inputCrop": "regions/region_010_input.jpg",
+      "inpaintedCrop": "regions/region_010_inpainted.jpg",
+      "finalCrop": "regions/region_010_final.jpg",
+      "sourceText": "",
+      "currentEnglish": "",
+      "translationSource": "skipped",
+      "regionKindGuess": "unknown",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 342,
+          "y1": 4831,
+          "x2": 352,
+          "y2": 4861,
+          "width": 10,
+          "height": 30
+        },
+        "redBox": null,
+        "eraseBoxes": [],
+        "greenBox": null,
+        "greenPolygon": []
+      },
+      "metadata": {
+        "ocrProvider": "easyocr_ch_sim",
+        "ocrConfidence": 0.0,
+        "route": "bubble_dialogue",
+        "bubbleIdx": 1,
+        "maskMode": "",
+        "layoutAdjustment": ""
+      }
+    },
+    {
+      "id": 12,
+      "reasons": [
+        "layout_rejected:classification_noise",
+        "missing_layout_constraint",
+        "missing_translation"
+      ],
+      "inputCrop": "regions/region_012_input.jpg",
+      "inpaintedCrop": "regions/region_012_inpainted.jpg",
+      "finalCrop": "regions/region_012_final.jpg",
+      "sourceText": "",
+      "currentEnglish": "",
+      "translationSource": "skipped",
+      "regionKindGuess": "unknown",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 764,
+          "y1": 5097,
+          "x2": 786,
+          "y2": 5149,
+          "width": 22,
+          "height": 52
+        },
+        "redBox": null,
+        "eraseBoxes": [],
+        "greenBox": null,
+        "greenPolygon": []
+      },
+      "metadata": {
+        "ocrProvider": "easyocr_ch_sim",
+        "ocrConfidence": 0.0,
+        "route": "bubble_dialogue",
+        "bubbleIdx": 2,
+        "maskMode": "",
+        "layoutAdjustment": ""
+      }
+    },
+    {
+      "id": 13,
+      "reasons": [
+        "layout_rejected:classification_noise",
+        "missing_layout_constraint",
+        "missing_translation"
+      ],
+      "inputCrop": "regions/region_013_input.jpg",
+      "inpaintedCrop": "regions/region_013_inpainted.jpg",
+      "finalCrop": "regions/region_013_final.jpg",
+      "sourceText": "",
+      "currentEnglish": "",
+      "translationSource": "skipped",
+      "regionKindGuess": "unknown",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 700,
+          "y1": 5141,
+          "x2": 747,
+          "y2": 5257,
+          "width": 47,
+          "height": 116
+        },
+        "redBox": null,
+        "eraseBoxes": [],
+        "greenBox": null,
+        "greenPolygon": []
+      },
+      "metadata": {
+        "ocrProvider": "easyocr_ch_sim",
+        "ocrConfidence": 0.0,
+        "route": "bubble_dialogue",
+        "bubbleIdx": 2,
+        "maskMode": "",
+        "layoutAdjustment": ""
+      }
+    },
+    {
+      "id": 15,
+      "reasons": [
+        "layout_rejected:classification_noise",
+        "missing_layout_constraint",
+        "missing_translation"
+      ],
+      "inputCrop": "regions/region_015_input.jpg",
+      "inpaintedCrop": "regions/region_015_inpainted.jpg",
+      "finalCrop": "regions/region_015_final.jpg",
+      "sourceText": "",
+      "currentEnglish": "",
+      "translationSource": "skipped",
+      "regionKindGuess": "dialogue",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 661,
+          "y1": 6082,
+          "x2": 717,
+          "y2": 6145,
+          "width": 56,
+          "height": 63
+        },
+        "redBox": null,
+        "eraseBoxes": [],
+        "greenBox": null,
+        "greenPolygon": []
+      },
+      "metadata": {
+        "ocrProvider": "easyocr_ch_sim",
+        "ocrConfidence": 0.0,
+        "route": "floating_dialogue",
+        "bubbleIdx": -1,
+        "maskMode": "",
+        "layoutAdjustment": ""
+      }
+    },
+    {
+      "id": 16,
+      "reasons": [
+        "layout_not_rendered"
+      ],
+      "inputCrop": "regions/region_016_input.jpg",
+      "inpaintedCrop": "regions/region_016_inpainted.jpg",
+      "finalCrop": "regions/region_016_final.jpg",
+      "sourceText": "停頓",
+      "currentEnglish": "...",
+      "translationSource": "api",
+      "regionKindGuess": "dialogue",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 242,
+          "y1": 6191,
+          "x2": 307,
+          "y2": 6251,
+          "width": 65,
+          "height": 60
+        },
+        "redBox": [
+          242,
+          6191,
+          307,
+          6251
+        ],
+        "eraseBoxes": [],
+        "greenBox": [
+          238,
+          6187,
+          310,
+          6254
+        ],
+        "greenPolygon": [
+          [
+            238,
+            6187
+          ],
+          [
+            310,
+            6187
+          ],
+          [
+            310,
+            6254
+          ],
+          [
+            238,
+            6254
+          ]
+        ]
+      },
+      "metadata": {
+        "ocrProvider": "paddleocr_ch_rescue",
+        "ocrConfidence": 0.9066,
+        "route": "floating_dialogue",
+        "bubbleIdx": -1,
+        "maskMode": "stroke",
+        "layoutAdjustment": ""
+      }
+    },
+    {
+      "id": 18,
+      "reasons": [
+        "layout_rejected:floating_too_small",
+        "missing_layout_constraint",
+        "missing_translation"
+      ],
+      "inputCrop": "regions/region_018_input.jpg",
+      "inpaintedCrop": "regions/region_018_inpainted.jpg",
+      "finalCrop": "regions/region_018_final.jpg",
+      "sourceText": "",
+      "currentEnglish": "",
+      "translationSource": "skipped",
+      "regionKindGuess": "dialogue",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 492,
+          "y1": 6362,
+          "x2": 509,
+          "y2": 6390,
+          "width": 17,
+          "height": 28
+        },
+        "redBox": null,
+        "eraseBoxes": [],
+        "greenBox": null,
+        "greenPolygon": []
+      },
+      "metadata": {
+        "ocrProvider": "easyocr_ch_sim",
+        "ocrConfidence": 0.0,
+        "route": "floating_dialogue",
+        "bubbleIdx": -1,
+        "maskMode": "",
+        "layoutAdjustment": ""
+      }
+    },
+    {
+      "id": 19,
+      "reasons": [
+        "layout_rejected:credit",
+        "missing_layout_constraint",
+        "missing_translation"
+      ],
+      "inputCrop": "regions/region_019_input.jpg",
+      "inpaintedCrop": "regions/region_019_inpainted.jpg",
+      "finalCrop": "regions/region_019_final.jpg",
+      "sourceText": "",
+      "currentEnglish": "",
+      "translationSource": "skipped",
+      "regionKindGuess": "dialogue",
+      "expectedLayoutBehaviorGuess": "keep_translation_near_original_text_and_avoid_unrelated_character_art",
+      "boxes": {
+        "ocrBox": {
+          "x1": 154,
+          "y1": 6656,
+          "x2": 206,
+          "y2": 6688,
+          "width": 52,
+          "height": 32
+        },
+        "redBox": null,
+        "eraseBoxes": [],
+        "greenBox": null,
+        "greenPolygon": []
+      },
+      "metadata": {
+        "ocrProvider": "easyocr_ch_sim",
+        "ocrConfidence": 0.0,
+        "route": "floating_dialogue",
+        "bubbleIdx": -1,
+        "maskMode": "",
+        "layoutAdjustment": ""
+      }
+    }
+  ]
+}
