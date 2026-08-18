@@ -39,6 +39,11 @@ import cv2
 import numpy as np
 import os
 
+# Sentinel handle used to route model calls to a remote GPU. Imported at module
+# scope so the isinstance() checks in detect_* are cheap; the module itself pulls
+# nothing heavier than cv2/numpy, both already imported above.
+from gpu_bridge_backend import RemoteHandle
+
 # ===================================================================
 # EMERGENCY CUDA DLL INJECTION (Windows Fix)
 # ===================================================================
@@ -234,6 +239,14 @@ class MLConfig:
 
 def load_text_model(model_path: str, allow_cpu: bool = False):
     """Load ONNX text detector. STRICT CUDA-only."""
+    from gpu_bridge_backend import RemoteHandle, bridge_enabled
+    if bridge_enabled():
+        # Return WITHOUT touching onnxruntime: creating a CUDAExecutionProvider session
+        # here would put a CUDA context on this machine even though inference happens
+        # remotely, which is exactly what offloading is supposed to avoid.
+        print("  [Model A] Text detector: REMOTE (gpu bridge)")
+        return RemoteHandle("text")
+
     import onnxruntime as ort
 
     try:
@@ -252,6 +265,11 @@ def load_text_model(model_path: str, allow_cpu: bool = False):
 
 
 def load_semantic_model(model_path: str, allow_cpu: bool = False):
+    from gpu_bridge_backend import RemoteHandle, bridge_enabled
+    if bridge_enabled():
+        print("  [Model A-S] Magi: REMOTE (gpu bridge)")
+        return RemoteHandle("semantic")
+
     import transformers
     from transformers import AutoModel, AutoConfig
     from huggingface_hub import hf_hub_download
@@ -667,6 +685,17 @@ def detect_text(session, image: np.ndarray, cfg: MLConfig) -> TextDetectionResul
     returns a single seg mask, not a list of per-instance masks like detect_bubbles, so a
     naive per-tile overwrite would erase the previous tile's detections in the overlap band.
     """
+    if isinstance(session, RemoteHandle):
+        # The whole call goes over the bridge, tiling included -- the server runs this
+        # same function against a real session, so extreme-aspect handling stays in one
+        # place instead of being forked across the wire.
+        from gpu_bridge_backend import remote_detect_text
+        raw_boxes, seg = remote_detect_text(image, cfg)
+        return TextDetectionResult(
+            boxes=[Box(x1, y1, x2, y2) for (x1, y1, x2, y2) in raw_boxes],
+            seg_mask=seg,
+        )
+
     h, w = image.shape[:2]
     long_side, short_side = max(h, w), max(1, min(h, w))
 
@@ -729,6 +758,20 @@ def detect_semantic_text_regions(
     score indicating whether the text is dialogue (high) or non-dialogue/SFX (low).
     We now extract this alongside the bounding boxes for more informed routing.
     """
+    if isinstance(semantic_model, RemoteHandle):
+        from gpu_bridge_backend import remote_detect_semantic
+        return SemanticDetectionResult(regions=[
+            SemanticTextRegion(
+                box=Box(*r["box"]),
+                class_id=int(r["class_id"]),
+                raw_class_name=r["raw_class_name"],
+                semantic_class=r["semantic_class"],
+                action=r["action"],
+                confidence=float(r["confidence"]),
+            )
+            for r in remote_detect_semantic(image, cfg)
+        ])
+
     import torch
     from PIL import Image
 
@@ -791,6 +834,13 @@ def detect_semantic_text_regions(
 
 def load_bubble_model(model_path: str, allow_cpu: bool = False):
     """Load YOLOv11n bubble segmentor. STRICT CUDA-only."""
+    from gpu_bridge_backend import RemoteHandle, bridge_enabled
+    if bridge_enabled():
+        # Returns the same (model, device) SHAPE every caller unpacks; "remote" stands in
+        # for the cuda device string so no call site needs to special-case the tuple.
+        print("  [Model B] Bubble segmentor: REMOTE (gpu bridge)")
+        return RemoteHandle("bubble"), "remote"
+
     import torch
     from ultralytics import YOLO
 
@@ -940,6 +990,10 @@ def detect_bubbles(
     back into full-page coordinates, and duplicate detections from the tile overlap are
     deduped by mask IoU.
     """
+    if isinstance(model, RemoteHandle):
+        from gpu_bridge_backend import remote_detect_bubbles
+        return remote_detect_bubbles(image, cfg)
+
     h, w = image.shape[:2]
     long_side, short_side = max(h, w), max(1, min(h, w))
     if (long_side / short_side) < _BUBBLE_TILE_ASPECT_THRESHOLD:
