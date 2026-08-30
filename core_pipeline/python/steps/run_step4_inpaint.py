@@ -267,10 +267,14 @@ def _bridge_enabled() -> bool:
 
 def _load_anime_lama_model(model_path: Path = ANIME_LAMA_PATH):
     if _bridge_enabled():
-        # (None, None) is this function's existing "not available, use ONNX LaMa" signal,
-        # and ONNX LaMa is bridged -- so floating text still gets inpainted, remotely.
-        print("  [AnimeLaMa] bridge enabled; deferring to remote LaMa")
-        return None, None
+        # Deliberately NOT (None, None). That is the "unavailable" signal, and while it is
+        # crash-safe -- every consumer guards it -- it downgrades floating-text inpainting
+        # to ONNX LaMa at all nine _anime_lama_local_crop call sites. Returning a handle
+        # keeps the full-quality path and confines the remote dispatch to one place,
+        # _anime_lama_inpaint below.
+        from gpu_bridge_backend import RemoteHandle
+        print("  [AnimeLaMa] floating-text inpainter: REMOTE (gpu bridge)")
+        return RemoteHandle("anime_lama"), "remote"
     if torch is None:
         print("  [AnimeLaMa] torch unavailable; floating text will use ONNX LaMa fallback")
         return None, None
@@ -380,6 +384,13 @@ def _pad_to_modulo(arr: np.ndarray, modulo: int = 8, is_mask: bool = False) -> n
 
 
 def _anime_lama_inpaint(anime_model, anime_device, crop_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    # Single dispatch point for all nine _anime_lama_local_crop call sites. Padding stays
+    # server-side with the weights, matching lama_inpaint's split in ml_region_lib.
+    from gpu_bridge_backend import RemoteHandle
+    if isinstance(anime_model, RemoteHandle):
+        from gpu_bridge_backend import remote_inpaint
+        return remote_inpaint(crop_bgr, mask, variant="anime_lama")
+
     crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
     crop_rgb = _pad_to_modulo(crop_rgb, modulo=8, is_mask=False)
     mask_pad = _pad_to_modulo(mask, modulo=8, is_mask=True)

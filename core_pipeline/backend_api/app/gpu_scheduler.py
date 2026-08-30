@@ -182,6 +182,21 @@ class AdaptiveGpuScheduler:
             return None
 
     def gpu_memory(self) -> GpuMemory | None:
+        if os.environ.get("FMT_GPU_BRIDGE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            # Under the bridge every model runs on Kaggle, so LOCAL free VRAM says nothing
+            # about whether a job can proceed -- a card full of some other application
+            # would otherwise throttle work that never touches it.
+            #
+            # Returning None is not a bypass: _capacity_for_memory maps it to capacity 1
+            # ("sequential_no_gpu_memory_probe"), which is the correct capacity anyway,
+            # because the bridge serialises jobs at max_concurrent=1 regardless.
+            #
+            # It also removes a real hazard to the whole point of the bridge: the
+            # _torch_memory fallback below calls torch.cuda.mem_get_info(), which
+            # INITIALISES a local CUDA context. That would put a python process on the
+            # local GPU and falsify the "laptop GPU untouched" measurement -- from the
+            # scheduler, not from any model.
+            return None
         ttl = self._gpu_probe_ttl_seconds
         now = time.perf_counter()
         if ttl > 0:

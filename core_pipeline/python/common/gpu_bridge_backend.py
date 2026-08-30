@@ -185,3 +185,62 @@ def remote_inpaint(image: np.ndarray, mask: np.ndarray, variant: str = "lama_onn
     )
     raw = np.frombuffer(base64.b64decode(out["image"]), dtype=np.uint8)
     return cv2.imdecode(raw, cv2.IMREAD_COLOR)
+
+
+TASK_EASYOCR_READTEXT = "fmt_easyocr_readtext"
+
+
+class RemoteEasyOCR:
+    """A stand-in for an easyocr.Reader that forwards .readtext() over the bridge.
+
+    Unlike RemoteHandle this one is deliberately NOT inert. easyocr's reader is consumed
+    at two call sites that pass a dozen tuning kwargs each (contrast_ths, text_threshold,
+    low_text, link_threshold, ...) and read back (bbox, text, confidence) triples. Making
+    the handle quack like a Reader keeps those thresholds where they are -- forwarding the
+    kwargs verbatim -- instead of forking easyocr's tuning across the wire, which is the
+    same "one implementation" rule fmt_bridge_tasks.py follows for tiling and NMS.
+
+    ko/zh depend on this: PaddleOCR cannot run on Kaggle (paddlex needs a non-headless
+    opencv the notebook rejects), so _paddleocr_reader returns None under the bridge and
+    easyocr is the ONLY recogniser those languages have remotely.
+    """
+
+    __slots__ = ("language",)
+
+    def __init__(self, language: str):
+        self.language = language
+
+    def __repr__(self) -> str:
+        return f"<RemoteEasyOCR {self.language}>"
+
+    def readtext(self, image, **kwargs):
+        # `image` here is an RGB ndarray variant (a contrast/threshold rescue variant),
+        # not a path -- encode_image handles the array form.
+        out = get_bridge().run(
+            TASK_EASYOCR_READTEXT,
+            {"image": encode_image(image), "language": self.language, "kwargs": kwargs},
+            max_wait=1800.0,
+        )
+        # Rebuild the exact shape easyocr returns for detail=1: (bbox, text, confidence),
+        # bbox being 4 [x, y] corner pairs. JSON gave us lists; the consumers index rather
+        # than type-check, so lists are fine, but the triple must stay a tuple-of-3.
+        return [(r["bbox"], r["text"], float(r["confidence"])) for r in out["results"]]
+
+
+def remote_manga_ocr(pil_image) -> str:
+    """One manga-ocr recognition. Returns the recognised string.
+
+    Not batched, unlike remote_ocr_batch: the manga-ocr call site (read_pil) is invoked
+    once per region from inside a loop that also decides, per region, whether to retry
+    inverted -- so there is no batch to form without restructuring step 5's control flow.
+    """
+    import numpy as _np
+    rgb = _np.array(pil_image.convert("RGB"))
+    bgr = rgb[:, :, ::-1]
+    out = get_bridge().run(
+        TASK_OCR_BATCH,
+        {"crops": [encode_image(bgr)], "language": "", "engine": "manga_ocr"},
+        max_wait=1800.0,
+    )
+    results = out["results"]
+    return results[0] if results else ""

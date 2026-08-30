@@ -113,8 +113,8 @@ def _easyocr_reader(language: str):
         # Never construct EasyOCR locally under the bridge: Reader(..., gpu=True) builds
         # its detector+recogniser on CUDA at construction, so merely creating it puts a
         # context on the local card even if every readtext() call is remote.
-        from gpu_bridge_backend import RemoteHandle
-        return RemoteHandle(f"easyocr:{language}")
+        from gpu_bridge_backend import RemoteEasyOCR
+        return RemoteEasyOCR(language)
 
     if language not in _EASYOCR_READERS:
         import easyocr
@@ -128,8 +128,14 @@ def _paddleocr_reader(language: str):
     if language not in {"ko", "ch"}:
         return None
     if _bridge_enabled():
-        from gpu_bridge_backend import RemoteHandle
-        return RemoteHandle(f"paddleocr:{language}")
+        # Not RemoteHandle: every consumer calls .predict() on this, and an inert handle
+        # would AttributeError. None is the existing "engine unavailable" signal and is
+        # guarded at all four call sites. This is honest rather than merely convenient --
+        # PaddleOCR does not work on Kaggle at all (paddlex requires a non-headless
+        # opencv build the bridge notebook's smoke test rejects), so ko/zh fall back to
+        # EasyOCR remotely, which measures worse. See KAGGLE docs on the paddlex conflict.
+        print(f"  [Model D3] PaddleOCR {language}: UNAVAILABLE under gpu bridge; EasyOCR only")
+        return None
     if language in _PADDLEOCR_UNAVAILABLE:
         return None
     if language not in _PADDLEOCR_READERS:
@@ -937,13 +943,21 @@ class LocalCjkOcr:
 
         global _MANGA_OCR_MODEL
         crop_rgb = np.array(pil_image.convert("RGB"))
+        _remote_ocr = None
+        if _bridge_enabled():
+            # self.manga_ocr_model is a RemoteHandle here (see load_ocr_model), which is
+            # inert by design and not callable -- so the call has to be routed, not the
+            # handle made magic.
+            from gpu_bridge_backend import remote_manga_ocr as _remote_ocr
         if not self.language:
             crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
             if _crop_dark_flat_background(crop_bgr, seg_crop):
                 inverted = Image.fromarray(255 - crop_rgb)
-                text = self.manga_ocr_model(inverted)
+                text = (_remote_ocr(inverted) if _remote_ocr
+                        else self.manga_ocr_model(inverted))
                 return {"text": text, "provider": "manga_ocr_inverted", "confidence": None}
-            text = self.manga_ocr_model(pil_image)
+            text = (_remote_ocr(pil_image) if _remote_ocr
+                    else self.manga_ocr_model(pil_image))
             return {"text": text, "provider": "manga_ocr", "confidence": None}
 
         def _run_easyocr(rgb_variant):
