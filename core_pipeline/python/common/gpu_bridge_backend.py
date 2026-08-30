@@ -40,6 +40,8 @@ BRIDGE_CLIENT_PATH_ENV = "FMT_GPU_BRIDGE_CLIENT"
 TASK_DETECT_TEXT = "fmt_detect_text"
 TASK_DETECT_BUBBLES = "fmt_detect_bubbles"
 TASK_DETECT_SEMANTIC = "fmt_detect_semantic"
+TASK_OCR_BATCH = "fmt_ocr_batch"
+TASK_INPAINT = "fmt_inpaint"
 
 _BRIDGE = None
 
@@ -154,3 +156,32 @@ def remote_detect_semantic(image: np.ndarray, cfg: Any) -> list:
         max_wait=900.0,
     )
     return out["regions"]
+
+
+def remote_ocr_batch(crops: list, language: str, engine: str = "manga_ocr") -> list:
+    """OCR N crops in ONE round trip; returns N result dicts.
+
+    Batched deliberately. A page can carry dozens of text regions, and one request per
+    crop through a tunnel serialised at max_concurrent=1 would make the round trips, not
+    the GPU, the whole cost of step 5. Sending the crops together keeps it to one.
+    """
+    out = get_bridge().run(
+        TASK_OCR_BATCH,
+        {"crops": [encode_image(c) for c in crops],
+         "language": language, "engine": engine},
+        max_wait=1800.0,
+    )
+    return out["results"]
+
+
+def remote_inpaint(image: np.ndarray, mask: np.ndarray, variant: str = "lama_onnx"):
+    """Inpaint one page remotely. `variant` selects which inpainter the server uses
+    (lama_onnx / anime_lama / manga_cleaner), so the local variant-selection logic stays
+    authoritative and the server stays a dumb executor."""
+    out = get_bridge().run(
+        TASK_INPAINT,
+        {"image": encode_image(image), "mask": encode_image(mask), "variant": variant},
+        max_wait=1800.0,
+    )
+    raw = np.frombuffer(base64.b64decode(out["image"]), dtype=np.uint8)
+    return cv2.imdecode(raw, cv2.IMREAD_COLOR)

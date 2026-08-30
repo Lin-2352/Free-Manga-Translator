@@ -484,6 +484,23 @@ def _load_local_translator():
         if _LOCAL_TRANSLATOR is not None:
             return _LOCAL_TRANSLATOR
 
+        try:
+            from gpu_bridge_backend import bridge_enabled as _bridge_enabled
+            _bridged = _bridge_enabled()
+        except Exception:
+            _bridged = False
+        if _bridged:
+            # Refuse rather than quietly running NLLB on the local card. This path is
+            # opt-in via LOCAL_NLLB_TRANSLATION and only fires when the remote providers
+            # fail, so a silent local fallback here would be both rare and invisible --
+            # exactly the shape of bug that makes "no local GPU" untrue without anyone
+            # noticing. The pipeline still has its remote provider chain for translation.
+            raise RuntimeError(
+                "LOCAL_NLLB_TRANSLATION is enabled while FMT_GPU_BRIDGE is on. The local "
+                "NLLB fallback would load a model onto the LOCAL GPU. Disable "
+                "LOCAL_NLLB_TRANSLATION for remote-GPU runs."
+            )
+
         import torch
         from transformers import AutoModelForSeq2SeqLM
 

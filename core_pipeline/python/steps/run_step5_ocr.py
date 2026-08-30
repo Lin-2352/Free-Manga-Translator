@@ -98,7 +98,24 @@ def _is_chinese_ocr_language(language: str | None) -> bool:
     return language in {"ch_tra", "ch_sim"}
 
 
+def _bridge_enabled() -> bool:
+    """True when GPU work is offloaded. Imported lazily so a plain local run never needs
+    the bridge module on sys.path."""
+    try:
+        from gpu_bridge_backend import bridge_enabled
+        return bridge_enabled()
+    except Exception:
+        return False
+
+
 def _easyocr_reader(language: str):
+    if _bridge_enabled():
+        # Never construct EasyOCR locally under the bridge: Reader(..., gpu=True) builds
+        # its detector+recogniser on CUDA at construction, so merely creating it puts a
+        # context on the local card even if every readtext() call is remote.
+        from gpu_bridge_backend import RemoteHandle
+        return RemoteHandle(f"easyocr:{language}")
+
     if language not in _EASYOCR_READERS:
         import easyocr
 
@@ -110,6 +127,9 @@ def _easyocr_reader(language: str):
 def _paddleocr_reader(language: str):
     if language not in {"ko", "ch"}:
         return None
+    if _bridge_enabled():
+        from gpu_bridge_backend import RemoteHandle
+        return RemoteHandle(f"paddleocr:{language}")
     if language in _PADDLEOCR_UNAVAILABLE:
         return None
     if language not in _PADDLEOCR_READERS:

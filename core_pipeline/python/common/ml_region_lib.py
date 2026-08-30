@@ -42,7 +42,7 @@ import os
 # Sentinel handle used to route model calls to a remote GPU. Imported at module
 # scope so the isinstance() checks in detect_* are cheap; the module itself pulls
 # nothing heavier than cv2/numpy, both already imported above.
-from gpu_bridge_backend import RemoteHandle
+from gpu_bridge_backend import RemoteHandle, bridge_enabled
 
 # ===================================================================
 # EMERGENCY CUDA DLL INJECTION (Windows Fix)
@@ -365,6 +365,13 @@ def load_semantic_model(model_path: str, allow_cpu: bool = False):
 
 def load_ocr_model(force_cpu: bool = False):
     """Load manga-ocr (kha-white/manga-ocr-base) for Japanese text recognition."""
+    if bridge_enabled():
+        # Return before importing manga_ocr: its constructor builds a torch model and
+        # moves it to CUDA, which would create a local CUDA context even though every
+        # subsequent recognition call goes over the bridge.
+        print("  [Model D] manga-ocr: REMOTE (gpu bridge)")
+        return RemoteHandle("ocr")
+
     from manga_ocr import MangaOcr
     mocr = MangaOcr(force_cpu=force_cpu)
     print("  [Model D] manga-ocr: LOADED")
@@ -1047,6 +1054,10 @@ def _axis_tiles_local(length: int, tile_size: int, overlap: int) -> List[Tuple[i
 
 def load_lama_model(model_path: str, allow_cpu: bool = False):
     """Load LaMa inpainting ONNX model. STRICT CUDA-only."""
+    if bridge_enabled():
+        print("  [Model C] LaMa inpainter: REMOTE (gpu bridge)")
+        return RemoteHandle("lama")
+
     import onnxruntime as ort
 
     try:
@@ -1075,6 +1086,13 @@ def lama_inpaint(
     mask:  uint8 [H, W] — 255 = inpaint, 0 = keep
     Returns: inpainted BGR uint8 [H, W, 3]
     """
+    if isinstance(lama_session, RemoteHandle):
+        # Padding/unpadding stays SERVER-side with the model, for the same reason tiling
+        # does: the geometry rules and the weights belong together, and splitting them
+        # across the wire is how the two halves drift apart.
+        from gpu_bridge_backend import remote_inpaint
+        return remote_inpaint(image, mask, variant="lama_onnx")
+
     h_orig, w_orig = image.shape[:2]
 
     # Pad to multiple of 32 to support fully convolutional LaMa at native resolution

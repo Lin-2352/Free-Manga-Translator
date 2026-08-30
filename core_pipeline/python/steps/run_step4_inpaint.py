@@ -256,7 +256,21 @@ def _floating_sfx_signature(
     return True
 
 
+def _bridge_enabled() -> bool:
+    """True when GPU work is offloaded to the remote bridge."""
+    try:
+        from gpu_bridge_backend import bridge_enabled
+        return bridge_enabled()
+    except Exception:
+        return False
+
+
 def _load_anime_lama_model(model_path: Path = ANIME_LAMA_PATH):
+    if _bridge_enabled():
+        # (None, None) is this function's existing "not available, use ONNX LaMa" signal,
+        # and ONNX LaMa is bridged -- so floating text still gets inpainted, remotely.
+        print("  [AnimeLaMa] bridge enabled; deferring to remote LaMa")
+        return None, None
     if torch is None:
         print("  [AnimeLaMa] torch unavailable; floating text will use ONNX LaMa fallback")
         return None, None
@@ -333,6 +347,10 @@ def _load_manga_cleaner_models():
                 f"({inpaintor_path}, {line_path})",
                 flush=True,
             )
+            return None
+
+        if _bridge_enabled():
+            print("  [MangaCleaner] bridge enabled; deferring to remote LaMa")
             return None
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -704,6 +722,17 @@ def _external_inpaint_command_local_crop(
     command_template = os.getenv("MANGA_INPAINT_COMMAND", "").strip()
     if not command_template:
         return False
+    if _bridge_enabled():
+        # Hard refusal, not a silent skip. This launches an EXTERNAL process (typically
+        # iopaint_inpaint_backend.py, whose --device defaults to cuda), so it is invisible
+        # to every in-process bridge guard: it would quietly consume the local GPU while
+        # the code-level checks all still reported clean. Failing loudly is the only way
+        # a "zero local GPU" claim stays honest.
+        raise RuntimeError(
+            "MANGA_INPAINT_COMMAND is set while FMT_GPU_BRIDGE is enabled. That command "
+            "runs in a separate process and would use the LOCAL GPU, which the bridge "
+            "cannot intercept. Unset MANGA_INPAINT_COMMAND for remote-GPU runs."
+        )
 
     crop_x1, crop_y1, crop_x2, crop_y2 = _context_crop_bounds(img_h, img_w, x1, y1, x2, y2)
     crop_img = image[crop_y1:crop_y2, crop_x1:crop_x2].copy()
