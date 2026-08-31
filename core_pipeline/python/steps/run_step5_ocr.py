@@ -59,6 +59,7 @@ from ml_region_lib import (
     build_step2_routing_state, consolidate_by_bubble, Box,
     SAMPLE_MAP, classify_text_by_content,
     _safe_bubble_mask, _polygon_from_mask, _bubble_cluster_zones,
+    _BUBBLE_TILE_ASPECT_THRESHOLD,
 )
 
 _EASYOCR_READERS = {}
@@ -1520,6 +1521,179 @@ def _vision_rescue_cjk_ocr(
     return []
 
 
+# Same shape of ceiling as the full-page budget below, but counted separately.
+# The partial rescue fires on pages that ALREADY SUCCEED, so it adds vision calls to a
+# path that previously made none -- sharing the full-page counter would let a run of
+# partial rescues silently exhaust the budget the last-resort path depends on.
+_VISION_PARTIAL_ATTEMPTS: list = []
+_VISION_PARTIAL_ATTEMPTS_LOCK = threading.Lock()
+
+
+def _vision_partial_rescue_budget_ok() -> bool:
+    limit = int(os.environ.get("VISION_PARTIAL_RESCUE_MAX_PER_HOUR", "60"))
+    if limit <= 0:
+        return False
+    now = time.time()
+    with _VISION_PARTIAL_ATTEMPTS_LOCK:
+        _VISION_PARTIAL_ATTEMPTS[:] = [t for t in _VISION_PARTIAL_ATTEMPTS if now - t < 3600]
+        if len(_VISION_PARTIAL_ATTEMPTS) >= limit:
+            return False
+        _VISION_PARTIAL_ATTEMPTS.append(now)
+    return True
+
+
+def _shift_payload_y(item: dict, offset: int) -> dict:
+    """Move every geometry field of a rescued item from band space back to page space."""
+    shifted = dict(item)
+    for key in ("box", "green_box"):
+        value = shifted.get(key)
+        if isinstance(value, dict):
+            moved = dict(value)
+            for axis in ("y1", "y2"):
+                if axis in moved:
+                    moved[axis] = int(moved[axis]) + offset
+            shifted[key] = moved
+    boxes = shifted.get("erase_boxes")
+    if isinstance(boxes, list):
+        moved_list = []
+        for entry in boxes:
+            if isinstance(entry, dict):
+                moved = dict(entry)
+                for axis in ("y1", "y2"):
+                    if axis in moved:
+                        moved[axis] = int(moved[axis]) + offset
+                moved_list.append(moved)
+            else:
+                moved_list.append(entry)
+        shifted["erase_boxes"] = moved_list
+    polygon = shifted.get("green_polygon")
+    if isinstance(polygon, list):
+        shifted["green_polygon"] = [
+            [point[0], point[1] + offset] if isinstance(point, (list, tuple)) and len(point) >= 2 else point
+            for point in polygon
+        ]
+    return shifted
+
+
+def _vision_rescue_banded(
+    image_path: Path,
+    image: np.ndarray,
+    language: str | None,
+    text_boxes: list[Box],
+    seg_mask: np.ndarray | None,
+    detected_results: list[dict],
+) -> list[dict]:
+    """Vision rescue that survives extreme-aspect (webtoon strip) pages.
+
+    The region handlers send the WHOLE page and pass box coordinates in the prompt text
+    -- both _openai_compatible_vision_region_ocr and the gemini handler do
+    base64(image_path.read_bytes()). Vision APIs downscale the long edge, so an
+    800x10081 strip arrives at roughly 1/8 scale and its text is simply unreadable. That
+    is why new_sample_11 (aspect 12.60) OCR'd 5 of 26 regions and new_sample_10 (8.96)
+    managed 1 of 20.
+
+    Below the aspect threshold this is a pass-through -- byte-identical to calling
+    _vision_rescue_cjk_ocr directly, so the 32 normal-aspect samples are unaffected.
+    Above it the page is cut into vertical bands, each band cropped and sent as its own
+    image with boxes rebased into band space, and every returned geometry field shifted
+    back to page space.
+
+    The threshold is READ from ml_region_lib, never redefined here: detect_text and
+    detect_bubbles deliberately share that one constant because step 5 compares one's
+    boxes against the other's masks, so a second copy free to drift would be a bug in
+    waiting. This is a third consumer of the same value, not a new policy.
+    """
+    if not text_boxes:
+        return []
+    img_h, img_w = image.shape[:2]
+    long_side = max(img_h, img_w)
+    short_side = max(1, min(img_h, img_w))
+    if (long_side / short_side) < _BUBBLE_TILE_ASPECT_THRESHOLD or img_h <= img_w:
+        # Normal-aspect pages still get the small-prompt treatment: sample_13 is 1.39
+        # aspect, took the unbanded single-call path, and duplicated 2 texts.
+        return _rescue_band_chunked(image_path, image, language, text_boxes, seg_mask)
+
+    band_height = max(512, int(os.environ.get("VISION_RESCUE_BAND_HEIGHT", "1600")))
+    # A little vertical context so a line sitting on a cut is not sliced mid-glyph.
+    context = 64
+    ordered = sorted(text_boxes, key=lambda b: b.y1)
+    bands: list[list] = []
+    current: list = []
+    band_top = 0
+    for box in ordered:
+        if not current:
+            current, band_top = [box], box.y1
+        elif box.y2 - band_top <= band_height:
+            current.append(box)
+        else:
+            bands.append(current)
+            current, band_top = [box], box.y1
+    if current:
+        bands.append(current)
+
+    print(f"  [vision-band] aspect {long_side / short_side:.2f} -> {len(bands)} band(s) "
+          f"for {len(ordered)} box(es)", flush=True)
+
+    collected: list[dict] = []
+    for band in bands:
+        top = max(0, min(b.y1 for b in band) - context)
+        bottom = min(img_h, max(b.y2 for b in band) + context)
+        if bottom - top < 16:
+            continue
+        crop = image[top:bottom]
+        crop_mask = seg_mask[top:bottom] if seg_mask is not None else None
+        rebased = [Box(b.x1, b.y1 - top, b.x2, b.y2 - top) for b in band]
+        tmp_path = None
+        rescued: list[dict] = []
+        try:
+            handle, tmp_name = tempfile.mkstemp(suffix=".jpg", prefix="fmt_vision_band_")
+            os.close(handle)
+            tmp_path = Path(tmp_name)
+            if cv2.imwrite(str(tmp_path), crop):
+                rescued = _rescue_band_chunked(
+                    tmp_path, crop, language, rebased, crop_mask
+                )
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+        collected.extend(_shift_payload_y(item, top) for item in rescued)
+    return collected
+
+
+def _rescue_band_chunked(image_path, crop, language, rebased, crop_mask):
+    """Call the rescue for one band, in small groups of boxes, with a retry on silence.
+
+    Group size matters for CORRECTNESS, not just cost: handed ~20 boxes in one prompt the
+    vision model mis-assigns text to region ids -- new_sample_10 came back with four texts
+    duplicated across regions and a 14-character caption dropped into a 91x55 box while
+    the 256x81 caption box beside it stayed empty.
+
+    Chunking WITHIN a band, rather than across the page, is the other half. Cutting chunks
+    in slot order scattered each chunk down a 7171px strip, so every chunk needed its own
+    bands: 4 calls became 7, the tail hit 429s and returned nothing, and coverage fell from
+    14 regions to 6. Boxes inside one band are spatially adjacent, so one call per band
+    covers them at the cycle-2 call count while keeping the small prompt.
+
+    An empty result is retried once: 429 is transient, and a silent chunk costs every
+    region in it.
+    """
+    group_size = max(1, int(os.environ.get("VISION_PARTIAL_RESCUE_GROUP_SIZE", "6")))
+    out: list[dict] = []
+    for start in range(0, len(rebased), group_size):
+        group = rebased[start:start + group_size]
+        got = _vision_rescue_cjk_ocr(image_path, crop, language, group, crop_mask, []) or []
+        if not got:
+            time.sleep(float(os.environ.get("VISION_PARTIAL_RESCUE_RETRY_SLEEP", "20")))
+            got = _vision_rescue_cjk_ocr(image_path, crop, language, group, crop_mask, []) or []
+            if got:
+                print(f"  [vision-band] group of {len(group)} recovered on retry", flush=True)
+        out.extend(got)
+    return out
+
+
 # Process-lifetime hourly attempt budget for the full-page rescue specifically
 # -- it's the most expensive vision call (whole-page image, more output
 # tokens than a handful of boxed regions) and, since Task 3's blank-result
@@ -2940,6 +3114,210 @@ def _run_step5_ocr_unlocked(sample_map: dict[str, str] | None = None, samples_di
             if rescued:
                 final_results = rescued
 
+        # PARTIAL rescue. The gate above is all-or-nothing: it only fires when a page has
+        # NO usable text at all. A page where the local engine filled a few regions and
+        # left most blank therefore gets nothing -- which is exactly what happens to ko/zh
+        # when PaddleOCR is unavailable and EasyOCR takes over. Measured 2026-08-31 over
+        # the 34-sample suite: zh 88 of 111 regions empty across 8 samples, ko 13 of 50,
+        # while 23 zh regions DID succeed, so _usable_cjk_text_count was never 0 and no
+        # rescue ran. The rendered pages were consequently ~79% untranslated.
+        #
+        # Keyed on the MEASURED empty fraction, deliberately not on which OCR engine ran.
+        # A paddle-working local run measures 0.0% empty on all 19 ja samples and on the
+        # zh samples too, so this cannot fire there and cannot move that baseline. Keying
+        # it on "is the bridge on" or "did paddle load" would make behaviour depend on a
+        # branch that differs between processes -- the failure this codebase has already
+        # been bitten by.
+        partial_meta: dict[str, object] = {"attempted": False}
+        if rescue_language:
+            empty_slots = [
+                index for index, item in enumerate(final_results)
+                if isinstance(item, dict)
+                and not str(item.get("text") or "").strip()
+                and isinstance(item.get("box"), dict)
+            ]
+            total_slots = len(final_results)
+            min_regions = int(os.environ.get("VISION_PARTIAL_RESCUE_MIN_REGIONS", "3"))
+            min_fraction = float(os.environ.get("VISION_PARTIAL_RESCUE_MIN_FRACTION", "0.34"))
+            max_regions = int(os.environ.get("VISION_PARTIAL_RESCUE_MAX_REGIONS", "40"))
+            fraction = (len(empty_slots) / total_slots) if total_slots else 0.0
+            if (
+                len(empty_slots) >= min_regions
+                and fraction >= min_fraction
+                and _vision_partial_rescue_budget_ok()
+            ):
+                targets = empty_slots[:max_regions]
+                print(
+                    f"  [vision-partial] {len(targets)}/{total_slots} regions empty "
+                    f"({fraction * 100:.0f}%) lang={rescue_language}; asking vision OCR",
+                    flush=True,
+                )
+                rescued_partial = _vision_rescue_banded(
+                    img_path,
+                    image,
+                    rescue_language,
+                    [_box_from_payload(final_results[i]["box"]) for i in targets],
+                    text_result.seg_mask,
+                    [final_results[i] for i in targets],
+                ) or []
+                filled = 0
+                used_slots: set = set()
+
+                def _write_slot(slot_index, source, tag):
+                    """Write a rescued transcription into an existing OCR slot.
+
+                    Writing INTO the slot rather than appending keeps its id, box, route,
+                    bubble_idx and mask metadata, so step 6->7->8 sees the region set it
+                    always did, and sidesteps _preserve_detection_metadata's
+                    `merged["id"] = index` reindexing, which would collide with the ids the
+                    kept non-empty regions already own.
+                    """
+                    slot = dict(final_results[slot_index])
+                    slot["text"] = str(source.get("text") or "").strip()
+                    provider = str(source.get("ocr_provider") or "vision")
+                    slot["ocr_provider"] = f"{provider}{tag}"
+                    # Carry the vision model's own English across: the rescue prompt asks
+                    # for source_text AND english together, and step 7 prefers it
+                    # (_pretranslated_text -> source "vision", those ids dropped from the
+                    # API batch). Discarding it once turned a page that had just been
+                    # OCR'd into placeholder_translations=14 and an HTTP 500.
+                    for english_key in ("pretranslated_text", "vision_english", "english"):
+                        english = source.get(english_key)
+                        if isinstance(english, str) and english.strip():
+                            slot["pretranslated_text"] = english.strip()
+                            break
+                    conf = source.get("ocr_confidence", source.get("confidence"))
+                    if conf is not None:
+                        slot["ocr_confidence"] = conf
+                    final_results[slot_index] = slot
+                    used_slots.add(slot_index)
+
+                def _fits(slot_index, text):
+                    """Is this slot physically big enough to hold that many characters?"""
+                    box = _box_from_payload(final_results[slot_index]["box"])
+                    area = max(0, box.width) * max(0, box.height)
+                    floor = float(os.environ.get(
+                        "VISION_PARTIAL_RESCUE_MIN_AREA_PER_CHAR", "400"))
+                    if not text:
+                        return False, 0.0
+                    return (area / len(text)) >= floor, (area / len(text))
+
+                pool = [r for r in (rescued_partial or []) if str(r.get("text") or "").strip()]
+                # Drop repeats of the same transcription. A model that mislabels ids emits
+                # the SAME source text for several boxes -- observed on both the banded
+                # (sample_10, 4 duplicates) and the unbanded single-call path (sample_13,
+                # 2), so this is not a banding artefact. Keeping one copy costs a genuinely
+                # repeated line its second rendering, which is the better trade: a repeat
+                # is far more often misattribution than real repetition, and the
+                # alternative prints text confidently into a region it does not belong to.
+                seen_texts: set = set()
+                deduped = []
+                for candidate in pool:
+                    key = " ".join(str(candidate.get("text") or "").split())
+                    if key in seen_texts:
+                        continue
+                    seen_texts.add(key)
+                    deduped.append(candidate)
+                if len(deduped) != len(pool):
+                    print(f"  [vision-partial] dropped {len(pool) - len(deduped)} duplicate "
+                          f"transcription(s) (sign of region-id confusion)", flush=True)
+                pool = deduped
+                # PASS 1 -- place each transcription in the slot it overlaps, but only
+                # if that slot is physically big enough to hold it. Matched by box
+                # overlap, never by position: the handler returns fewer regions than boxes
+                # given, because _vision_source_script_ok drops low-script transcriptions.
+                rejected: list = []
+                for i in targets:
+                    slot_box = _box_from_payload(final_results[i]["box"])
+                    best, best_overlap = None, 0.0
+                    for candidate in pool:
+                        overlap = _boxes_overlap(
+                            slot_box, _box_from_payload(candidate.get("box") or {})
+                        )
+                        if overlap > best_overlap:
+                            best, best_overlap = candidate, overlap
+                    if best is None or best_overlap < 0.20:
+                        continue
+                    text = str(best.get("text") or "").strip()
+                    ok, ratio = _fits(i, text)
+                    if not ok:
+                        # Do not discard it yet. On new_sample_10 a 14-character caption
+                        # was rejected from a 91x55 box (358 px/char) while the caption's
+                        # real 256x81 box sat empty two slots away -- the text was right,
+                        # the model's choice of region was not. Hand it to pass 2.
+                        print(f"  [vision-partial] id={final_results[i].get('id')} too small "
+                              f"for {len(text)} chars ({ratio:.0f} px/char); deferring",
+                              flush=True)
+                        pool.remove(best)
+                        rejected.append(best)
+                        continue
+                    pool.remove(best)
+                    _write_slot(i, best, "_partial")
+                    filled += 1
+
+                # PASS 2 -- re-home what pass 1 could not place. A transcription rejected
+                # for being too big for its assigned box is evidence the MODEL picked the
+                # wrong region, not that the text is wrong, so look for an unfilled slot
+                # that can actually hold it. Constrained deliberately: the slot must still
+                # be empty, must satisfy the same size floor, and must sit within a bounded
+                # vertical distance, so this corrects a mislabelled neighbour rather than
+                # scattering text across the page. The NEAREST eligible slot wins, not the
+                # tightest fit: a dry run on this page's real geometry showed tightest-fit
+                # picking an 84x70 box at 420 px/char -- barely over the floor -- when the
+                # text belonged in the 256x81 caption box (1481 px/char) two slots closer.
+                # A mislabelled region is nearly always adjacent to the right one.
+                max_shift = float(os.environ.get("VISION_PARTIAL_RESCUE_REHOME_MAX_DY", "1200"))
+                rehomed = 0
+                for source in rejected + list(pool):
+                    text = str(source.get("text") or "").strip()
+                    if not text:
+                        continue
+                    src_box = _box_from_payload(source.get("box") or {})
+                    best_slot, best_ratio, best_dy = None, None, None
+                    for i in targets:
+                        if i in used_slots:
+                            continue
+                        ok, ratio = _fits(i, text)
+                        if not ok:
+                            continue
+                        slot_box = _box_from_payload(final_results[i]["box"])
+                        dy = abs(slot_box.y1 - src_box.y1)
+                        if dy > max_shift:
+                            continue
+                        if best_dy is None or dy < best_dy:
+                            best_slot, best_ratio, best_dy = i, ratio, dy
+                    if best_slot is None:
+                        continue
+                    print(f"  [vision-partial] re-homed {len(text)} chars -> id="
+                          f"{final_results[best_slot].get('id')} ({best_ratio:.0f} px/char)",
+                          flush=True)
+                    _write_slot(best_slot, source, "_partial_rehomed")
+                    filled += 1
+                    rehomed += 1
+                if rehomed:
+                    print(f"  [vision-partial] re-homed {rehomed} transcription(s) the model "
+                          f"had assigned to a box too small for them", flush=True)
+                partial_meta = {
+                    "attempted": True,
+                    "language": rescue_language,
+                    "emptyRegions": len(empty_slots),
+                    "totalRegions": total_slots,
+                    "targeted": len(targets),
+                    "filled": filled,
+                }
+                print(f"  [vision-partial] filled {filled}/{len(targets)} empty regions",
+                      flush=True)
+
+        # Ids must stay unique across the whole result set: step 6/7/8 hand off by id, and
+        # a duplicate silently corrupts that mapping rather than raising. Cheap assertion,
+        # placed here because the partial rescue above is the only writer that could
+        # plausibly break it.
+        _ids = [
+            item.get("id") for item in final_results
+            if isinstance(item, dict) and item.get("id") is not None
+        ]
+        assert len(set(_ids)) == len(_ids), f"duplicate OCR ids after partial rescue: {_ids}"
+
         # Last resort: every existing path (local OCR, the region-boxed
         # vision rescue above) still produced zero usable text. Ask a vision
         # model to find its own text regions across the whole page instead
@@ -2963,7 +3341,11 @@ def _run_step5_ocr_unlocked(sample_map: dict[str, str] | None = None, samples_di
             step5_dir = sample_path / "step_5_ocr"
             step5_dir.mkdir(parents=True, exist_ok=True)
             (step5_dir / "vision_rescue_meta.json").write_text(
-                json.dumps(vision_rescue_meta, ensure_ascii=False), encoding="utf-8"
+                json.dumps(
+                    {**vision_rescue_meta, "partial": partial_meta},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
             )
         except OSError:
             pass

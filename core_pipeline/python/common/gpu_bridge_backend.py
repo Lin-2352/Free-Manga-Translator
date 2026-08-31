@@ -77,7 +77,16 @@ def get_bridge():
         if client_dir not in sys.path:
             sys.path.insert(0, client_dir)
         from gpu_client import GPUBridge  # noqa: PLC0415
-        _BRIDGE = GPUBridge()
+        # gpu_client defaults to 4 attempts with a ~7s total backoff, which suits a short
+        # interactive call. A pipeline run is not that: new_sample_11 spends 40+ minutes
+        # making thousands of bridge calls, and a single ngrok blip longer than 7s failed
+        # the whole page after the OCR rescue had already succeeded (15 of 21 regions
+        # recovered, then "Bridge unreachable after 4 attempts"). Widen the window so a
+        # transient tunnel drop costs a pause instead of the sample.
+        _BRIDGE = GPUBridge(
+            timeout=float(os.environ.get("FMT_BRIDGE_TIMEOUT_SECONDS", "60")),
+            retries=int(os.environ.get("FMT_BRIDGE_RETRIES", "7")),
+        )
     return _BRIDGE
 
 
